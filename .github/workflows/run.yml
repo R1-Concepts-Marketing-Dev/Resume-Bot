@@ -1,0 +1,49 @@
+name: Resume bot
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub may delay scheduled runs during peak load.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:  # also runnable manually from the Actions tab
+
+concurrency:
+  # Don't let a new run start while a previous one is still going.
+  group: resume-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install OCR system deps (Tesseract + Poppler)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends tesseract-ocr poppler-utils
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the bot
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-5' }}
+          DRIVE_FOLDER_QUALIFIED: ${{ secrets.DRIVE_FOLDER_QUALIFIED }}
+          DRIVE_FOLDER_NOT_QUALIFIED: ${{ secrets.DRIVE_FOLDER_NOT_QUALIFIED }}
+          DRIVE_FOLDER_REVIEW: ${{ secrets.DRIVE_FOLDER_REVIEW }}
+          DRIVE_FOLDER_INCOMING: ${{ secrets.DRIVE_FOLDER_INCOMING }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          FILTERS_TAB_NAME: ${{ vars.FILTERS_TAB_NAME || 'Filters' }}
+          DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
+          PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'resume-bot/processed' }}
+          MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '25' }}
+        run: python -m src.main
