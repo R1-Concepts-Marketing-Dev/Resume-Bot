@@ -1,0 +1,31 @@
+# Secrets / credentials
+.env
+.env.local
+*.service-account.json
+service-account-*.json
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+dist/
+build/
+
+# Local mockup (keep)
+# filter-editor-mockup.html — keep in repo as a static design reference
