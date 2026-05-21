@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import anthropic
@@ -113,6 +114,13 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
         return _fallback(f"Claude API error: {e}")
 
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+
+    # Strip markdown code fences if Claude wrapped the JSON (it often does
+    # despite the system prompt's instruction not to).
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
 
     try:
         result = json.loads(text)
