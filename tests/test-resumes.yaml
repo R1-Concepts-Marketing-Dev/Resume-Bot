@@ -1,0 +1,175 @@
+# Bulk test corpus for the offline test scorer.
+#
+# Each test is one entry under `tests:`. The bulk scorer reads this file,
+# runs every test against the current filters in filters.yaml, and prints
+# a pass/fail summary in the GitHub Actions log.
+#
+# To add a new test:
+#   1. Copy one of the existing entries.
+#   2. Give it a unique `name`.
+#   3. Set `expected_decision` to qualified | not_qualified | needs_review.
+#      (Use needs_review for ambiguous or OCR-degraded resumes.)
+#   4. Fill `email_subject` and `email_body` if the applicant mentioned a
+#      specific role — leave empty otherwise.
+#   5. Paste the resume text into `resume:` using the `|` block scalar
+#      syntax (preserves line breaks).
+#
+# After adding tests, push to GitHub and trigger the
+# "Bulk test scorer (offline)" workflow.
+
+tests:
+
+  - name: "Strong cherry picker"
+    expected_decision: "qualified"
+    email_subject: "Application — warehouse work"
+    email_body: ""
+    resume: |
+      Maria Lopez
+      maria.lopez.test@gmail.com  •  (562) 555-0143
+
+      Experience
+      2023-2026   ABC Logistics, Compton CA — Cherry Picker Operator
+                  • Operated stand-up and order-picker forklifts daily
+                  • Cycle counts on 200+ SKUs per shift
+                  • Avg 180 picks/hr; 99.6% accuracy
+                  • Trained 4 new pickers
+
+      2021-2023   XYZ Distribution, Long Beach CA — Warehouse Associate
+                  • Packing, labeling, RF scanning
+                  • Forklift sit-down certified 2022, renewed 2024
+
+      Skills: Bilingual EN/ES, RF scanner, WMS systems
+
+  - name: "Borderline packer (~6 mo)"
+    expected_decision: "qualified"
+    email_subject: "looking for job"
+    email_body: ""
+    resume: |
+      Travis Kim
+      travis.kim.test@gmail.com  •  (310) 555-0192
+
+      Work History
+      2025-Present   Quick Pack Inc, Carson CA — Packer
+                     Pack and label outbound orders, ~6 months
+                     Some receiving and stocking
+
+      2024-2025      Pizza Express, Torrance CA — Delivery Driver
+                     (1 year)
+
+      2022-2023      Retail at Target — Sales Floor
+                     (1 year)
+
+      Education: Banning HS 2022
+
+  - name: "Multi-role qualifier (data entry + warehouse)"
+    expected_decision: "qualified"
+    email_subject: "Data entry application"
+    email_body: ""
+    resume: |
+      Jasmine Patel
+      jasmine.patel.test@gmail.com  •  (714) 555-0177
+
+      Professional Summary
+      Detail-oriented operations associate with experience in data entry,
+      warehouse processing, and inventory management.
+
+      Experience
+      2024-Present   Acme Distribution, Cerritos CA — Inventory Clerk
+                     • Daily data entry into NetSuite and Excel
+                     • Built and maintained spreadsheets for cycle count audits
+                     • 2 years at this position
+
+      2022-2024      Pacific Freight, Gardena CA — Receiving Associate
+                     • General warehouse: receiving, putaway, labeling
+                     • 2 years
+                     • Forklift sit-down certified
+
+      Skills: Excel (pivot tables, VLOOKUP), 10-key, MS Office
+
+  - name: "Not qualified - software engineer"
+    expected_decision: "not_qualified"
+    email_subject: "Applying for any open position"
+    email_body: ""
+    resume: |
+      Alex Chen
+      alex.chen.test@gmail.com  •  (415) 555-0234
+
+      Senior Software Engineer with 8 years building distributed systems.
+
+      Experience
+      2020-Present   Datacorp, San Francisco CA — Senior Engineer
+                     Building cloud infrastructure, Kubernetes, Go, Python
+                     Led migration of monolith to microservices
+
+      2018-2020      Startup Inc — Backend Engineer
+                     Built REST APIs, MongoDB, Node.js
+
+      Education: BS Computer Science, UC Berkeley 2018
+      Skills: Go, Python, Kubernetes, AWS, Docker, Terraform
+
+  - name: "Sparse / needs review"
+    expected_decision: "needs_review"
+    email_subject: "Resume"
+    email_body: ""
+    resume: |
+      J. Doe
+
+      Work
+      - Warehouse stuff
+      - Other things
+      - Pick orders
+
+      Available immediately.
+
+  - name: "Email-context routing (subject mentions forklift)"
+    expected_decision: "qualified"
+    email_subject: "Forklift driver application"
+    email_body: "Hi, I'm interested in the forklift driver position. Resume attached. Thanks."
+    resume: |
+      Diego Ramirez
+      diego.ramirez.test@gmail.com
+
+      Experience
+      2024-Present   FastMove Logistics, Compton CA — Forklift Operator
+                     • Sit-down forklift, 8-hour shifts
+                     • 1.5 years, current
+                     • Class 4/5 certified
+
+      2022-2024      Star Warehouse — Packer/Loader
+                     • Loading trucks, manual labor, 2 years
+
+  - name: "Stand-up forklift only (precision test)"
+    expected_decision: "qualified"
+    email_subject: "forklift operator"
+    email_body: ""
+    resume: |
+      Roberto Sanchez
+      roberto.s.test@gmail.com
+
+      Experience
+      2023-Present   Costco Warehouse, Anaheim CA — Stand-Up Forklift Operator
+                     • Stand-up reach truck, 8-hour shifts
+                     • Order picking in 30ft racking
+                     • 2.5 years current
+                     • Class 2 certified
+
+      2021-2023      Home Depot DC, Ontario CA — Material Handler
+                     (2 years)
+
+  - name: "Job hopper (cherry picker skills, short stints)"
+    expected_decision: "qualified"
+    email_subject: "interested in warehouse work"
+    email_body: ""
+    resume: |
+      Marcus Williams
+      marcus.w.test@gmail.com
+
+      Experience
+      Aug 2025-Present   FastWarehouse Inc — Cherry Picker (4 months)
+      Jan 2025-Jul 2025  Quik Pak Logistics — Cherry Picker (6 months)
+      Jul 2024-Dec 2024  Star Distribution — Cherry Picker / RF Scanner (5 months)
+      Jan 2024-Jun 2024  ABC Storage — Cherry Picker (6 months)
+      Aug 2023-Dec 2023  XYZ Freight — Cherry Picker (4 months)
+      Jan 2023-Jul 2023  Big Box Co — General Warehouse (6 months)
+
+      All positions involve order picking, cherry picker operation, cycle counts.
