@@ -20,4 +20,8 @@ window.RESUME_BOT_CONFIG = {
   // Optional: restrict sign-in to a specific Workspace domain.
   // Set to "" to allow any signed-in Google account.
   hostedDomain: "r1concepts.com",
+
+    // Optional: when set, the toolbar shows a "View resumes" button that opens
+  // this URL in a new tab. Leave as empty string to hide the button.
+  resumeFolderUrl: "https://drive.google.com/drive/u/1/folders/1erAtOiN5URqrUO9xV4cPtylP29haOipK",
 };
