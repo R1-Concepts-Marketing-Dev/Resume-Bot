@@ -3,7 +3,6 @@ Actions secrets in production, .env file locally)."""
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 
@@ -21,9 +20,11 @@ def _optional(key: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class Config:
-    # Google auth
-    service_account_info: dict
-    gmail_user: str
+    # Google OAuth (user-flow, signed in as jobs@ once via OAuth Playground)
+    oauth_client_id: str
+    oauth_client_secret: str
+    oauth_refresh_token: str
+    gmail_user: str  # informational + used as the Gmail API userId
 
     # Anthropic
     anthropic_api_key: str
@@ -46,14 +47,10 @@ class Config:
 
 
 def load() -> Config:
-    sa_raw = _required("GOOGLE_SA_JSON")
-    try:
-        sa_info = json.loads(sa_raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"GOOGLE_SA_JSON is not valid JSON: {e}") from e
-
     return Config(
-        service_account_info=sa_info,
+        oauth_client_id=_required("GOOGLE_OAUTH_CLIENT_ID"),
+        oauth_client_secret=_required("GOOGLE_OAUTH_CLIENT_SECRET"),
+        oauth_refresh_token=_required("GOOGLE_OAUTH_REFRESH_TOKEN"),
         gmail_user=_required("GMAIL_USER"),
         anthropic_api_key=_required("ANTHROPIC_API_KEY"),
         anthropic_model=_optional("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
