@@ -1,9 +1,6 @@
 """Bulk offline test scorer. Reads tests/test-resumes.yaml, scores every
 test against the active filters in filters.yaml, prints a summary table
-to the Actions log.
-
-No Google APIs touched - only Anthropic. Useful for calibrating filter
-wording and the scoring rubric before the bot goes live."""
+to the Actions log. No Google APIs touched."""
 
 from __future__ import annotations
 
@@ -48,7 +45,13 @@ def _load_tests() -> list[dict]:
         log.error("tests/test-resumes.yaml not found at %s", yaml_path)
         return []
     data = yaml.safe_load(yaml_path.read_text())
-    return data.get("tests") or []
+    # Accept either {"tests": [...]} or a bare list at the top level,
+    # since hand-editing the YAML can flatten the wrapper accidentally.
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("tests") or []
+    return []
 
 
 def run() -> int:
@@ -71,8 +74,7 @@ def run() -> int:
     log.info("Running %d test(s) against %d filter(s).", len(tests), len(filters))
     print()
 
-    summary: list[tuple[str, str, str, str, float, str, str]] = []
-    # tuple: (name, expected, got, pass_fail, conf, applied_for, top_role)
+    summary: list[tuple[str, str, str, str, float, str]] = []
 
     for i, t in enumerate(tests, 1):
         name = t.get("name") or f"test {i}"
@@ -87,7 +89,8 @@ def run() -> int:
         if subject:
             print(f"Email subject:     {subject}")
         if body:
-            print(f"Email body:        {body[:120]}{'...' if len(body) > 120 else ''}")
+            preview = body[:120] + ("..." if len(body) > 120 else "")
+            print(f"Email body:        {preview}")
         print("-" * 70)
 
         result = scorer.score(
@@ -106,10 +109,6 @@ def run() -> int:
             f"{r['role']} ({r['fit_score']})" for r in result["best_fit_roles"]
         )
         pass_fail = "PASS" if decision == expected else "FAIL"
-        top_role = (
-            result["best_fit_roles"][0]["role"]
-            if result["best_fit_roles"] else ""
-        )
 
         print(f"Got decision: {decision}  [{pass_fail}]")
         print(f"Confidence:   {conf:.2f}")
@@ -118,18 +117,19 @@ def run() -> int:
         print(f"AI reasoning: {result['reasoning']}")
         print()
 
-        summary.append((name, expected, decision, pass_fail, conf, applied, top_role))
+        summary.append((name, expected, decision, pass_fail, conf, applied))
 
-    # Final summary table
     print()
     print("=" * 88)
     print("BULK TEST SUMMARY")
     print("=" * 88)
-    print(f"{'#':<3}{'PF':<6}{'Expected':<16}{'Got':<16}{'Conf':<7}{'Applied':<28}{'Test'}")
+    header = f"{'#':<3}{'PF':<6}{'Expected':<16}{'Got':<16}{'Conf':<7}{'Applied':<28}{'Test'}"
+    print(header)
     print("-" * 88)
-    for i, (name, exp, got, pf, conf, applied, top) in enumerate(summary, 1):
-        short_applied = (applied[:25] + "...") if len(applied) > 28 else applied
-        print(f"{i:<3}{pf:<6}{exp:<16}{got:<16}{conf:<7.2f}{short_applied:<28}{name}")
+    for i, (name, exp, got, pf, conf, applied) in enumerate(summary, 1):
+        short_app = applied[:25] + "..." if len(applied) > 28 else applied
+        row = f"{i:<3}{pf:<6}{exp:<16}{got:<16}{conf:<7.2f}{short_app:<28}{name}"
+        print(row)
     print("-" * 88)
 
     passed = sum(1 for r in summary if r[3] == "PASS")
