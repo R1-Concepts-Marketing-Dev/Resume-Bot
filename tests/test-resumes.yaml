@@ -1,81 +1,122 @@
-# ===== Calibration tests (some expected to FAIL) =====
+# ===== Round 2: edge cases =====
 
-  - name: "[CALIBRATION] Intentional mislabel - clean qualified marked wrong"
-    expected_decision: "not_qualified"  # AI will say qualified; tests FAIL display
-    email_subject: "warehouse work"
+  - name: "Inflated claim caught by dates - 'years' contradicts actual span"
+    expected_decision: "needs_review"
+    email_subject: "experienced warehouse worker"
     email_body: ""
     resume: |
-      Sandra Miller
-      sandra.m.test@gmail.com  •  (562) 555-0455
-
-      Experience
-      2022-Present  Walmart DC, Riverside CA — Cherry Picker Operator
-                    • Daily order picking, RF scanner, cycle counts
-                    • 4 years current, sit-down forklift certified
-
-  - name: "[CALIBRATION] 11 months - just under minimum"
-    expected_decision: "qualified"  # AI may correctly say not_qualified - under 1 yr
-    email_subject: "applying"
-    email_body: ""
-    resume: |
-      Brian Lewis
-      brian.l.test@gmail.com
-
-      Experience
-      Feb 2025-Present  Premier Logistics, Long Beach CA — Cherry Picker Operator
-                        • 11 months current as cherry picker
-                        • Stand-up reach + order picker forklift
-                        • 99% pick accuracy
-
-      2023-2024  Subway Sandwich Shop, Carson CA — Crew Member
-                 (1 year)
-
-      Education: Compton HS 2023
-
-  - name: "[CALIBRATION] Vague claims - no dates / unverifiable"
-    expected_decision: "qualified"  # AI will likely needs_review due to no dates
-    email_subject: "Cherry Picker job"
-    email_body: ""
-    resume: |
-      Tony Garcia
-      tony.g.test@gmail.com
+      Carlos Mendoza
+      carlos.m.test@gmail.com  •  (562) 555-0511
 
       Summary
-      Experienced warehouse worker with 5+ years of cherry picker
-      experience. Skilled in RF scanning, cycle counts, and forklift
-      operations. Hard worker, team player, reliable.
+      10+ years of warehouse and cherry picker experience.
 
-      Skills: Cherry picker, RF scanner, forklift, cycle counts,
-      inventory, warehouse, packing, loading, unloading.
+      Work History
+      Aug 2025-Present  Logistics Plus, Compton CA — Cherry Picker (4 months)
 
-      References available upon request.
+      Education: HS diploma 2024
 
-  - name: "[CALIBRATION] Buried qualifications - awful formatting"
-    expected_decision: "qualified"  # Tests if AI digs past noise to find experience
+      Skills: Cherry picker, RF scanner, forklift, packing
+
+  - name: "Long employment gap (2-year break)"
+    expected_decision: "qualified"
     email_subject: ""
     email_body: ""
     resume: |
-      kevin nelson kevin.n.test@gmail.com 5625550901 OBJECTIVE seeking
-      employment in warehouse position EMPLOYMENT HISTORY 2023 to current
-      ABC LOGISTICS WAREHOUSE WORKER cherry picker operator daily duties
-      include order picking using stand up forklift and sit down forklift
-      rf scanner cycle counts averaging 150 picks per hour 2 years current
-      2021 to 2023 XYZ DISTRIBUTION CENTER GENERAL WAREHOUSE WORKER 2
-      years duties included packing labeling loading EDUCATION HIGH SCHOOL
-      DIPLOMA 2021 CERTIFICATIONS FORKLIFT OPERATOR CLASS 4 AND 5
+      Patricia Reyes
+      patricia.r.test@gmail.com  •  (562) 555-0578
 
-  - name: "[CALIBRATION] Inflated claims with red flags"
-    expected_decision: "needs_review"  # AI may go either way - tests gray zone
-    email_subject: "Senior warehouse position"
-    email_body: ""
+      Work History
+      2024-Present   Warehouse Pro, Long Beach CA — Cherry Picker
+                     8 months current — returning to workforce
+                     Order picking, RF scanner, cycle counts
+
+      2018-2022      Big Warehouse Inc, Gardena CA — Cherry Picker
+                     4 years
+                     Lead picker, trained 8 staff
+
+      Career break 2022-2024 (family care)
+
+      Skills: Cherry picker, forklift sit-down certified 2021 (renewed 2024)
+
+  - name: "Career changer - cert only, zero experience"
+    expected_decision: "needs_review"
+    email_subject: "applying for forklift position"
+    email_body: "I just completed my forklift certification and am eager to start."
     resume: |
-      Michael Rodriguez
-      no.email@listed
-      (XXX) XXX-XXXX
+      Jason Tucker
+      jason.t.test@gmail.com  •  (714) 555-0623
+
+      Career change to warehouse industry.
+
+      Recent
+      Apr 2026  Completed Sit-Down Forklift Operator Certification
+                Long Beach Community College — Class 4 cert
+
+      Work History
+      2020-2026  Lincoln High School, Long Beach CA — English Teacher
+                 6 years teaching, advisor to debate team
+
+      Education: BA English Literature, CSULB 2020
+
+  - name: "Over-qualified - logistics manager applying for cherry picker"
+    expected_decision: "qualified"
+    email_subject: "Cherry Picker position"
+    email_body: "Hi, looking for a less stressful role. Resume attached."
+    resume: |
+      Sarah Mitchell
+      sarah.m.test@gmail.com  •  (310) 555-0734
 
       Experience
-      "20+ years" — Various warehouses — Forklift Operator / Cherry Picker
-                    Operated all types of forklifts and equipment.
-                    Excellent at everything warehouse-related.
+      2022-Present   MegaCorp Logistics, Anaheim CA — Warehouse Manager
+                     • Manage team of 40 cherry pickers and packers
+                     • Hands-on training, often operate equipment myself
+                     • 4 years, sit-down + cherry picker certified
 
-      Available for immediate hire. Will accept any wage.
+      2018-2022      Pacific Distribution, Carson CA — Lead Cherry Picker
+                     • 4 years operating order picker, top performer
+                     • Promoted to supervisor before transferring
+
+      2015-2018      ABC Warehouse, Long Beach CA — Cherry Picker
+                     • 3 years, average 200 picks/hr
+
+  - name: "Data entry only - no warehouse experience"
+    expected_decision: "qualified"
+    email_subject: "Data Entry application"
+    email_body: ""
+    resume: |
+      Michael Park
+      michael.p.test@gmail.com  •  (562) 555-0801
+
+      Experience
+      2023-Present   Insurance Brokers Inc, Long Beach CA — Data Entry Specialist
+                     • 3 years current
+                     • Daily Excel work: pivot tables, VLOOKUP, data cleaning
+                     • Process 250+ entries/day into AS400 + Excel
+
+      2021-2023      Bank of America, Cerritos CA — Teller / Data Entry Clerk
+                     • 2 years
+                     • Excel reporting, balance reconciliations
+
+      Skills: Advanced Excel, 10-key 14,000 KPH, MS Office
+
+  - name: "Two-people resume merge (paste error)"
+    expected_decision: "needs_review"
+    email_subject: ""
+    email_body: ""
+    resume: |
+      Rachel Foster
+      rachel.f.test@gmail.com  •  (562) 555-0900
+
+      Experience
+      2024-Present   ABC Logistics, Compton CA — Cherry Picker (2 years)
+                     • RF scanner, daily order picking
+
+      David Kim
+      david.kim.different@gmail.com  •  (818) 555-1011
+
+      Experience
+      2019-2025      Tech Startup, Mountain View CA — Software Engineer
+                     • 6 years Python, Go, Kubernetes
+
+      Education: BS Computer Science, Stanford 2019
