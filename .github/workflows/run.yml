@@ -2,12 +2,10 @@ name: Resume bot
 
 on:
   schedule:
-    # Every 10 minutes. GitHub may delay scheduled runs during peak load.
     - cron: "*/10 * * * *"
-  workflow_dispatch:  # also runnable manually from the Actions tab
+  workflow_dispatch:
 
 concurrency:
-  # Don't let a new run start while a previous one is still going.
   group: resume-bot
   cancel-in-progress: false
 
@@ -42,10 +40,13 @@ jobs:
           DRIVE_FOLDER_QUALIFIED: ${{ secrets.DRIVE_FOLDER_QUALIFIED }}
           DRIVE_FOLDER_NOT_QUALIFIED: ${{ secrets.DRIVE_FOLDER_NOT_QUALIFIED }}
           DRIVE_FOLDER_REVIEW: ${{ secrets.DRIVE_FOLDER_REVIEW }}
+          DRIVE_FOLDER_PENDING: ${{ secrets.DRIVE_FOLDER_PENDING }}
           DRIVE_FOLDER_INCOMING: ${{ secrets.DRIVE_FOLDER_INCOMING }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           FILTERS_TAB_NAME: ${{ vars.FILTERS_TAB_NAME || 'Filters' }}
           DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
+          TEMPLATES_TAB_NAME: ${{ vars.TEMPLATES_TAB_NAME || 'Templates' }}
           PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'resume-bot/processed' }}
           MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '25' }}
+          COMPANY_NAME: ${{ vars.COMPANY_NAME || 'R1 Concepts' }}
         run: python -m src.main
