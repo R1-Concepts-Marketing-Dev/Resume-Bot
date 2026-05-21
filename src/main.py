@@ -64,9 +64,12 @@ def run() -> int:
     cfg = config.load()
     log.info("Booting resume bot. Gmail user=%s, sheet=%s", cfg.gmail_user, cfg.sheet_id)
 
-    gmail = google_auth.gmail(cfg.service_account_info, cfg.gmail_user)
-    drive = google_auth.drive(cfg.service_account_info, cfg.gmail_user)
-    sheets = google_auth.sheets(cfg.service_account_info, cfg.gmail_user)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    gmail = google_auth.gmail(creds)
+    drive = google_auth.drive(creds)
+    sheets = google_auth.sheets(creds)
 
     # Filters: prefer Sheet (HR-editable), fall back to YAML seed.
     sheets_client.ensure_dashboard_headers(sheets, cfg.sheet_id, cfg.dashboard_tab)
