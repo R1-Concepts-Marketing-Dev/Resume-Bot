@@ -9,33 +9,21 @@
 <script src="./config.js"></script>
 <style>
   :root {
-    --bg: #fafaf7;
-    --surface: #ffffff;
-    --surface-alt: #f4f3ee;
-    --text: #1a1a1a;
-    --text-muted: #6b6b66;
-    --text-faint: #9b9b95;
-    --border: rgba(20, 20, 20, 0.12);
-    --border-strong: rgba(20, 20, 20, 0.22);
-    --accent: #185fa5;
-    --accent-bg: #e6f1fb;
-    --success: #0f6e56;
-    --success-bg: #e1f5ee;
-    --warn: #854f0b;
-    --warn-bg: #faeeda;
-    --danger: #a32d2d;
-    --danger-bg: #fcebeb;
-    --radius-sm: 6px;
-    --radius-md: 8px;
-    --radius-lg: 12px;
-    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --bg: #fafaf7; --surface: #ffffff; --surface-alt: #f4f3ee;
+    --text: #1a1a1a; --text-muted: #6b6b66; --text-faint: #9b9b95;
+    --border: rgba(20, 20, 20, 0.12); --border-strong: rgba(20, 20, 20, 0.22);
+    --accent: #185fa5; --accent-bg: #e6f1fb;
+    --success: #0f6e56; --success-bg: #e1f5ee;
+    --warn: #854f0b; --warn-bg: #faeeda;
+    --danger: #a32d2d; --danger-bg: #fcebeb;
+    --radius-md: 8px; --radius-lg: 12px;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: var(--font-sans); color: var(--text); background: var(--bg); font-size: 14px; line-height: 1.5; }
   .app { max-width: 1040px; margin: 0 auto; padding: 24px 28px 64px; }
   .top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 0.5px solid var(--border); margin-bottom: 24px; flex-wrap: wrap; }
   .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
-  .brand-mark { width: 36px; height: 36px; border-radius: var(--radius-md); background: var(--accent-bg); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 18px; }
   .brand-logo { height: 36px; width: auto; display: block; background: #000; padding: 6px 12px; border-radius: var(--radius-md); }
   .brand-title { font-weight: 500; font-size: 16px; margin: 0; }
   .brand-sub { font-size: 12px; color: var(--text-muted); margin: 0; }
@@ -95,16 +83,14 @@
   .banner { padding: 10px 14px; border-radius: var(--radius-md); font-size: 13px; margin-bottom: 16px; }
   .banner.err { background: var(--danger-bg); color: var(--danger); }
   .banner.ok { background: var(--success-bg); color: var(--success); }
-  .save-status { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+  code { background: var(--surface-alt); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 
-<!-- Signed-out shell -->
 <div class="app" id="signedOut">
   <div class="signin-wrap">
-    <div class="brand-mark" style="margin-bottom: 16px;"><i class="ti ti-filter"></i></div>
     <h1>Resume bot — filter manager</h1>
     <p>Sign in with your <strong>@r1concepts.com</strong> Google account to view and edit the filters the resume-screening bot uses.</p>
     <div id="configError" class="banner err" hidden></div>
@@ -112,7 +98,6 @@
   </div>
 </div>
 
-<!-- Signed-in app -->
 <div class="app" id="signedIn" hidden>
   <header class="top">
     <div class="brand">
@@ -143,7 +128,7 @@
   <div class="toolbar">
     <p><span id="filterCount">0</span> filters</p>
     <div class="actions">
-      <button onclick="reloadFilters()"><i class="ti ti-refresh"></i>Reload</button>
+      <button onclick="reloadAll()"><i class="ti ti-refresh"></i>Reload</button>
       <button class="primary" id="addBtn"><i class="ti ti-plus"></i>Add role</button>
     </div>
   </div>
@@ -151,12 +136,7 @@
   <div class="table-wrap">
     <table>
       <thead>
-        <tr>
-          <th style="width: 80px;">Active</th>
-          <th style="width: 260px;">Role(s)</th>
-          <th>Minimum requirement</th>
-          <th style="width: 280px;"></th>
-        </tr>
+        <tr><th style="width: 80px;">Active</th><th style="width: 260px;">Role(s)</th><th>Minimum requirement</th><th style="width: 280px;"></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -164,14 +144,28 @@
 
   <p class="footer-note">Changes save to the shared Filters sheet. The bot picks them up on its next run (within 10 min).</p>
 
-  <section class="card" id="addPanel" hidden>
-    <div class="card-head">
-      <i class="ti ti-plus"></i>
-      <p class="card-title">Add role</p>
-      <span class="card-hint">cancel to close</span>
+  <div class="toolbar" style="margin-top: 36px;">
+    <p><span id="templateCount">0</span> email templates</p>
+    <div class="actions">
+      <button onclick="reloadTemplates()"><i class="ti ti-refresh"></i>Reload</button>
     </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th style="width: 80px;">Active</th><th style="width: 200px;">Template</th><th>Subject</th><th style="width: 200px;"></th></tr>
+      </thead>
+      <tbody id="templateRows"></tbody>
+    </table>
+  </div>
+
+  <p class="footer-note">Templates are sent automatically based on the AI's decision. Variables: <code>{applicant_name}</code>, <code>{role}</code>, <code>{best_fit_roles}</code>, <code>{company_name}</code>.</p>
+
+  <section class="card" id="addPanel" hidden>
+    <div class="card-head"><i class="ti ti-plus"></i><p class="card-title">Add role</p><span class="card-hint">cancel to close</span></div>
     <div class="field"><label class="lbl">Role name(s)</label><input type="text" id="roleName" placeholder="e.g. Forklift Driver / Yardman" /></div>
-    <div class="field"><label class="lbl">Minimum requirement</label><textarea id="roleReq" placeholder="Write the requirement in plain English. Claude reads this as-is, so be as specific as you'd be telling a new HR teammate."></textarea></div>
+    <div class="field"><label class="lbl">Minimum requirement</label><textarea id="roleReq" placeholder="Plain English."></textarea></div>
     <div class="field"><label class="lbl">Job hopping rule</label><input type="text" id="roleHop" value="Average tenure > 1 year = positive, Multiple < 1 year roles = caution" /></div>
     <div class="form-foot">
       <label class="checkbox"><input type="checkbox" id="roleActive" checked /> Active on save</label>
@@ -183,7 +177,6 @@
 </div>
 
 <script>
-// ----- Module state -----
 const cfg = window.RESUME_BOT_CONFIG || {};
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 const SCOPE = "https://www.googleapis.com/auth/spreadsheets";
@@ -191,10 +184,11 @@ const SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 let tokenClient = null;
 let accessToken = null;
 let user = { email: "", initials: "??" };
-let filters = []; // { role, req, hop, active }
+let filters = [];
 let editingIndex = null;
+let templates = [];
+let editingTemplateKey = null;
 
-// ----- Bootstrap -----
 function init() {
   const errEl = document.getElementById("configError");
   if (!cfg.oauthClientId || cfg.oauthClientId.startsWith("PASTE_") || !cfg.sheetId || cfg.sheetId.startsWith("PASTE_")) {
@@ -202,12 +196,10 @@ function init() {
     errEl.hidden = false;
     return;
   }
-  // Wait until GIS is loaded.
   const tryInit = () => {
     if (!window.google || !google.accounts) { setTimeout(tryInit, 80); return; }
     tokenClient = google.accounts.oauth2.initTokenClient({
-      client_id: cfg.oauthClientId,
-      scope: SCOPE,
+      client_id: cfg.oauthClientId, scope: SCOPE,
       hosted_domain: cfg.hostedDomain || undefined,
       callback: onTokenReceived,
     });
@@ -217,24 +209,18 @@ function init() {
 }
 
 function onTokenReceived(resp) {
-  if (resp.error) {
-    showBanner("Sign-in failed: " + resp.error, "err");
-    return;
-  }
+  if (resp.error) { showBanner("Sign-in failed: " + resp.error, "err"); return; }
   accessToken = resp.access_token;
-  // Decode the user's email from the OpenID UserInfo endpoint
   fetchUserInfo().then(() => {
     document.getElementById("signedOut").hidden = true;
     document.getElementById("signedIn").hidden = false;
-    reloadFilters();
+    reloadAll();
   });
 }
 
 async function fetchUserInfo() {
   try {
-    const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-      headers: { Authorization: "Bearer " + accessToken },
-    });
+    const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: "Bearer " + accessToken } });
     if (r.ok) {
       const data = await r.json();
       user.email = data.email || "(signed in)";
@@ -243,199 +229,220 @@ async function fetchUserInfo() {
       document.getElementById("userEmail").textContent = user.email;
       document.getElementById("userInitials").textContent = user.initials.toUpperCase();
     }
-  } catch (e) { /* non-fatal */ }
+  } catch (e) {}
 }
 
-function signIn() {
-  if (!tokenClient) return;
-  tokenClient.requestAccessToken({ prompt: "" });
-}
-
+function signIn() { if (tokenClient) tokenClient.requestAccessToken({ prompt: "" }); }
 function signOut() {
   if (accessToken) google.accounts.oauth2.revoke(accessToken, () => {});
-  accessToken = null;
-  filters = [];
-  editingIndex = null;
+  accessToken = null; filters = []; templates = []; editingIndex = null; editingTemplateKey = null;
   document.getElementById("signedIn").hidden = true;
   document.getElementById("signedOut").hidden = false;
 }
 
-// ----- Sheets API -----
 async function sheetsGet(range) {
-  const r = await fetch(`${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}`, {
-    headers: { Authorization: "Bearer " + accessToken },
-  });
+  const r = await fetch(`${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}`, { headers: { Authorization: "Bearer " + accessToken } });
   if (!r.ok) throw new Error("Sheets read failed: " + (await r.text()));
   return r.json();
 }
-
 async function sheetsUpdate(range, values) {
-  const r = await fetch(
-    `${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}?valueInputOption=RAW`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: "Bearer " + accessToken,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ values }),
-    }
-  );
+  const r = await fetch(`${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}?valueInputOption=RAW`, {
+    method: "PUT", headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ values }),
+  });
   if (!r.ok) throw new Error("Sheets write failed: " + (await r.text()));
   return r.json();
 }
-
 async function sheetsClear(range) {
-  const r = await fetch(
-    `${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}:clear`,
-    { method: "POST", headers: { Authorization: "Bearer " + accessToken } }
-  );
+  const r = await fetch(`${SHEETS_API}/${cfg.sheetId}/values/${encodeURIComponent(range)}:clear`, { method: "POST", headers: { Authorization: "Bearer " + accessToken } });
   if (!r.ok) throw new Error("Sheets clear failed: " + (await r.text()));
   return r.json();
 }
 
-// ----- Load / save -----
-const HEADERS = [["Role", "Minimum requirement", "Job hopping rule", "Active"]];
+const FILTERS_HEADERS = [["Role", "Minimum requirement", "Job hopping rule", "Active"]];
+const TEMPLATES_HEADERS = [["Template Key", "Subject", "Body", "Active"]];
+
+async function reloadAll() { await reloadFilters(); await reloadTemplates(); }
 
 async function reloadFilters() {
   showBanner("Loading...", "ok");
   try {
-    // Make sure headers exist.
-    const head = await sheetsGet(`${cfg.filtersTab}!A1:D1`);
-    if (!head.values || !head.values.length) {
-      await sheetsUpdate(`${cfg.filtersTab}!A1:D1`, HEADERS);
-    }
-    const resp = await sheetsGet(`${cfg.filtersTab}!A2:D`);
+    const tab = cfg.filtersTab || "Filters";
+    const head = await sheetsGet(`${tab}!A1:D1`);
+    if (!head.values || !head.values.length) await sheetsUpdate(`${tab}!A1:D1`, FILTERS_HEADERS);
+    const resp = await sheetsGet(`${tab}!A2:D`);
     filters = (resp.values || []).map((r) => {
       const [role = "", req = "", hop = "", active = ""] = r;
       return {
-        role: role.trim(),
-        req: req.trim(),
+        role: role.trim(), req: req.trim(),
         hop: hop.trim() || "Average tenure > 1 year = positive, Multiple < 1 year roles = caution",
-        active: ["true", "yes", "y", "1", "on", "x", "✓"].includes(String(active).trim().toLowerCase()),
+        active: ["true","yes","y","1","on","x"].includes(String(active).trim().toLowerCase()),
       };
     }).filter((f) => f.role || f.req);
     editingIndex = null;
-    render();
+    renderFilters();
     hideBanner();
-  } catch (e) {
-    showBanner(e.message, "err");
-  }
+  } catch (e) { showBanner(e.message, "err"); }
 }
 
-async function saveAll(quietBanner = false) {
-  if (!quietBanner) showBanner("Saving...", "ok");
+async function reloadTemplates() {
   try {
-    // Clear A2:D first so deleted rows actually disappear.
-    await sheetsClear(`${cfg.filtersTab}!A2:D`);
+    const tab = cfg.templatesTab || "Templates";
+    const head = await sheetsGet(`${tab}!A1:D1`);
+    if (!head.values || !head.values.length) await sheetsUpdate(`${tab}!A1:D1`, TEMPLATES_HEADERS);
+    const resp = await sheetsGet(`${tab}!A2:D`);
+    templates = (resp.values || []).map((r) => {
+      const [key = "", subject = "", body = "", active = ""] = r;
+      return {
+        key: key.trim(), subject: subject || "",
+        body: (body || "").replace(/\\n/g, "\n"),
+        active: ["true","yes","y","1","on","x"].includes(String(active).trim().toLowerCase()),
+      };
+    }).filter((t) => t.key);
+    editingTemplateKey = null;
+    renderTemplates();
+  } catch (e) { templates = []; renderTemplates(); }
+}
+
+async function saveFilters() {
+  showBanner("Saving...", "ok");
+  try {
+    const tab = cfg.filtersTab || "Filters";
+    await sheetsClear(`${tab}!A2:D`);
     if (filters.length) {
       const rows = filters.map((f) => [f.role, f.req, f.hop, f.active ? "TRUE" : "FALSE"]);
-      await sheetsUpdate(`${cfg.filtersTab}!A2:D${1 + rows.length}`, rows);
+      await sheetsUpdate(`${tab}!A2:D${1 + rows.length}`, rows);
     }
     document.getElementById("statSaved").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     showBanner("Saved. Bot picks up changes within 10 min.", "ok");
     setTimeout(hideBanner, 2500);
-  } catch (e) {
-    showBanner("Save failed: " + e.message, "err");
-  }
+  } catch (e) { showBanner("Save failed: " + e.message, "err"); }
 }
 
-// ----- UI render -----
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+async function saveAllTemplates() {
+  try {
+    const tab = cfg.templatesTab || "Templates";
+    await sheetsClear(`${tab}!A2:D`);
+    if (templates.length) {
+      const rows = templates.map((t) => [t.key, t.subject, t.body, t.active ? "TRUE" : "FALSE"]);
+      await sheetsUpdate(`${tab}!A2:D${1 + rows.length}`, rows);
+    }
+    showBanner("Templates saved.", "ok");
+    setTimeout(hideBanner, 2500);
+  } catch (e) { showBanner("Save failed: " + e.message, "err"); }
 }
 
-function renderViewRow(f, i) {
-  return `
-    <tr class="${f.active ? "" : "paused"}">
-      <td><span class="pill ${f.active ? "on" : "off"}"><i class="ti ti-${f.active ? "check" : "pause"}"></i>${f.active ? "On" : "Paused"}</span></td>
-      <td>${escapeHtml(f.role)}</td>
-      <td class="muted">${escapeHtml(f.req)}</td>
-      <td class="row-actions">
-        <button onclick="toggle(${i})"><i class="ti ti-${f.active ? "player-pause" : "player-play"}"></i>${f.active ? "Pause" : "Activate"}</button>
-        <button onclick="startEdit(${i})"><i class="ti ti-edit"></i>Edit</button>
-        <button class="ghost-danger" onclick="del(${i})"><i class="ti ti-trash"></i>Delete</button>
-      </td>
-    </tr>`;
-}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 
-function renderEditRow(f, i) {
-  return `
-    <tr class="editing">
-      <td><label class="checkbox" style="font-size: 12px;"><input type="checkbox" id="edit-active" ${f.active ? "checked" : ""} /> Active</label></td>
-      <td><input type="text" id="edit-role" value="${escapeHtml(f.role)}" /></td>
-      <td>
-        <textarea id="edit-req">${escapeHtml(f.req)}</textarea>
-        <label class="lbl" style="margin-top: 8px;">Job hopping rule</label>
-        <input type="text" id="edit-hop" value="${escapeHtml(f.hop)}" />
-      </td>
-      <td class="row-actions">
-        <button class="primary" onclick="saveEdit(${i})"><i class="ti ti-check"></i>Save</button>
-        <button onclick="cancelEdit()">Cancel</button>
-      </td>
-    </tr>`;
+function renderFilterViewRow(f, i) {
+  return `<tr class="${f.active ? '' : 'paused'}">
+    <td><span class="pill ${f.active ? 'on' : 'off'}"><i class="ti ti-${f.active ? 'check' : 'pause'}"></i>${f.active ? 'On' : 'Paused'}</span></td>
+    <td>${escapeHtml(f.role)}</td>
+    <td class="muted">${escapeHtml(f.req)}</td>
+    <td class="row-actions">
+      <button onclick="toggleFilter(${i})"><i class="ti ti-${f.active ? 'player-pause' : 'player-play'}"></i>${f.active ? 'Pause' : 'Activate'}</button>
+      <button onclick="startFilterEdit(${i})"><i class="ti ti-edit"></i>Edit</button>
+      <button class="ghost-danger" onclick="delFilter(${i})"><i class="ti ti-trash"></i>Delete</button>
+    </td></tr>`;
 }
-
-function render() {
-  const tbody = document.getElementById("rows");
-  tbody.innerHTML = filters.map((f, i) => (editingIndex === i ? renderEditRow(f, i) : renderViewRow(f, i))).join("");
+function renderFilterEditRow(f, i) {
+  return `<tr class="editing">
+    <td><label class="checkbox" style="font-size: 12px;"><input type="checkbox" id="edit-active" ${f.active ? 'checked' : ''} /> Active</label></td>
+    <td><input type="text" id="edit-role" value="${escapeHtml(f.role)}" /></td>
+    <td>
+      <textarea id="edit-req">${escapeHtml(f.req)}</textarea>
+      <label class="lbl" style="margin-top: 8px;">Job hopping rule</label>
+      <input type="text" id="edit-hop" value="${escapeHtml(f.hop)}" />
+    </td>
+    <td class="row-actions">
+      <button class="primary" onclick="saveFilterEdit(${i})"><i class="ti ti-check"></i>Save</button>
+      <button onclick="cancelFilterEdit()">Cancel</button>
+    </td></tr>`;
+}
+function renderFilters() {
+  document.getElementById("rows").innerHTML = filters.map((f, i) => editingIndex === i ? renderFilterEditRow(f, i) : renderFilterViewRow(f, i)).join("");
   document.getElementById("filterCount").textContent = filters.length;
   document.getElementById("statTotal").textContent = filters.length;
   document.getElementById("statActive").textContent = filters.filter((f) => f.active).length;
 }
 
-function showBanner(msg, kind) {
-  const b = document.getElementById("banner");
-  b.textContent = msg;
-  b.className = "banner " + (kind || "ok");
-  b.hidden = false;
+function renderTemplateViewRow(t, i) {
+  return `<tr class="${t.active ? '' : 'paused'}">
+    <td><span class="pill ${t.active ? 'on' : 'off'}"><i class="ti ti-${t.active ? 'check' : 'pause'}"></i>${t.active ? 'On' : 'Paused'}</span></td>
+    <td><code>${escapeHtml(t.key)}</code></td>
+    <td class="muted">${escapeHtml(t.subject)}</td>
+    <td class="row-actions">
+      <button onclick="toggleTemplate(${i})"><i class="ti ti-${t.active ? 'player-pause' : 'player-play'}"></i>${t.active ? 'Pause' : 'Activate'}</button>
+      <button onclick="startTemplateEdit(${i})"><i class="ti ti-edit"></i>Edit</button>
+    </td></tr>`;
 }
+function renderTemplateEditRow(t, i) {
+  return `<tr class="editing">
+    <td><label class="checkbox" style="font-size: 12px;"><input type="checkbox" id="tmpl-active" ${t.active ? 'checked' : ''} /> Active</label></td>
+    <td><code>${escapeHtml(t.key)}</code></td>
+    <td colspan="2">
+      <label class="lbl">Subject</label>
+      <input type="text" id="tmpl-subject" value="${escapeHtml(t.subject)}" />
+      <label class="lbl" style="margin-top: 8px;">Body</label>
+      <textarea id="tmpl-body" style="min-height: 180px; font-family: ui-monospace, monospace; font-size: 12px;">${escapeHtml(t.body)}</textarea>
+      <div style="display:flex; gap:8px; margin-top:10px; justify-content:flex-end;">
+        <button onclick="cancelTemplateEdit()">Cancel</button>
+        <button class="primary" onclick="saveTemplate(${i})"><i class="ti ti-check"></i>Save</button>
+      </div>
+    </td></tr>`;
+}
+function renderTemplates() {
+  const tbody = document.getElementById("templateRows");
+  if (!templates.length) {
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 20px;">No templates yet — the bot creates them on its first run.</td></tr>`;
+    document.getElementById("templateCount").textContent = "0";
+    return;
+  }
+  tbody.innerHTML = templates.map((t, i) => editingTemplateKey === t.key ? renderTemplateEditRow(t, i) : renderTemplateViewRow(t, i)).join("");
+  document.getElementById("templateCount").textContent = templates.length;
+}
+
+function showBanner(msg, kind) { const b = document.getElementById("banner"); b.textContent = msg; b.className = "banner " + (kind || "ok"); b.hidden = false; }
 function hideBanner() { document.getElementById("banner").hidden = true; }
 
-// ----- Row actions -----
-function toggle(i) {
+function toggleFilter(i) { if (editingIndex !== null) return; filters[i].active = !filters[i].active; renderFilters(); saveFilters(); }
+function delFilter(i) {
   if (editingIndex !== null) return;
-  filters[i].active = !filters[i].active;
-  render();
-  saveAll(true);
+  if (!confirm("Delete the filter for '" + filters[i].role + "'?\n\nThis can't be undone.")) return;
+  filters.splice(i, 1); renderFilters(); saveFilters();
 }
-
-function del(i) {
-  if (editingIndex !== null) return;
-  if (!confirm("Delete the filter for '" + filters[i].role + "'?\n\nThis can't be undone. The bot will stop scoring new resumes against this role on its next run.")) return;
-  filters.splice(i, 1);
-  render();
-  saveAll();
+function startFilterEdit(i) {
+  if (editingIndex !== null) { if (!confirm("Discard changes?")) return; }
+  editingIndex = i; renderFilters();
+  const el = document.getElementById("edit-role"); if (el) { el.focus(); el.select(); }
 }
-
-function startEdit(i) {
-  if (editingIndex !== null) {
-    if (!confirm("Discard the changes you're making to '" + filters[editingIndex].role + "'?")) return;
-  }
-  editingIndex = i;
-  render();
-  const el = document.getElementById("edit-role");
-  if (el) { el.focus(); el.select(); }
-}
-
-function saveEdit(i) {
+function saveFilterEdit(i) {
   const role = document.getElementById("edit-role").value.trim();
   const req = document.getElementById("edit-req").value.trim();
   const hop = document.getElementById("edit-hop").value.trim();
   const active = document.getElementById("edit-active").checked;
-  if (!role || !req) {
-    alert("Role name and minimum requirement are required.");
-    return;
-  }
+  if (!role || !req) { alert("Role name and minimum requirement are required."); return; }
   filters[i] = { role, req, hop, active };
-  editingIndex = null;
-  render();
-  saveAll();
+  editingIndex = null; renderFilters(); saveFilters();
 }
+function cancelFilterEdit() { editingIndex = null; renderFilters(); }
 
-function cancelEdit() { editingIndex = null; render(); }
+function toggleTemplate(i) { if (editingTemplateKey) return; templates[i].active = !templates[i].active; renderTemplates(); saveAllTemplates(); }
+function startTemplateEdit(i) {
+  if (editingTemplateKey) { if (!confirm("Discard changes?")) return; }
+  editingTemplateKey = templates[i].key; renderTemplates();
+  const el = document.getElementById("tmpl-subject"); if (el) el.focus();
+}
+function saveTemplate(i) {
+  const subject = document.getElementById("tmpl-subject").value;
+  const body = document.getElementById("tmpl-body").value;
+  const active = document.getElementById("tmpl-active").checked;
+  if (!subject.trim() || !body.trim()) { alert("Subject and Body are required."); return; }
+  templates[i] = { ...templates[i], subject, body, active };
+  editingTemplateKey = null; renderTemplates(); saveAllTemplates();
+}
+function cancelTemplateEdit() { editingTemplateKey = null; renderTemplates(); }
 
-// ----- Add panel -----
 function openAdd() {
   document.getElementById("roleName").value = "";
   document.getElementById("roleReq").value = "";
@@ -446,7 +453,6 @@ function openAdd() {
   document.getElementById("roleName").focus();
 }
 function closeAdd() { document.getElementById("addPanel").hidden = true; }
-
 function addRole() {
   const role = document.getElementById("roleName").value.trim();
   const req = document.getElementById("roleReq").value.trim();
@@ -454,19 +460,15 @@ function addRole() {
   const active = document.getElementById("roleActive").checked;
   if (!role || !req) { alert("Role name and minimum requirement are required."); return; }
   filters.push({ role, req, hop, active });
-  closeAdd();
-  render();
-  saveAll();
+  closeAdd(); renderFilters(); saveFilters();
 }
 
-// ----- Wire up -----
 document.getElementById("signInBtn").addEventListener("click", signIn);
 document.getElementById("signOutBtn").addEventListener("click", signOut);
 document.getElementById("addBtn").addEventListener("click", openAdd);
 document.getElementById("addCancelBtn").addEventListener("click", closeAdd);
 document.getElementById("addSaveBtn").addEventListener("click", addRole);
 
-// Show the hero "View resumes" button only if a Drive folder URL is configured.
 if (cfg.resumeFolderUrl) {
   const btn = document.getElementById("viewResumesBtnHeader");
   btn.hidden = false;
