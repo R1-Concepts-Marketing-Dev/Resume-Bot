@@ -1,9 +1,4 @@
-"""Score a resume against the active filters using Claude.
-
-Returns a strict JSON dict the orchestrator uses to decide:
-- which Drive folder to file the resume into
-- what to write to the dashboard
-"""
+"""Score a resume against the active filters using Claude."""
 
 from __future__ import annotations
 
@@ -15,27 +10,31 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an HR screening assistant for R1 Concepts, a brake \
-parts company. You read a candidate's resume text and decide whether they meet \
-any of the company's active role filters.
+SYSTEM_PROMPT = """You are an HR screening assistant for a brake parts \
+company. You read a candidate's resume text (plus the email they sent it in) \
+and decide how well they match each open role.
 
 You always reply with a single JSON object and nothing else. No prose, no \
-markdown, no backticks. The JSON must conform exactly to the schema you are \
-given. If the resume is unreadable, badly OCR'd, or you cannot reasonably \
-determine fit, set bucket to "needs_review" and explain in the reasoning \
-field. Prefer "needs_review" over a confident wrong answer."""
+markdown, no backticks. The JSON must conform exactly to the schema in the \
+user message. If the resume is unreadable or you cannot reasonably score it, \
+set overall_decision to "needs_review" and explain in reasoning."""
 
-USER_TEMPLATE = """Active role filters (each line is one role and its minimum \
-requirement):
+
+USER_TEMPLATE = """Open roles and their minimum requirements:
 
 {filter_block}
 
-Job hopping guidance: {job_hopping}
+Job-hopping guidance (applies to all roles): {job_hopping}
+
+---
+
+Email subject from the applicant: {email_subject}
+Email body from the applicant (may be empty):
+{email_body}
 
 ---
 
 Resume text (may be OCR'd; some noise is expected):
-
 {resume_text}
 
 ---
@@ -43,50 +42,58 @@ Resume text (may be OCR'd; some noise is expected):
 Respond with this exact JSON schema:
 
 {{
-  "bucket": "qualified" | "not_qualified" | "needs_review",
-  "best_fit_roles": ["role name", ...],   // empty array if none
+  "best_fit_roles": [
+    {{
+      "role": "<exact role name from the list above>",
+      "fit_score": <integer 0-100>,
+      "reasoning": "<1-2 sentence justification of the score>"
+    }}
+  ],
+  "overall_decision": "qualified" | "not_qualified" | "needs_review",
   "years_relevant_experience": <number, 0 if unknown>,
   "job_hopping_flag": "positive" | "caution" | "neutral",
-  "reasoning": "<2-4 sentence explanation HR will read>",
+  "reasoning": "<2-4 sentence overall explanation HR will read>",
   "confidence": <number between 0 and 1>,
   "candidate_name": "<best guess or empty string>",
   "candidate_email": "<best guess or empty string>",
   "candidate_phone": "<best guess or empty string>"
 }}
 
-Rules:
-- "qualified" requires meeting the explicit minimum requirement for at least \
-one active role.
-- "not_qualified" means clearly not meeting any role's minimum.
-- "needs_review" for ambiguous, missing-info, or OCR-degraded resumes.
-- best_fit_roles lists role names from the filters above that the candidate \
-plausibly fits.
-- If confidence < 0.6, set bucket to "needs_review" regardless of fit.
+Include EVERY role from the list above where fit_score >= 30 in best_fit_roles. Omit roles where the candidate is clearly not a fit at all. Sort by fit_score descending.
+
+Fit-score rubric (apply to each role independently):
+  90-100  Strong match: meets minimum + extra relevant experience + recent + good tenure
+  70-89   Meets the minimum bar comfortably
+  50-69   Meets the minimum but borderline
+  30-49   Close but does not meet the stated minimum
+  0-29    Clearly not a fit (omit from best_fit_roles)
+
+overall_decision rules:
+  qualified       - at least one role has fit_score >= 60
+  not_qualified   - no role has fit_score >= 50
+  needs_review    - anything ambiguous, OCR-degraded, or confidence < 0.6
+
+Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your scoring. If they don't specify, score against every open role.
 """
 
 
 def _build_filter_block(filters: list) -> str:
-    lines = []
-    for f in filters:
-        lines.append(f"- {f.role} — {f.requirement}")
-    return "\n".join(lines)
+    return "\n".join(f"- {f.role} - {f.requirement}" for f in filters)
 
 
-def score(api_key: str, model: str, resume_text: str, filters: list,
+def score(*, api_key: str, model: str, resume_text: str, filters: list,
+          email_subject: str = "", email_body: str = "",
           used_ocr: bool = False) -> dict[str, Any]:
-    """Score a single resume. Returns the parsed JSON dict from Claude.
-
-    Falls back to {"bucket": "needs_review", ...} on any failure so the bot
-    never silently drops a candidate.
-    """
     if not resume_text.strip():
-        return _fallback("Empty resume text — could not extract content.")
+        return _fallback("Empty resume text - could not extract content.")
 
     job_hopping = filters[0].job_hopping if filters else "Average tenure > 1 year = positive"
     user_msg = USER_TEMPLATE.format(
         filter_block=_build_filter_block(filters),
         job_hopping=job_hopping,
-        resume_text=resume_text[:18000],  # keep tokens bounded; resumes >18k chars are very rare
+        email_subject=(email_subject or "(none)")[:200],
+        email_body=(email_body or "(empty)")[:2000],
+        resume_text=resume_text[:18000],
     )
 
     if used_ocr:
@@ -95,9 +102,7 @@ def score(api_key: str, model: str, resume_text: str, filters: list,
     client = anthropic.Anthropic(api_key=api_key)
     try:
         resp = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            model=model, max_tokens=1500, system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
     except Exception as e:
@@ -117,8 +122,8 @@ def score(api_key: str, model: str, resume_text: str, filters: list,
 
 def _fallback(reason: str) -> dict[str, Any]:
     return {
-        "bucket": "needs_review",
         "best_fit_roles": [],
+        "overall_decision": "needs_review",
         "years_relevant_experience": 0,
         "job_hopping_flag": "neutral",
         "reasoning": reason,
@@ -130,10 +135,30 @@ def _fallback(reason: str) -> dict[str, Any]:
 
 
 def _normalize(r: dict[str, Any]) -> dict[str, Any]:
-    bucket = r.get("bucket")
-    if bucket not in {"qualified", "not_qualified", "needs_review"}:
-        r["bucket"] = "needs_review"
-    r.setdefault("best_fit_roles", [])
+    decision = r.get("overall_decision")
+    if decision not in {"qualified", "not_qualified", "needs_review"}:
+        r["overall_decision"] = "needs_review"
+
+    cleaned = []
+    for item in r.get("best_fit_roles") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        try:
+            sc = int(item.get("fit_score", 0))
+        except (TypeError, ValueError):
+            sc = 0
+        sc = max(0, min(100, sc))
+        if not role:
+            continue
+        cleaned.append({
+            "role": role,
+            "fit_score": sc,
+            "reasoning": str(item.get("reasoning", "")).strip(),
+        })
+    cleaned.sort(key=lambda x: x["fit_score"], reverse=True)
+    r["best_fit_roles"] = cleaned
+
     r.setdefault("years_relevant_experience", 0)
     r.setdefault("job_hopping_flag", "neutral")
     r.setdefault("reasoning", "")
