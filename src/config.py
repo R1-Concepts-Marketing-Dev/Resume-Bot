@@ -1,5 +1,4 @@
-"""Environment-driven configuration. Reads from process env (set by GitHub
-Actions secrets in production, .env file locally)."""
+"""Environment-driven configuration."""
 
 from __future__ import annotations
 
@@ -20,30 +19,28 @@ def _optional(key: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class Config:
-    # Google OAuth (user-flow, signed in as jobs@ once via OAuth Playground)
     oauth_client_id: str
     oauth_client_secret: str
     oauth_refresh_token: str
-    gmail_user: str  # informational + used as the Gmail API userId
+    gmail_user: str
 
-    # Anthropic
     anthropic_api_key: str
     anthropic_model: str
 
-    # Google Drive folder IDs
     folder_qualified: str
     folder_not_qualified: str
     folder_review: str
-    folder_incoming: str  # optional, "" if not set
+    folder_pending: str
+    folder_incoming: str
 
-    # Google Sheet
     sheet_id: str
     filters_tab: str
     dashboard_tab: str
+    templates_tab: str
 
-    # Behaviour
     processed_label: str
     max_messages_per_run: int
+    company_name: str
 
 
 def load() -> Config:
@@ -57,10 +54,13 @@ def load() -> Config:
         folder_qualified=_required("DRIVE_FOLDER_QUALIFIED"),
         folder_not_qualified=_required("DRIVE_FOLDER_NOT_QUALIFIED"),
         folder_review=_required("DRIVE_FOLDER_REVIEW"),
+        folder_pending=_required("DRIVE_FOLDER_PENDING"),
         folder_incoming=_optional("DRIVE_FOLDER_INCOMING", ""),
         sheet_id=_required("SHEET_ID"),
         filters_tab=_optional("FILTERS_TAB_NAME", "Filters"),
         dashboard_tab=_optional("DASHBOARD_TAB_NAME", "Candidates"),
+        templates_tab=_optional("TEMPLATES_TAB_NAME", "Templates"),
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
+        company_name=_optional("COMPANY_NAME", "R1 Concepts"),
     )
