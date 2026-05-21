@@ -1,175 +1,81 @@
-# Bulk test corpus for the offline test scorer.
-#
-# Each test is one entry under `tests:`. The bulk scorer reads this file,
-# runs every test against the current filters in filters.yaml, and prints
-# a pass/fail summary in the GitHub Actions log.
-#
-# To add a new test:
-#   1. Copy one of the existing entries.
-#   2. Give it a unique `name`.
-#   3. Set `expected_decision` to qualified | not_qualified | needs_review.
-#      (Use needs_review for ambiguous or OCR-degraded resumes.)
-#   4. Fill `email_subject` and `email_body` if the applicant mentioned a
-#      specific role — leave empty otherwise.
-#   5. Paste the resume text into `resume:` using the `|` block scalar
-#      syntax (preserves line breaks).
-#
-# After adding tests, push to GitHub and trigger the
-# "Bulk test scorer (offline)" workflow.
+# ===== Calibration tests (some expected to FAIL) =====
 
-tests:
-
-  - name: "Strong cherry picker"
-    expected_decision: "qualified"
-    email_subject: "Application — warehouse work"
+  - name: "[CALIBRATION] Intentional mislabel - clean qualified marked wrong"
+    expected_decision: "not_qualified"  # AI will say qualified; tests FAIL display
+    email_subject: "warehouse work"
     email_body: ""
     resume: |
-      Maria Lopez
-      maria.lopez.test@gmail.com  •  (562) 555-0143
+      Sandra Miller
+      sandra.m.test@gmail.com  •  (562) 555-0455
 
       Experience
-      2023-2026   ABC Logistics, Compton CA — Cherry Picker Operator
-                  • Operated stand-up and order-picker forklifts daily
-                  • Cycle counts on 200+ SKUs per shift
-                  • Avg 180 picks/hr; 99.6% accuracy
-                  • Trained 4 new pickers
+      2022-Present  Walmart DC, Riverside CA — Cherry Picker Operator
+                    • Daily order picking, RF scanner, cycle counts
+                    • 4 years current, sit-down forklift certified
 
-      2021-2023   XYZ Distribution, Long Beach CA — Warehouse Associate
-                  • Packing, labeling, RF scanning
-                  • Forklift sit-down certified 2022, renewed 2024
-
-      Skills: Bilingual EN/ES, RF scanner, WMS systems
-
-  - name: "Borderline packer (~6 mo)"
-    expected_decision: "qualified"
-    email_subject: "looking for job"
+  - name: "[CALIBRATION] 11 months - just under minimum"
+    expected_decision: "qualified"  # AI may correctly say not_qualified - under 1 yr
+    email_subject: "applying"
     email_body: ""
     resume: |
-      Travis Kim
-      travis.kim.test@gmail.com  •  (310) 555-0192
-
-      Work History
-      2025-Present   Quick Pack Inc, Carson CA — Packer
-                     Pack and label outbound orders, ~6 months
-                     Some receiving and stocking
-
-      2024-2025      Pizza Express, Torrance CA — Delivery Driver
-                     (1 year)
-
-      2022-2023      Retail at Target — Sales Floor
-                     (1 year)
-
-      Education: Banning HS 2022
-
-  - name: "Multi-role qualifier (data entry + warehouse)"
-    expected_decision: "qualified"
-    email_subject: "Data entry application"
-    email_body: ""
-    resume: |
-      Jasmine Patel
-      jasmine.patel.test@gmail.com  •  (714) 555-0177
-
-      Professional Summary
-      Detail-oriented operations associate with experience in data entry,
-      warehouse processing, and inventory management.
+      Brian Lewis
+      brian.l.test@gmail.com
 
       Experience
-      2024-Present   Acme Distribution, Cerritos CA — Inventory Clerk
-                     • Daily data entry into NetSuite and Excel
-                     • Built and maintained spreadsheets for cycle count audits
-                     • 2 years at this position
+      Feb 2025-Present  Premier Logistics, Long Beach CA — Cherry Picker Operator
+                        • 11 months current as cherry picker
+                        • Stand-up reach + order picker forklift
+                        • 99% pick accuracy
 
-      2022-2024      Pacific Freight, Gardena CA — Receiving Associate
-                     • General warehouse: receiving, putaway, labeling
-                     • 2 years
-                     • Forklift sit-down certified
+      2023-2024  Subway Sandwich Shop, Carson CA — Crew Member
+                 (1 year)
 
-      Skills: Excel (pivot tables, VLOOKUP), 10-key, MS Office
+      Education: Compton HS 2023
 
-  - name: "Not qualified - software engineer"
-    expected_decision: "not_qualified"
-    email_subject: "Applying for any open position"
+  - name: "[CALIBRATION] Vague claims - no dates / unverifiable"
+    expected_decision: "qualified"  # AI will likely needs_review due to no dates
+    email_subject: "Cherry Picker job"
     email_body: ""
     resume: |
-      Alex Chen
-      alex.chen.test@gmail.com  •  (415) 555-0234
+      Tony Garcia
+      tony.g.test@gmail.com
 
-      Senior Software Engineer with 8 years building distributed systems.
+      Summary
+      Experienced warehouse worker with 5+ years of cherry picker
+      experience. Skilled in RF scanning, cycle counts, and forklift
+      operations. Hard worker, team player, reliable.
 
-      Experience
-      2020-Present   Datacorp, San Francisco CA — Senior Engineer
-                     Building cloud infrastructure, Kubernetes, Go, Python
-                     Led migration of monolith to microservices
+      Skills: Cherry picker, RF scanner, forklift, cycle counts,
+      inventory, warehouse, packing, loading, unloading.
 
-      2018-2020      Startup Inc — Backend Engineer
-                     Built REST APIs, MongoDB, Node.js
+      References available upon request.
 
-      Education: BS Computer Science, UC Berkeley 2018
-      Skills: Go, Python, Kubernetes, AWS, Docker, Terraform
-
-  - name: "Sparse / needs review"
-    expected_decision: "needs_review"
-    email_subject: "Resume"
+  - name: "[CALIBRATION] Buried qualifications - awful formatting"
+    expected_decision: "qualified"  # Tests if AI digs past noise to find experience
+    email_subject: ""
     email_body: ""
     resume: |
-      J. Doe
+      kevin nelson kevin.n.test@gmail.com 5625550901 OBJECTIVE seeking
+      employment in warehouse position EMPLOYMENT HISTORY 2023 to current
+      ABC LOGISTICS WAREHOUSE WORKER cherry picker operator daily duties
+      include order picking using stand up forklift and sit down forklift
+      rf scanner cycle counts averaging 150 picks per hour 2 years current
+      2021 to 2023 XYZ DISTRIBUTION CENTER GENERAL WAREHOUSE WORKER 2
+      years duties included packing labeling loading EDUCATION HIGH SCHOOL
+      DIPLOMA 2021 CERTIFICATIONS FORKLIFT OPERATOR CLASS 4 AND 5
 
-      Work
-      - Warehouse stuff
-      - Other things
-      - Pick orders
-
-      Available immediately.
-
-  - name: "Email-context routing (subject mentions forklift)"
-    expected_decision: "qualified"
-    email_subject: "Forklift driver application"
-    email_body: "Hi, I'm interested in the forklift driver position. Resume attached. Thanks."
-    resume: |
-      Diego Ramirez
-      diego.ramirez.test@gmail.com
-
-      Experience
-      2024-Present   FastMove Logistics, Compton CA — Forklift Operator
-                     • Sit-down forklift, 8-hour shifts
-                     • 1.5 years, current
-                     • Class 4/5 certified
-
-      2022-2024      Star Warehouse — Packer/Loader
-                     • Loading trucks, manual labor, 2 years
-
-  - name: "Stand-up forklift only (precision test)"
-    expected_decision: "qualified"
-    email_subject: "forklift operator"
+  - name: "[CALIBRATION] Inflated claims with red flags"
+    expected_decision: "needs_review"  # AI may go either way - tests gray zone
+    email_subject: "Senior warehouse position"
     email_body: ""
     resume: |
-      Roberto Sanchez
-      roberto.s.test@gmail.com
+      Michael Rodriguez
+      no.email@listed
+      (XXX) XXX-XXXX
 
       Experience
-      2023-Present   Costco Warehouse, Anaheim CA — Stand-Up Forklift Operator
-                     • Stand-up reach truck, 8-hour shifts
-                     • Order picking in 30ft racking
-                     • 2.5 years current
-                     • Class 2 certified
+      "20+ years" — Various warehouses — Forklift Operator / Cherry Picker
+                    Operated all types of forklifts and equipment.
+                    Excellent at everything warehouse-related.
 
-      2021-2023      Home Depot DC, Ontario CA — Material Handler
-                     (2 years)
-
-  - name: "Job hopper (cherry picker skills, short stints)"
-    expected_decision: "qualified"
-    email_subject: "interested in warehouse work"
-    email_body: ""
-    resume: |
-      Marcus Williams
-      marcus.w.test@gmail.com
-
-      Experience
-      Aug 2025-Present   FastWarehouse Inc — Cherry Picker (4 months)
-      Jan 2025-Jul 2025  Quik Pak Logistics — Cherry Picker (6 months)
-      Jul 2024-Dec 2024  Star Distribution — Cherry Picker / RF Scanner (5 months)
-      Jan 2024-Jun 2024  ABC Storage — Cherry Picker (6 months)
-      Aug 2023-Dec 2023  XYZ Freight — Cherry Picker (4 months)
-      Jan 2023-Jul 2023  Big Box Co — General Warehouse (6 months)
-
-      All positions involve order picking, cherry picker operation, cycle counts.
+      Available for immediate hire. Will accept any wage.
