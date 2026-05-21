@@ -33,11 +33,16 @@
   * { box-sizing: border-box; }
   body { margin: 0; font-family: var(--font-sans); color: var(--text); background: var(--bg); font-size: 14px; line-height: 1.5; }
   .app { max-width: 1040px; margin: 0 auto; padding: 24px 28px 64px; }
-  .top { display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 0.5px solid var(--border); margin-bottom: 24px; }
-  .brand { display: flex; align-items: center; gap: 12px; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 0.5px solid var(--border); margin-bottom: 24px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
   .brand-mark { width: 36px; height: 36px; border-radius: var(--radius-md); background: var(--accent-bg); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 18px; }
+  .brand-logo { height: 44px; width: auto; display: block; border-radius: var(--radius-md); }
   .brand-title { font-weight: 500; font-size: 16px; margin: 0; }
   .brand-sub { font-size: 12px; color: var(--text-muted); margin: 0; }
+  .header-actions { display: flex; align-items: center; gap: 14px; }
+  .btn-hero { font-size: 14px; font-weight: 500; padding: 10px 18px; background: var(--accent); color: white; border-color: var(--accent); box-shadow: 0 1px 2px rgba(20,20,20,0.08); }
+  .btn-hero:hover { background: #134d87; }
+  .btn-hero i { font-size: 16px; }
   .who { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-muted); }
   .avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--accent-bg); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 500; }
   .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
@@ -111,16 +116,19 @@
 <div class="app" id="signedIn" hidden>
   <header class="top">
     <div class="brand">
-      <div class="brand-mark"><i class="ti ti-filter"></i></div>
+      <img src="./logo.png" alt="R1 DFC" class="brand-logo" onerror="this.style.display='none'" />
       <div>
         <p class="brand-title">Resume bot — filter manager</p>
         <p class="brand-sub">Active filters apply to every resume the bot processes</p>
       </div>
     </div>
-    <div class="who">
-      <div class="avatar" id="userInitials">--</div>
-      <span id="userEmail">--</span>
-      <button id="signOutBtn" title="Sign out" style="padding: 6px 10px;"><i class="ti ti-logout"></i></button>
+    <div class="header-actions">
+      <button id="viewResumesBtnHeader" class="btn-hero" hidden><i class="ti ti-folder-open"></i>View resumes</button>
+      <div class="who">
+        <div class="avatar" id="userInitials">--</div>
+        <span id="userEmail">--</span>
+        <button id="signOutBtn" title="Sign out" style="padding: 6px 10px;"><i class="ti ti-logout"></i></button>
+      </div>
     </div>
   </header>
 
@@ -135,7 +143,6 @@
   <div class="toolbar">
     <p><span id="filterCount">0</span> filters</p>
     <div class="actions">
-      <button id="viewResumesBtn" hidden><i class="ti ti-folder"></i>View resumes</button>
       <button onclick="reloadFilters()"><i class="ti ti-refresh"></i>Reload</button>
       <button class="primary" id="addBtn"><i class="ti ti-plus"></i>Add role</button>
     </div>
@@ -459,9 +466,9 @@ document.getElementById("addBtn").addEventListener("click", openAdd);
 document.getElementById("addCancelBtn").addEventListener("click", closeAdd);
 document.getElementById("addSaveBtn").addEventListener("click", addRole);
 
-// Show the "View resumes" button only if a Drive folder URL is configured.
+// Show the hero "View resumes" button only if a Drive folder URL is configured.
 if (cfg.resumeFolderUrl) {
-  const btn = document.getElementById("viewResumesBtn");
+  const btn = document.getElementById("viewResumesBtnHeader");
   btn.hidden = false;
   btn.addEventListener("click", () => window.open(cfg.resumeFolderUrl, "_blank", "noopener,noreferrer"));
 }
