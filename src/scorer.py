@@ -56,7 +56,8 @@ Respond with this exact JSON schema:
   "confidence": <number between 0 and 1>,
   "candidate_name": "<best guess or empty string>",
   "candidate_email": "<best guess or empty string>",
-  "candidate_phone": "<best guess or empty string>"
+  "candidate_phone": "<best guess or empty string>",
+  "applied_for_role": "<exact role name the applicant explicitly applied for, OR 'unspecified'>"
 }}
 
 Include EVERY role from the list above where fit_score >= 30 in best_fit_roles. Omit roles where the candidate is clearly not a fit at all. Sort by fit_score descending.
@@ -74,6 +75,8 @@ overall_decision rules:
   needs_review    - anything ambiguous, OCR-degraded, or confidence < 0.6
 
 Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your scoring. If they don't specify, score against every open role.
+
+applied_for_role rule: read the email subject and body. If the applicant explicitly names a role they're applying for (e.g. "applying for Cherry Picker", "interested in the forklift driver position"), match it to the closest role name from the list above and return that EXACT name. If they just say "any position", "warehouse work", or don't mention a role at all, return "unspecified".
 """
 
 
@@ -102,7 +105,7 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
     client = anthropic.Anthropic(api_key=api_key)
     try:
         resp = client.messages.create(
-            model=model, max_tokens=1500, system=SYSTEM_PROMPT,
+            model=model, max_tokens=3000, system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
     except Exception as e:
@@ -131,6 +134,7 @@ def _fallback(reason: str) -> dict[str, Any]:
         "candidate_name": "",
         "candidate_email": "",
         "candidate_phone": "",
+        "applied_for_role": "unspecified",
     }
 
 
@@ -166,4 +170,7 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     r.setdefault("candidate_name", "")
     r.setdefault("candidate_email", "")
     r.setdefault("candidate_phone", "")
+    r.setdefault("applied_for_role", "unspecified")
+    if not str(r["applied_for_role"]).strip():
+        r["applied_for_role"] = "unspecified"
     return r
