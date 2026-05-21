@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/28110254/README.md)
 # Resume bot
 
 GitHub-hosted agent that watches the `jobs@r1concepts.com` inbox, scores each incoming resume against HR-managed filters using Claude, files the resumes into the right Google Drive folder, and logs every decision to a shared dashboard Sheet. A static GitHub Pages web app lets HR edit filters without touching code.
@@ -58,24 +59,29 @@ State is kept in a Gmail label (`resume-bot/processed`), not a database. Re-runs
    - **Google Drive API**
    - **Google Sheets API**
 
-### 2. Create a service account (for the bot)
+### 2. Create the "backend" OAuth client (for the bot)
 
-1. APIs & Services → Credentials → Create credentials → Service account.
-2. Name it `resume-bot`. Skip the optional grants.
-3. Open the new service account → Keys → Add key → JSON → save the file. You'll paste its contents into a GitHub secret in step 8.
-4. Note the service account's **email** (looks like `resume-bot@r1-resume-bot.iam.gserviceaccount.com`) and **client ID** (numeric).
+The bot authenticates via an OAuth refresh token tied to a one-time sign-in as `jobs@r1concepts.com`. No service account, no Workspace admin needed.
 
-### 3. Enable domain-wide delegation (DWD)
+1. APIs & Services → Credentials → Create credentials → OAuth client ID.
+2. Application type: **Web application**.
+3. Name: `Resume Bot Backend`.
+4. Under **Authorized redirect URIs**, add: `https://developers.google.com/oauthplayground`
+5. Create. Copy the **Client ID** and **Client Secret** that appear in the dialog. You'll need both in the next step.
 
-This is the one step that needs a Google Workspace **super admin**. It lets the service account act *as* `jobs@r1concepts.com` so it can read that inbox.
+### 3. Get the refresh token (one-time, via OAuth Playground)
 
-1. Workspace admin: admin.google.com → Security → Access and data control → API controls → Manage Domain-wide Delegation → Add new.
-2. Client ID: paste the service account's numeric client ID from step 2.
-3. OAuth scopes (comma-separated):
+1. Open https://developers.google.com/oauthplayground in a private/incognito window.
+2. Click the gear icon in the top-right → check **Use your own OAuth credentials** → paste the Client ID and Client Secret from step 2 → close the settings.
+3. In the left panel, in the **Input your own scopes** box at the bottom of the scope list, paste these three scopes (space-separated):
    ```
-   https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/spreadsheets
+   https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets
    ```
-4. Authorize.
+4. Click **Authorize APIs**. Sign in as **`jobs@r1concepts.com`** (this is the one and only time anyone needs to know that account's password). Grant the requested permissions.
+5. You'll be redirected back to the Playground. Click **Exchange authorization code for tokens**.
+6. Copy the **Refresh token** that appears. It looks like `1//0abc...xyz`. Save it somewhere private — you'll paste it into a GitHub secret in step 8.
+
+If at any point you want to revoke this access: go to https://myaccount.google.com/permissions while signed in as jobs@ and remove the "Resume Bot Backend" app. The refresh token will immediately stop working.
 
 ### 4. Create an OAuth client ID (for the web UI)
 
@@ -123,7 +129,9 @@ Repo Settings → Secrets and variables → Actions → New repository secret. A
 
 | Secret name | Value |
 |---|---|
-| `GOOGLE_SA_JSON` | Full contents of the service account JSON file from step 2 (paste the whole file as-is, including the curly braces) |
+| `GOOGLE_OAUTH_CLIENT_ID` | Client ID from step 2 (ends in `.apps.googleusercontent.com`) |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | Client Secret from step 2 |
+| `GOOGLE_OAUTH_REFRESH_TOKEN` | Refresh token from step 3 (starts with `1//`) |
 | `GMAIL_USER` | `jobs@r1concepts.com` |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key (`sk-ant-...`) |
 | `DRIVE_FOLDER_QUALIFIED` | Folder ID from step 5 |
@@ -180,7 +188,7 @@ In the Actions tab, the **Resume bot** workflow will trigger every 10 minutes au
 ## Troubleshooting
 
 - **"Missing required environment variable"** in Actions logs → secret name is misspelled or unset.
-- **"unauthorized_client" or 403 from Gmail** → domain-wide delegation isn't enabled, or the scopes don't match.
+- **"invalid_grant" or "unauthorized_client" from Google** → refresh token has been revoked or expired. Repeat step 3 (OAuth Playground) to get a fresh one and update the `GOOGLE_OAUTH_REFRESH_TOKEN` secret.
 - **No messages processed** → bot is working but everything in the inbox is already labeled. Apply the label manually to test, or send a test resume.
 - **Web UI says "Sign-in failed"** → the GitHub Pages URL isn't in the OAuth client's authorized JavaScript origins.
 - **"Sheets read failed: 403"** in browser → the signed-in user doesn't have edit access to the Sheet.
