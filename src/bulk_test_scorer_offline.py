@@ -135,7 +135,12 @@ def run() -> int:
     passed = sum(1 for r in summary if r[3] == "PASS")
     total = len(summary)
     print(f"Passed: {passed} / {total}")
-    return 0 if passed == total else 1
+    # Always return 0 - this is an exploratory tool, not a CI gate. A FAIL
+    # row means the AI disagreed with my expected_decision, not that the
+    # bot broke. Returning 1 caused Actions to show the run as a red X
+    # which is misleading. Read the per-test reasoning to decide whether
+    # to tune filters or update expectations.
+    return 0
 
 
 if __name__ == "__main__":
