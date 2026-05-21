@@ -135,6 +135,7 @@
   <div class="toolbar">
     <p><span id="filterCount">0</span> filters</p>
     <div class="actions">
+      <button id="viewResumesBtn" hidden><i class="ti ti-folder"></i>View resumes</button>
       <button onclick="reloadFilters()"><i class="ti ti-refresh"></i>Reload</button>
       <button class="primary" id="addBtn"><i class="ti ti-plus"></i>Add role</button>
     </div>
@@ -457,6 +458,13 @@ document.getElementById("signOutBtn").addEventListener("click", signOut);
 document.getElementById("addBtn").addEventListener("click", openAdd);
 document.getElementById("addCancelBtn").addEventListener("click", closeAdd);
 document.getElementById("addSaveBtn").addEventListener("click", addRole);
+
+// Show the "View resumes" button only if a Drive folder URL is configured.
+if (cfg.resumeFolderUrl) {
+  const btn = document.getElementById("viewResumesBtn");
+  btn.hidden = false;
+  btn.addEventListener("click", () => window.open(cfg.resumeFolderUrl, "_blank", "noopener,noreferrer"));
+}
 
 init();
 </script>
