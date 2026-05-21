@@ -1,0 +1,28 @@
+name: Bulk test scorer (offline)
+
+# Runs every test case in tests/test-resumes.yaml against the current
+# filter set in filters.yaml. Prints a per-test breakdown and a summary
+# table to the Actions log. No Google APIs touched.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bulk test scorer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-5' }}
+        run: python -m src.bulk_test_scorer_offline
