@@ -1,0 +1,47 @@
+name: Test scorer (offline)
+
+# Quick scoring test that works WITHOUT the Google jobs@ refresh token.
+# Uses filters from filters.yaml (the repo's seed) and prints results to
+# the Actions log. Once GOOGLE_OAUTH_REFRESH_TOKEN is set up, switch to
+# the regular 'Test scorer' workflow which writes results to the Sheet.
+on:
+  workflow_dispatch:
+    inputs:
+      resume_text:
+        description: "Resume text (paste the full resume body)"
+        required: true
+        type: string
+      email_subject:
+        description: "Email subject line (optional)"
+        required: false
+        type: string
+        default: ""
+      email_body:
+        description: "Email body (optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the offline test scorer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-5' }}
+          RESUME_TEXT: ${{ inputs.resume_text }}
+          EMAIL_SUBJECT: ${{ inputs.email_subject }}
+          EMAIL_BODY: ${{ inputs.email_body }}
+        run: python -m src.test_scorer_offline
