@@ -27,9 +27,9 @@ class Template:
 
 DASHBOARD_HEADERS = [
     "Timestamp", "Candidate Name", "Email", "Phone", "Original Filename",
-    "Best-Fit Roles & Scores", "Decision", "Years Relevant Exp", "Job Hopping",
-    "Confidence", "AI Reasoning", "Drive File Link", "Gmail Thread Link",
-    "HR Status", "HR Notes",
+    "Applied For", "Best-Fit Roles & Scores", "Cross-Fit Flag", "Decision",
+    "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
+    "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
 ]
 
 
@@ -39,10 +39,10 @@ SEED_TEMPLATES: list[Template] = [
         subject="Please resend with your resume attached",
         body=(
             "Hi {applicant_name},\n\n"
-            "Thanks for reaching out about a position at {company_name}. We "
-            "didn't see a resume attached to your message — could you reply "
-            "to this email with your resume as a PDF or Word attachment? "
-            "Once we have it we'll get back to you.\n\n"
+            "Thanks for reaching out about a position at {company_name}. "
+            "We didn't see a resume attached to your message - could you "
+            "reply with your resume as a PDF or Word attachment? Once we "
+            "have it we'll get back to you.\n\n"
             "Thanks,\n"
             "{company_name} HR"
         ),
@@ -53,10 +53,10 @@ SEED_TEMPLATES: list[Template] = [
         subject="Thank you for your interest in {company_name}",
         body=(
             "Hi {applicant_name},\n\n"
-            "Thank you for applying to {company_name}. After reviewing your "
-            "background against the role's requirements, we don't have a "
-            "current match. We'll keep your resume on file in case anything "
-            "opens up.\n\n"
+            "Thank you for applying to {company_name}. After reviewing "
+            "your background against the role's requirements, we don't "
+            "have a current match. We'll keep your resume on file in "
+            "case anything opens up.\n\n"
             "Best wishes in your search,\n"
             "{company_name} HR"
         ),
@@ -67,11 +67,11 @@ SEED_TEMPLATES: list[Template] = [
         subject="We'll keep your resume on file for {role}",
         body=(
             "Hi {applicant_name},\n\n"
-            "Thanks for applying to {company_name}. Your background looks "
-            "like a strong fit for {role}, but that role is currently on "
-            "hold — we're not actively interviewing for it right now. We've "
-            "added your resume to our pending file and will reach back out "
-            "when that role re-opens.\n\n"
+            "Thanks for applying to {company_name}. Your background "
+            "looks like a strong fit for {role}, but that role is "
+            "currently on hold - we're not actively interviewing for "
+            "it right now. We've added your resume to our pending file "
+            "and will reach back out when that role re-opens.\n\n"
             "Thanks for your patience,\n"
             "{company_name} HR"
         ),
@@ -90,11 +90,11 @@ def _is_truthy(v) -> bool:
     return s in {"true", "yes", "y", "on", "1", "x"}
 
 
-def load_filters(svc, sheet_id: str, tab: str) -> list[Filter]:
+def load_filters(svc, sheet_id, tab):
     rng = f"{tab}!A2:D"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     rows = resp.get("values", [])
-    out: list[Filter] = []
+    out = []
     for r in rows:
         r = (r + [""] * 4)[:4]
         role, req, hop, active = r
@@ -109,7 +109,7 @@ def load_filters(svc, sheet_id: str, tab: str) -> list[Filter]:
     return out
 
 
-def ensure_templates_seeded(svc, sheet_id: str, tab: str) -> None:
+def ensure_templates_seeded(svc, sheet_id, tab):
     head_rng = f"{tab}!A1:D1"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=head_rng).execute()
     if resp.get("values"):
@@ -125,11 +125,11 @@ def ensure_templates_seeded(svc, sheet_id: str, tab: str) -> None:
     ).execute()
 
 
-def load_templates(svc, sheet_id: str, tab: str) -> dict[str, Template]:
+def load_templates(svc, sheet_id, tab):
     rng = f"{tab}!A2:D"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     rows = resp.get("values", [])
-    out: dict[str, Template] = {}
+    out = {}
     for r in rows:
         r = (r + [""] * 4)[:4]
         key, subject, body, active = r
@@ -144,16 +144,16 @@ def load_templates(svc, sheet_id: str, tab: str) -> dict[str, Template]:
     return out
 
 
-def render_template(tmpl: Template, vars: dict[str, str]) -> tuple[str, str]:
-    def fill(s: str) -> str:
+def render_template(tmpl, vars):
+    def fill(s):
         for k, v in vars.items():
             s = s.replace("{" + k + "}", str(v))
         return s
     return fill(tmpl.subject), fill(tmpl.body)
 
 
-def ensure_dashboard_headers(svc, sheet_id: str, tab: str) -> None:
-    rng = f"{tab}!A1:O1"
+def ensure_dashboard_headers(svc, sheet_id, tab):
+    rng = f"{tab}!A1:Q1"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     if resp.get("values"):
         return
@@ -163,7 +163,7 @@ def ensure_dashboard_headers(svc, sheet_id: str, tab: str) -> None:
     ).execute()
 
 
-def append_candidate(svc, sheet_id: str, tab: str, row: dict) -> None:
+def append_candidate(svc, sheet_id, tab, row):
     best_fit_str = ", ".join(row.get("best_fit_with_scores") or [])
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -171,7 +171,9 @@ def append_candidate(svc, sheet_id: str, tab: str, row: dict) -> None:
         row.get("email", ""),
         row.get("phone", ""),
         row.get("filename", ""),
+        row.get("applied_for", ""),
         best_fit_str,
+        row.get("cross_fit_flag", ""),
         row.get("decision", ""),
         row.get("years_relevant_experience", ""),
         row.get("job_hopping_flag", ""),
@@ -182,7 +184,9 @@ def append_candidate(svc, sheet_id: str, tab: str, row: dict) -> None:
         "", "",
     ]
     svc.spreadsheets().values().append(
-        spreadsheetId=sheet_id, range=f"{tab}!A:O",
-        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A:Q",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
