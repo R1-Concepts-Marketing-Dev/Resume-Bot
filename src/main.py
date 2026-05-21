@@ -166,6 +166,18 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
 
         best_fit_with_scores = [f"{r['role']} ({r['fit_score']})" for r in result["best_fit_roles"]]
+
+        # Cross-fit flag: applicant specified a role, but their best-scoring
+        # active match is a different role. Pure visibility - doesn't change
+        # routing or emails.
+        applied_for = result.get("applied_for_role", "unspecified") or "unspecified"
+        top_active = active_matches[0]["role"] if active_matches else ""
+        cross_fit_flag = (
+            "Yes"
+            if (applied_for != "unspecified" and top_active and applied_for != top_active)
+            else "No"
+        )
+
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
             {
@@ -173,7 +185,9 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 "email": result["candidate_email"] or msg.sender_email,
                 "phone": result["candidate_phone"],
                 "filename": att.filename,
+                "applied_for": applied_for,
                 "best_fit_with_scores": best_fit_with_scores,
+                "cross_fit_flag": cross_fit_flag,
                 "decision": bucket,
                 "years_relevant_experience": result["years_relevant_experience"],
                 "job_hopping_flag": result["job_hopping_flag"],
