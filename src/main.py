@@ -1,25 +1,10 @@
-"""Orchestrator. Runs once per GitHub Actions invocation:
-
-  1. Build Google API clients (service account impersonating jobs@).
-  2. Load active filters from the Filters tab in the Google Sheet.
-     (Falls back to filters.yaml if the Sheet tab is empty.)
-  3. Find Gmail messages with attachments that aren't labeled "processed".
-  4. For each message:
-       - download each PDF/DOCX attachment
-       - extract text (with OCR fallback for scanned PDFs)
-       - score with Claude
-       - upload original file to the appropriate Drive folder
-       - append a row to the Candidates dashboard
-       - apply the "processed" Gmail label
-
-The "processed" label is the bot's only state — re-runs are idempotent.
-"""
+"""Orchestrator. Runs once per GitHub Actions invocation."""
 
 from __future__ import annotations
 
 import logging
-import os
 import pathlib
+import re
 import sys
 
 import yaml
@@ -34,15 +19,10 @@ logging.basicConfig(
 log = logging.getLogger("resume-bot")
 
 
-BUCKET_TO_FOLDER = {
-    "qualified": "folder_qualified",
-    "not_qualified": "folder_not_qualified",
-    "needs_review": "folder_review",
-}
+QUALIFIED_THRESHOLD = 60
 
 
 def _load_seed_filters() -> list[sheets_client.Filter]:
-    """Load filters.yaml from repo root as a fallback."""
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     yaml_path = repo_root / "filters.yaml"
     if not yaml_path.exists():
@@ -56,8 +36,19 @@ def _load_seed_filters() -> list[sheets_client.Filter]:
             active=f.get("active", True),
         )
         for f in (data.get("filters") or [])
-        if f.get("active", True)
     ]
+
+
+def _sanitize_filename_tag(roles: list[str]) -> str:
+    if not roles:
+        return ""
+    cleaned = []
+    for r in roles:
+        r2 = re.sub(r'[\\/<>:|?*"]', "", r).strip()
+        if len(r2) > 40:
+            r2 = r2[:37] + "..."
+        cleaned.append(r2)
+    return f"[{', '.join(cleaned)}] "
 
 
 def run() -> int:
@@ -71,49 +62,67 @@ def run() -> int:
     drive = google_auth.drive(creds)
     sheets = google_auth.sheets(creds)
 
-    # Filters: prefer Sheet (HR-editable), fall back to YAML seed.
     sheets_client.ensure_dashboard_headers(sheets, cfg.sheet_id, cfg.dashboard_tab)
-    filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
-    if not filters:
-        log.warning("Filters tab is empty — using filters.yaml as seed.")
-        filters = _load_seed_filters()
-    if not filters:
-        log.error("No active filters found. Aborting.")
+    sheets_client.ensure_templates_seeded(sheets, cfg.sheet_id, cfg.templates_tab)
+
+    all_filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
+    if not all_filters:
+        log.warning("Filters tab is empty - using filters.yaml seed.")
+        all_filters = _load_seed_filters()
+    if not all_filters:
+        log.error("No filters at all. Aborting.")
         return 2
-    log.info("Loaded %d active filter(s).", len(filters))
 
-    # Ensure the "processed" Gmail label exists, capture its ID.
+    active_role_names = {f.role for f in all_filters if f.active}
+    paused_role_names = {f.role for f in all_filters if not f.active}
+    log.info("Loaded %d filter(s): %d active, %d paused.",
+             len(all_filters), len(active_role_names), len(paused_role_names))
+
+    templates = sheets_client.load_templates(sheets, cfg.sheet_id, cfg.templates_tab)
+    log.info("Loaded %d active template(s): %s", len(templates), list(templates.keys()))
+
     label_id = gmail_client.ensure_label(gmail, cfg.gmail_user, cfg.processed_label)
-
     msg_ids = gmail_client.list_unprocessed(
         gmail, cfg.gmail_user, cfg.processed_label, cfg.max_messages_per_run
     )
     if not msg_ids:
-        log.info("No new messages with attachments. Nothing to do.")
+        log.info("No unprocessed inbox messages. Nothing to do.")
         return 0
     log.info("Found %d unprocessed message(s).", len(msg_ids))
 
-    handled = 0
+    scored = 0
     errors = 0
     for msg_id in msg_ids:
         try:
-            handled += _handle_one(cfg, gmail, drive, sheets, filters, msg_id, label_id)
+            scored += _handle_one(
+                cfg, gmail, drive, sheets, all_filters, templates,
+                active_role_names, paused_role_names, msg_id, label_id,
+            )
         except Exception:
-            log.exception("Failed to handle message %s — leaving unlabeled for retry next run.", msg_id)
+            log.exception("Failed to handle message %s.", msg_id)
             errors += 1
 
-    log.info("Run complete. Attachments scored: %d. Message-level errors: %d.", handled, errors)
+    log.info("Run complete. Attachments scored: %d. Errors: %d.", scored, errors)
     return 0 if errors == 0 else 1
 
 
-def _handle_one(cfg, gmail, drive, sheets, filters, msg_id, label_id) -> int:
+def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
+                active_role_names, paused_role_names, msg_id, label_id) -> int:
     msg = gmail_client.fetch(gmail, cfg.gmail_user, msg_id)
-    if not msg.attachments:
-        # Nothing to score, but still mark processed so we don't re-scan.
+    log.info("msg=%s subj=%r from=%s attachments=%d",
+             msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
+
+    if not msg.has_resume:
+        if msg.sender_email and "no_resume" in templates:
+            _send_template(
+                gmail, cfg, templates["no_resume"], msg,
+                vars_extra={"applicant_name": msg.sender_name or "there"},
+            )
+            log.info("  -> no resume; sent 'no_resume' reply to %s", msg.sender_email)
+        else:
+            log.info("  -> no resume / no sender / no template; skipped.")
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
-
-    log.info("msg=%s subj=%r attachments=%d", msg_id, msg.subject[:60], len(msg.attachments))
 
     scored = 0
     for att in msg.attachments:
@@ -122,25 +131,49 @@ def _handle_one(cfg, gmail, drive, sheets, filters, msg_id, label_id) -> int:
             api_key=cfg.anthropic_api_key,
             model=cfg.anthropic_model,
             resume_text=text,
-            filters=filters,
+            filters=all_filters,
+            email_subject=msg.subject,
+            email_body=msg.body_text,
             used_ocr=used_ocr,
         )
 
-        bucket = result["bucket"]
-        folder_attr = BUCKET_TO_FOLDER[bucket]
-        folder_id = getattr(cfg, folder_attr)
+        qualifying = [r for r in result["best_fit_roles"] if r["fit_score"] >= QUALIFIED_THRESHOLD]
+        active_matches = [r for r in qualifying if r["role"] in active_role_names]
+        paused_matches = [r for r in qualifying if r["role"] in paused_role_names]
+
+        if result["overall_decision"] == "needs_review":
+            bucket = "needs_review"
+            folder_id = cfg.folder_review
+            template_key = None
+        elif active_matches:
+            bucket = "qualified"
+            folder_id = cfg.folder_qualified
+            template_key = None
+        elif paused_matches:
+            bucket = "pending_paused"
+            folder_id = cfg.folder_pending
+            template_key = "paused_match"
+        else:
+            bucket = "not_qualified"
+            folder_id = cfg.folder_not_qualified
+            template_key = "denied"
+
+        tag_roles = active_matches or paused_matches or qualifying
+        tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
+        tagged_name = f"{tag}{att.filename}" if tag else att.filename
         drive_link = drive_client.upload(
-            drive, att.filename, att.data, att.mime_type or "application/pdf", folder_id
+            drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
         )
 
+        best_fit_with_scores = [f"{r['role']} ({r['fit_score']})" for r in result["best_fit_roles"]]
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
             {
                 "candidate_name": result["candidate_name"],
-                "email": result["candidate_email"],
+                "email": result["candidate_email"] or msg.sender_email,
                 "phone": result["candidate_phone"],
                 "filename": att.filename,
-                "best_fit_roles": result["best_fit_roles"],
+                "best_fit_with_scores": best_fit_with_scores,
                 "decision": bucket,
                 "years_relevant_experience": result["years_relevant_experience"],
                 "job_hopping_flag": result["job_hopping_flag"],
@@ -150,15 +183,50 @@ def _handle_one(cfg, gmail, drive, sheets, filters, msg_id, label_id) -> int:
                 "gmail_link": msg.thread_link,
             },
         )
-        scored += 1
-        log.info(
-            "  → %s | %s | conf=%.2f | %s",
-            att.filename, bucket, result["confidence"], result["candidate_name"],
-        )
 
-    # All attachments handled successfully → mark the message processed.
+        if template_key and template_key in templates and msg.sender_email:
+            applicant_name = result["candidate_name"] or msg.sender_name or "there"
+            primary_role = (paused_matches[0]["role"] if paused_matches
+                            else (qualifying[0]["role"] if qualifying else ""))
+            _send_template(
+                gmail, cfg, templates[template_key], msg,
+                vars_extra={
+                    "applicant_name": applicant_name,
+                    "role": primary_role,
+                    "best_fit_roles": ", ".join([r["role"] for r in qualifying]),
+                },
+            )
+            log.info("  -> %s | conf=%.2f | sent '%s' to %s",
+                     bucket, result["confidence"], template_key, msg.sender_email)
+        else:
+            log.info("  -> %s | conf=%.2f | no email", bucket, result["confidence"])
+
+        scored += 1
+
     gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
     return scored
+
+
+def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
+    vars_ = {"company_name": cfg.company_name, **vars_extra}
+    subject, body = sheets_client.render_template(template, vars_)
+    msg_full = gmail.users().messages().get(
+        userId=cfg.gmail_user, id=msg.id, format="metadata",
+        metadataHeaders=["Message-ID"],
+    ).execute()
+    in_reply_to = ""
+    for h in msg_full.get("payload", {}).get("headers", []):
+        if h["name"].lower() == "message-id":
+            in_reply_to = h["value"]
+            break
+    gmail_client.send_reply(
+        gmail, cfg.gmail_user,
+        to=msg.sender_email,
+        subject=subject,
+        body=body,
+        thread_id=msg.thread_id,
+        in_reply_to_msg_id=in_reply_to,
+    )
 
 
 if __name__ == "__main__":
