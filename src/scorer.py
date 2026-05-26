@@ -21,7 +21,9 @@ user message. If the resume is unreadable or you cannot reasonably score it, \
 set overall_decision to "needs_review" and explain in reasoning."""
 
 
-USER_TEMPLATE = """Open roles and their minimum requirements:
+USER_TEMPLATE = """Today's date: {today}. Use this as your anchor for "recent" and "current." Any "Present" or "Current" in the resume means up through today. Treat all date math relative to today, not your training cutoff.
+
+Open roles and their minimum requirements:
 
 {filter_block}
 
@@ -89,7 +91,7 @@ Cross-fit scores for OTHER roles are informational only when the applicant speci
 
 Recency rule: identify the end date of the candidate's most recent work experience. If that end date is more than 12 months before today, cap fit_score at 50 for ALL roles and set overall_decision to "needs_review". Skills decay - someone who hasn't worked in 18 months is not the same hire as someone working through last week, even if their past experience was strong. Currently-employed candidates (current or "Present" end date) are not affected by this rule.
 
-Job-hopping hard cap: count roles in the last 18 months. If there are 3 or more roles AND each one lasted less than 9 months, cap fit_score at 50 for all roles regardless of total years of experience. This signals high flight risk. A single short stint or one short stint within an otherwise stable history does NOT trigger this cap - only a clear pattern of consecutive short tenures in recent history.
+Job-hopping hard cap: look at the candidate's last 18 months of work history relative to today's date (provided above). Count the roles that started and/or ended within that window. If 3 or more of those roles each lasted less than 9 months, cap fit_score at 50 for all roles. This is a pattern test, not an all-or-nothing test: even if the candidate has one longer role mixed in (e.g. 11 months at one employer surrounded by 3-month stints at others), the surrounding pattern of short tenures still triggers the cap. The point is recent flight risk — someone with three 2-4 month roles in the last year is at high risk of leaving regardless of what came before.
 """
 
 
@@ -104,7 +106,9 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
         return _fallback("Empty resume text - could not extract content.")
 
     job_hopping = filters[0].job_hopping if filters else "Average tenure > 1 year = positive"
+    from datetime import date
     user_msg = USER_TEMPLATE.format(
+        today=date.today().isoformat(),
         filter_block=_build_filter_block(filters),
         job_hopping=job_hopping,
         email_subject=(email_subject or "(none)")[:200],
