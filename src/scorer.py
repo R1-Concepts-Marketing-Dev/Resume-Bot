@@ -80,6 +80,16 @@ Email-context rule: if the applicant's email subject or body explicitly mentions
 applied_for_role rule: read the email subject and body. If the applicant explicitly names a role they're applying for (e.g. "applying for Cherry Picker", "interested in the forklift driver position"), match it to the closest role name from the list above and return that EXACT name. If they just say "any position", "warehouse work", or don't mention a role at all, return "unspecified".
 
 Verifiability rule: a fit_score above 60 requires the resume to provide at least one verifiable employer name AND a date range (e.g. "2022-2024 at ABC Logistics" or "Mar 2023 - Present, FastWarehouse Inc"). If experience claims have no employer name or no dates, cap fit_score at 50 for every role and set overall_decision to "needs_review", regardless of how plausible the claims sound. Vague resumes that just list years of experience without specifics are not enough.
+
+Applied-for trump rule: if applied_for_role is NOT "unspecified", the overall_decision MUST be driven by the fit_score for THAT specific role:
+  - fit_score for applied_for role >= 60 -> overall_decision can be "qualified"
+  - fit_score for applied_for role between 50 and 59 -> overall_decision must be "needs_review"
+  - fit_score for applied_for role < 50 -> overall_decision must be "not_qualified"
+Cross-fit scores for OTHER roles are informational only when the applicant specified what they wanted. Do not "upgrade" the overall_decision based on a high score in a role they did not apply for. The applicant chose a role; respect that choice for the decision.
+
+Recency rule: identify the end date of the candidate's most recent work experience. If that end date is more than 12 months before today, cap fit_score at 50 for ALL roles and set overall_decision to "needs_review". Skills decay - someone who hasn't worked in 18 months is not the same hire as someone working through last week, even if their past experience was strong. Currently-employed candidates (current or "Present" end date) are not affected by this rule.
+
+Job-hopping hard cap: count roles in the last 18 months. If there are 3 or more roles AND each one lasted less than 9 months, cap fit_score at 50 for all roles regardless of total years of experience. This signals high flight risk. A single short stint or one short stint within an otherwise stable history does NOT trigger this cap - only a clear pattern of consecutive short tenures in recent history.
 """
 
 
