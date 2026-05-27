@@ -19,7 +19,9 @@ logging.basicConfig(
 log = logging.getLogger("resume-bot")
 
 
-QUALIFIED_THRESHOLD = 60
+# Levels that count as "qualified" for the active/paused-matches gate.
+# Mirrors scorer.QUALIFIED_LEVELS so we don't drift if the scorer changes.
+QUALIFIED_LEVELS = scorer.QUALIFIED_LEVELS
 
 
 def _load_seed_filters() -> list[sheets_client.Filter]:
@@ -137,7 +139,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             used_ocr=used_ocr,
         )
 
-        qualifying = [r for r in result["best_fit_roles"] if r["fit_score"] >= QUALIFIED_THRESHOLD]
+        qualifying = [r for r in result["best_fit_roles"] if r["fit_level"] in QUALIFIED_LEVELS]
         active_matches = [r for r in qualifying if r["role"] in active_role_names]
         paused_matches = [r for r in qualifying if r["role"] in paused_role_names]
 
@@ -165,7 +167,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
         )
 
-        best_fit_with_scores = [f"{r['role']} ({r['fit_score']})" for r in result["best_fit_roles"]]
+        best_fit_with_scores = [f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]]
 
         # Cross-fit flag: applicant specified a role, but their best-scoring
         # active match is a different role. Pure visibility - doesn't change
