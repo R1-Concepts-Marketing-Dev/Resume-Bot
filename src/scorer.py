@@ -199,4 +199,41 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     r.setdefault("applied_for_role", "unspecified")
     if not str(r["applied_for_role"]).strip():
         r["applied_for_role"] = "unspecified"
+
+    # Deterministic overall_decision derived from fit_scores. The model is
+    # asked to return overall_decision too, but it sometimes contradicts its
+    # own scores (e.g. returns "not_qualified" when its top score is 75).
+    # Recomputing here keeps the decision aligned with the math.
+    try:
+        confidence = float(r.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    applied = str(r.get("applied_for_role", "unspecified")).strip()
+    if applied and applied.lower() != "unspecified":
+        # Applied-for trump: decision is driven by the applied role's score.
+        applied_score = next(
+            (it["fit_score"] for it in cleaned if it["role"].lower() == applied.lower()),
+            0,
+        )
+        if applied_score >= 60:
+            r["overall_decision"] = "qualified"
+        elif applied_score >= 50:
+            r["overall_decision"] = "needs_review"
+        else:
+            r["overall_decision"] = "not_qualified"
+    else:
+        # Unspecified: best score across all roles drives the decision.
+        top_score = cleaned[0]["fit_score"] if cleaned else 0
+        if top_score >= 60:
+            r["overall_decision"] = "qualified"
+        elif top_score >= 50:
+            r["overall_decision"] = "needs_review"
+        else:
+            r["overall_decision"] = "not_qualified"
+
+    # Low confidence always demotes a "qualified" verdict to "needs_review".
+    if confidence and confidence < 0.6 and r["overall_decision"] == "qualified":
+        r["overall_decision"] = "needs_review"
+
     return r
