@@ -106,7 +106,7 @@ def run() -> int:
         conf = float(result.get("confidence") or 0)
         applied = result.get("applied_for_role", "unspecified") or "unspecified"
         roles_text = ", ".join(
-            f"{r['role']} ({r['fit_score']})" for r in result["best_fit_roles"]
+            f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]
         )
         pass_fail = "PASS" if decision == expected else "FAIL"
 
