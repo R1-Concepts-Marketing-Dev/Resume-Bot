@@ -88,7 +88,7 @@ def run() -> int:
     print(f"Job hopping: {result['job_hopping_flag']}")
     print("\nBest-fit roles (sorted high to low):")
     for r in result["best_fit_roles"]:
-        print(f"  {r['fit_score']:3d}  {r['role']}")
+        print(f"  {r['fit_level']:>10}  {r['role']}")
         if r.get("reasoning"):
             print(f"        \\ {r['reasoning']}")
     print(f"\nOverall reasoning:\n{result['reasoning']}")
