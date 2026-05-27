@@ -11,6 +11,19 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
+# Ordered worst -> best. Used internally for sorting and for the deterministic
+# overall_decision logic. The model never sees these numbers; they're just so
+# we can compare categories in Python.
+FIT_LEVELS = ("no_fit", "weak", "borderline", "strong", "excellent")
+_LEVEL_RANK = {lvl: i for i, lvl in enumerate(FIT_LEVELS)}
+
+# Levels that count as "qualified" for the overall decision.
+QUALIFIED_LEVELS = {"strong", "excellent"}
+# Levels included on the dashboard's best_fit_roles list (everything except
+# no_fit). "weak" shows up so HR can see roles the bot considered and rejected.
+SURFACED_LEVELS = {"weak", "borderline", "strong", "excellent"}
+
+
 SYSTEM_PROMPT = """You are an HR screening assistant for a brake parts \
 company. You read a candidate's resume text (plus the email they sent it in) \
 and decide how well they match each open role.
@@ -48,8 +61,8 @@ Respond with this exact JSON schema:
   "best_fit_roles": [
     {{
       "role": "<exact role name from the list above>",
-      "fit_score": <integer 0-100>,
-      "reasoning": "<1-2 sentence justification of the score>"
+      "fit_level": "excellent" | "strong" | "borderline" | "weak" | "no_fit",
+      "reasoning": "<1-2 sentence justification of the level>"
     }}
   ],
   "overall_decision": "qualified" | "not_qualified" | "needs_review",
@@ -63,37 +76,37 @@ Respond with this exact JSON schema:
   "applied_for_role": "<exact role name the applicant explicitly applied for, OR 'unspecified'>"
 }}
 
-Include EVERY role from the list above where fit_score >= 30 in best_fit_roles. Omit roles where the candidate is clearly not a fit at all. Sort by fit_score descending.
+Include EVERY role in best_fit_roles where the candidate is at least "weak" -- i.e. they were considered for the role even if they fall short. Omit only roles where they are clearly "no_fit". Sort by fit_level descending (excellent > strong > borderline > weak).
 
-Fit-score rubric (apply to each role independently):
-  90-100  Strong match: meets minimum + extra relevant experience + recent + good tenure
-  70-89   Meets the minimum bar comfortably
-  50-69   Meets the minimum but borderline
-  30-49   Close but does not meet the stated minimum
-  0-29    Clearly not a fit (omit from best_fit_roles)
+Fit-level rubric (apply to each role independently):
+  excellent   Meets the minimum requirement AND has extra relevant experience, recent employment, and a stable tenure pattern. Top-of-funnel hire.
+  strong      Meets the minimum requirement comfortably. Recent and verifiable. Would interview.
+  borderline  Meets the minimum but only just -- limited evidence, unclear tenure, or shaky recency. HR should decide.
+  weak        Close but does NOT meet the stated minimum. Some adjacent experience, not enough on the actual requirement.
+  no_fit      Clearly not a match for this role. Omit from best_fit_roles.
 
 overall_decision rules:
-  qualified       - at least one role has fit_score >= 60
-  not_qualified   - no role has fit_score >= 50
+  qualified       - at least one role is "excellent" or "strong"
+  not_qualified   - no role is "borderline" or higher
   needs_review    - anything ambiguous, OCR-degraded, or confidence < 0.6
 
-Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your scoring. If they don't specify, score against every open role.
+Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your assessment. If they don't specify, evaluate against every open role.
 
 applied_for_role rule: read the email subject and body. If the applicant explicitly names a role they're applying for (e.g. "applying for Cherry Picker", "interested in the forklift driver position"), match it to the closest role name from the list above and return that EXACT name. If they just say "any position", "warehouse work", or don't mention a role at all, return "unspecified".
 
-Verifiability rule: a fit_score above 60 requires the resume to provide at least one verifiable employer name AND a date range (e.g. "2022-2024 at ABC Logistics" or "Mar 2023 - Present, FastWarehouse Inc"). If experience claims have no employer name or no dates, cap fit_score at 50 for every role and set overall_decision to "needs_review", regardless of how plausible the claims sound. Vague resumes that just list years of experience without specifics are not enough.
+Verifiability rule: a fit_level of "strong" or "excellent" requires the resume to provide at least one verifiable employer name AND a date range (e.g. "2022-2024 at ABC Logistics" or "Mar 2023 - Present, FastWarehouse Inc"). If experience claims have no employer name or no dates, cap fit_level at "borderline" for every role and set overall_decision to "needs_review", regardless of how plausible the claims sound. Vague resumes that just list years of experience without specifics are not enough.
 
-Applied-for trump rule: if applied_for_role is NOT "unspecified", the overall_decision MUST be driven by the fit_score for THAT specific role:
-  - fit_score for applied_for role >= 60 -> overall_decision can be "qualified"
-  - fit_score for applied_for role between 50 and 59 -> overall_decision must be "needs_review"
-  - fit_score for applied_for role < 50 -> overall_decision must be "not_qualified"
-Cross-fit scores for OTHER roles are informational only when the applicant specified what they wanted. Do not "upgrade" the overall_decision based on a high score in a role they did not apply for. The applicant chose a role; respect that choice for the decision.
+Applied-for trump rule: if applied_for_role is NOT "unspecified", the overall_decision MUST be driven by the fit_level for THAT specific role:
+  - applied role is "strong" or "excellent" -> overall_decision can be "qualified"
+  - applied role is "borderline" -> overall_decision must be "needs_review"
+  - applied role is "weak" or "no_fit" -> overall_decision must be "not_qualified"
+Cross-fit levels for OTHER roles are informational only when the applicant specified what they wanted. Do not "upgrade" the overall_decision based on a high level in a role they did not apply for. The applicant chose a role; respect that choice for the decision.
 
-Recency rule: identify the end date of the candidate's most recent work experience. If that end date is more than 12 months before today, cap fit_score at 50 for ALL roles and set overall_decision to "needs_review". Skills decay - someone who hasn't worked in 18 months is not the same hire as someone working through last week, even if their past experience was strong. Currently-employed candidates (current or "Present" end date) are not affected by this rule.
+Recency rule: identify the end date of the candidate's most recent work experience. ONLY trigger this rule if that end date is MORE THAN 12 months before today. A 7-month gap or a 10-month gap does NOT trigger this rule -- only gaps strictly longer than 12 months. If the gap is more than 12 months, cap fit_level at "borderline" for ALL roles and set overall_decision to "needs_review". Skills decay - someone who hasn't worked in 18 months is not the same hire as someone working through last week. Currently-employed candidates (current or "Present" end date) are NEVER affected by this rule.
 
-Job-hopping hard cap: look at the candidate's last 18 months of work history relative to today's date (provided above). Count the roles that started and/or ended within that window. If 3 or more of those roles each lasted less than 9 months, cap fit_score at 50 for all roles. This is a pattern test, not an all-or-nothing test: even if the candidate has one longer role mixed in (e.g. 11 months at one employer surrounded by 3-month stints at others), the surrounding pattern of short tenures still triggers the cap. The point is recent flight risk — someone with three 2-4 month roles in the last year is at high risk of leaving regardless of what came before.
+Job-hopping hard cap: look at the candidate's last 18 months of work history relative to today's date (provided above). Count the roles that started and/or ended within that window. If 3 or more of those roles each lasted less than 9 months, cap fit_level at "borderline" for all roles. This is a pattern test, not an all-or-nothing test: even if the candidate has one longer role mixed in (e.g. 11 months at one employer surrounded by 3-month stints at others), the surrounding pattern of short tenures still triggers the cap. The point is recent flight risk -- someone with three 2-4 month roles in the last year is at high risk of leaving regardless of what came before.
 
-Concurrent-role exception: before counting roles for the job-hopping cap, check for overlapping date ranges. If two or more roles in the resume have dates that overlap in time (e.g. "TW Services Jan 2021–Present" running alongside "Harbor Logistics Nov 2025–Jan 2026"), identify the longest-running role as the primary employment and treat any overlapping shorter roles as side gigs, temp/contract work, or second jobs — NOT as job changes. When applying the job-hopping cap, do not count these overlapping side gigs as separate "hops"; only count roles that represent a true switch of primary employment (one role ending before another begins). Side gigs alongside stable primary employment are a sign of work ethic, not flight risk. A candidate with one stable 5-year job and three concurrent 2-month temp gigs is NOT a job-hopper.
+Concurrent-role exception: before counting roles for the job-hopping cap, check for overlapping date ranges. If two or more roles in the resume have dates that overlap in time (e.g. "TW Services Jan 2021-Present" running alongside "Harbor Logistics Nov 2025-Jan 2026"), identify the longest-running role as the primary employment and treat any overlapping shorter roles as side gigs, temp/contract work, or second jobs -- NOT as job changes. When applying the job-hopping cap, do not count these overlapping side gigs as separate "hops"; only count roles that represent a true switch of primary employment (one role ending before another begins). Side gigs alongside stable primary employment are a sign of work ethic, not flight risk. A candidate with one stable 5-year job and three concurrent 2-month temp gigs is NOT a job-hopper.
 """
 
 
@@ -164,6 +177,36 @@ def _fallback(reason: str) -> dict[str, Any]:
     }
 
 
+def _coerce_level(raw: Any) -> str:
+    """Map any incoming value to one of the FIT_LEVELS, defaulting to no_fit."""
+    if isinstance(raw, str):
+        s = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        if s in _LEVEL_RANK:
+            return s
+        # Backwards-compatible: if the model emits a numeric string, bridge it.
+        try:
+            n = int(float(s))
+            return _score_to_level(n)
+        except ValueError:
+            return "no_fit"
+    if isinstance(raw, (int, float)):
+        return _score_to_level(int(raw))
+    return "no_fit"
+
+
+def _score_to_level(n: int) -> str:
+    """Legacy bridge: map an old 0-100 score to a fit_level bucket."""
+    if n >= 90:
+        return "excellent"
+    if n >= 70:
+        return "strong"
+    if n >= 50:
+        return "borderline"
+    if n >= 30:
+        return "weak"
+    return "no_fit"
+
+
 def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     decision = r.get("overall_decision")
     if decision not in {"qualified", "not_qualified", "needs_review"}:
@@ -174,19 +217,22 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role", "")).strip()
-        try:
-            sc = int(item.get("fit_score", 0))
-        except (TypeError, ValueError):
-            sc = 0
-        sc = max(0, min(100, sc))
         if not role:
+            continue
+        # Accept either fit_level (new) or fit_score (legacy) from the model.
+        if "fit_level" in item:
+            level = _coerce_level(item.get("fit_level"))
+        else:
+            level = _coerce_level(item.get("fit_score"))
+        # Drop roles the model flagged as no_fit -- they shouldn't be on the list.
+        if level == "no_fit":
             continue
         cleaned.append({
             "role": role,
-            "fit_score": sc,
+            "fit_level": level,
             "reasoning": str(item.get("reasoning", "")).strip(),
         })
-    cleaned.sort(key=lambda x: x["fit_score"], reverse=True)
+    cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
     r["best_fit_roles"] = cleaned
 
     r.setdefault("years_relevant_experience", 0)
@@ -200,10 +246,10 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     if not str(r["applied_for_role"]).strip():
         r["applied_for_role"] = "unspecified"
 
-    # Deterministic overall_decision derived from fit_scores. The model is
+    # Deterministic overall_decision derived from fit_levels. The model is
     # asked to return overall_decision too, but it sometimes contradicts its
-    # own scores (e.g. returns "not_qualified" when its top score is 75).
-    # Recomputing here keeps the decision aligned with the math.
+    # own per-role assessments. Recomputing here keeps the decision aligned
+    # with the per-role levels.
     try:
         confidence = float(r.get("confidence") or 0)
     except (TypeError, ValueError):
@@ -211,23 +257,23 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
 
     applied = str(r.get("applied_for_role", "unspecified")).strip()
     if applied and applied.lower() != "unspecified":
-        # Applied-for trump: decision is driven by the applied role's score.
-        applied_score = next(
-            (it["fit_score"] for it in cleaned if it["role"].lower() == applied.lower()),
-            0,
+        # Applied-for trump: decision is driven by the applied role's level.
+        applied_level = next(
+            (it["fit_level"] for it in cleaned if it["role"].lower() == applied.lower()),
+            "no_fit",
         )
-        if applied_score >= 60:
+        if applied_level in QUALIFIED_LEVELS:
             r["overall_decision"] = "qualified"
-        elif applied_score >= 50:
+        elif applied_level == "borderline":
             r["overall_decision"] = "needs_review"
         else:
             r["overall_decision"] = "not_qualified"
     else:
-        # Unspecified: best score across all roles drives the decision.
-        top_score = cleaned[0]["fit_score"] if cleaned else 0
-        if top_score >= 60:
+        # Unspecified: top role across all surfaces drives the decision.
+        top_level = cleaned[0]["fit_level"] if cleaned else "no_fit"
+        if top_level in QUALIFIED_LEVELS:
             r["overall_decision"] = "qualified"
-        elif top_score >= 50:
+        elif top_level == "borderline":
             r["overall_decision"] = "needs_review"
         else:
             r["overall_decision"] = "not_qualified"
