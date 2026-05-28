@@ -39,10 +39,29 @@ SEED_TEMPLATES: list[Template] = [
         subject="Please resend with your resume attached",
         body=(
             "Hi {applicant_name},\n\n"
-            "Thanks for reaching out about a position at {company_name}. "
-            "We didn't see a resume attached to your message - could you "
-            "reply with your resume as a PDF or Word attachment? Once we "
-            "have it we'll get back to you.\n\n"
+            "Thanks for your interest in {company_name}. It looks like "
+            "your resume didn't come through with your email -- could "
+            "you reply with your resume attached as a PDF or Word "
+            "document? Once we have it we'll review and get back to "
+            "you.\n\n"
+            "Thanks,\n"
+            "{company_name} HR"
+        ),
+        active=True,
+    ),
+    Template(
+        key="question",
+        subject="Thanks for reaching out to {company_name}",
+        body=(
+            "Hi {applicant_name},\n\n"
+            "Thanks for reaching out to {company_name}.\n\n"
+            "For questions about open positions, pay, scheduling, or "
+            "the application process, please contact our HR team "
+            "directly at [HR contact email here] and we'll be happy "
+            "to help.\n\n"
+            "If you'd like to apply for a position, please reply to "
+            "this email with your resume attached as a PDF or Word "
+            "document.\n\n"
             "Thanks,\n"
             "{company_name} HR"
         ),
@@ -185,12 +204,7 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
 
 
 def append_error(svc, sheet_id, tab, row):
-    """Append a row to the Bot Errors tab. Records runtime errors and
-    edge cases the bot hits during a run (parse fail, scorer fail, drive
-    upload fail, uncaught exception, low-confidence decision).
-
-    Swallows its own exceptions -- a logging failure must not crash the
-    main run loop."""
+    """Append a row to the Bot Errors tab. Swallows its own exceptions."""
     try:
         values = [
             row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
