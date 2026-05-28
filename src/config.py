@@ -42,6 +42,12 @@ class Config:
     max_messages_per_run: int
     company_name: str
 
+    # Shadow mode: bot reads + scores + writes to the Sheet, but does NOT
+    # touch Gmail (no labels, no archiving, no auto-replies) and does NOT
+    # upload to Drive. Dedup happens by reading existing rows from the
+    # Sheet on each run. Set SHADOW_MODE=true to enable.
+    shadow_mode: bool
+
 
 def load() -> Config:
     return Config(
@@ -63,4 +69,6 @@ def load() -> Config:
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
         company_name=_optional("COMPANY_NAME", "R1 Concepts"),
+        shadow_mode=_optional("SHADOW_MODE", "false").strip().lower()
+                    in {"1", "true", "yes", "on"},
     )
