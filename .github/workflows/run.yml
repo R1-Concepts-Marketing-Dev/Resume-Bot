@@ -56,4 +56,8 @@ jobs:
           #   false = live -- full operation.
           # Flip to "false" once when testing is complete.
           SHADOW_MODE: "true"
+          # BOT_START_DATE: ignore any email received before this date.
+          # Prevents the bot from pulling in old applicants on first run.
+          # Format YYYY-MM-DD or YYYY/MM/DD. Leave blank for no floor.
+          BOT_START_DATE: "2026-05-29"
         run: python -m src.main
