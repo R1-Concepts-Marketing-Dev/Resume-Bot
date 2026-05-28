@@ -26,8 +26,6 @@ RESUME_MIME_TYPES = {
     "image/tiff": ".tif",
 }
 
-# Outcome labels the bot applies to processed emails. Nested under a
-# "Resume Bot" parent so they group together in Gmail's sidebar.
 OUTCOME_LABELS = {
     "qualified":       "Resume Bot/Qualified",
     "needs_review":    "Resume Bot/Needs Review",
@@ -54,6 +52,7 @@ class Message:
     sender_name: str
     body_text: str
     attachments: list[Attachment] = field(default_factory=list)
+    was_unread: bool = False
 
     @property
     def thread_link(self) -> str:
@@ -78,12 +77,9 @@ def ensure_label(svc, user: str, name: str) -> str:
 
 
 def ensure_outcome_labels(svc, user: str) -> dict[str, str]:
-    """Create the 5 outcome labels under a 'Resume Bot' parent if they don't
-    already exist. Returns a mapping from outcome key (e.g. 'qualified') to
-    the Gmail label id."""
+    """Create the 5 outcome labels under a 'Resume Bot' parent if missing."""
     existing = {lbl["name"]: lbl["id"]
                 for lbl in svc.users().labels().list(userId=user).execute().get("labels", [])}
-    # Parent label first so the children nest cleanly in Gmail's sidebar.
     if "Resume Bot" not in existing:
         created = svc.users().labels().create(
             userId=user,
@@ -107,12 +103,31 @@ def ensure_outcome_labels(svc, user: str) -> dict[str, str]:
     return out
 
 
-def list_unprocessed(svc, user: str, processed_label: str, max_results: int) -> list[str]:
+def list_unprocessed(svc, user: str, processed_label: str, max_results: int,
+                     start_date: str = "") -> list[str]:
+    """Live-mode message lookup. Inbox messages that don't already have the
+    bot-seen label, optionally floored to emails received after start_date."""
     query = f"in:inbox -label:{processed_label}"
+    after = _format_after_date(start_date)
+    if after:
+        query = f"{query} after:{after}"
     resp = svc.users().messages().list(
         userId=user, q=query, maxResults=max_results
     ).execute()
     return [m["id"] for m in resp.get("messages", [])]
+
+
+def _format_after_date(s: str) -> str:
+    """Accept YYYY-MM-DD or YYYY/MM/DD, return YYYY/MM/DD for Gmail's after:
+    operator. Empty input returns empty (no filter)."""
+    if not s:
+        return ""
+    s = s.strip().replace("-", "/")
+    parts = s.split("/")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        log.warning("BOT_START_DATE %r looks malformed; ignoring", s)
+        return ""
+    return s
 
 
 def _header(payload: dict, name: str) -> str:
@@ -191,22 +206,19 @@ def fetch(svc, user: str, msg_id: str) -> Message:
         sender_name=sender_name or (sender_email.split("@")[0] if sender_email else ""),
         body_text=_extract_body_text(payload),
         attachments=attachments,
+        was_unread="UNREAD" in msg.get("labelIds", []),
     )
 
 
 def mark_processed(svc, user: str, msg_id: str, label_id: str) -> None:
-    """Apply the 'I've seen this' label without archiving. Used for emails
-    the bot looked at but had no resume attachment to act on."""
+    """Apply the 'I've seen this' label without archiving."""
     svc.users().messages().modify(
         userId=user, id=msg_id, body={"addLabelIds": [label_id]}
     ).execute()
 
 
 def mark_unread(svc, user: str, msg_id: str) -> None:
-    """Force the UNREAD label back on a message. Used in shadow mode so
-    that bot processing doesn't change HR's read/unread tracking in the
-    jobs@ inbox -- HR can still use 'unread count' as their queue gauge
-    while the bot quietly observes in the background."""
+    """Force the UNREAD label back on a message. Used in shadow mode."""
     try:
         svc.users().messages().modify(
             userId=user, id=msg_id,
@@ -218,9 +230,7 @@ def mark_unread(svc, user: str, msg_id: str) -> None:
 
 def archive_with_outcome(svc, user: str, msg_id: str, *,
                          processed_label_id: str, outcome_label_id: str) -> None:
-    """Apply both the bot-seen label and the outcome label, then remove
-    INBOX so the email is archived. The outcome label keeps the thread
-    findable in Gmail's sidebar; archiving keeps the inbox clean."""
+    """Apply both the bot-seen label and the outcome label, then remove INBOX."""
     svc.users().messages().modify(
         userId=user, id=msg_id,
         body={
