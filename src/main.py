@@ -207,15 +207,12 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         tag_roles = active_matches or paused_matches or qualifying
         tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
         tagged_name = f"{tag}{att.filename}" if tag else att.filename
-        if cfg.shadow_mode:
-            # Don't copy the resume to Drive in shadow mode. The Sheet's
-            # Drive Link column will be empty -- HR can pull the resume
-            # from the original Gmail thread (link is in column O).
-            drive_link = ""
-        else:
-            drive_link = drive_client.upload(
-                drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
-            )
+        # Drive uploads run in BOTH shadow and live mode. The Drive folders
+        # are ours to write to and uploading doesn't touch HR's Gmail or
+        # send any outbound communication.
+        drive_link = drive_client.upload(
+            drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
+        )
 
         best_fit_with_scores = [f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]]
 
