@@ -163,6 +163,30 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
     ).execute()
 
 
+def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
+    """Read column O (Gmail Thread Link) from the dashboard and return the
+    set of Gmail thread IDs we've already logged. Used by shadow mode to
+    dedup: in shadow mode we can't apply a Gmail label, so the Sheet is
+    the source of truth for what we've already processed."""
+    import re
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=f"{tab}!O2:O",
+        ).execute()
+    except Exception:
+        return set()
+    ids: set[str] = set()
+    for row in resp.get("values", []):
+        if not row:
+            continue
+        url = str(row[0])
+        # Thread links look like https://mail.google.com/.../#inbox/<threadId>
+        m = re.search(r"#inbox/([A-Za-z0-9]+)", url)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
 def append_candidate(svc, sheet_id, tab, row):
     best_fit_str = ", ".join(row.get("best_fit_with_scores") or [])
     values = [
