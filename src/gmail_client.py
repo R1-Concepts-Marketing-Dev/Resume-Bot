@@ -202,6 +202,20 @@ def mark_processed(svc, user: str, msg_id: str, label_id: str) -> None:
     ).execute()
 
 
+def mark_unread(svc, user: str, msg_id: str) -> None:
+    """Force the UNREAD label back on a message. Used in shadow mode so
+    that bot processing doesn't change HR's read/unread tracking in the
+    jobs@ inbox -- HR can still use 'unread count' as their queue gauge
+    while the bot quietly observes in the background."""
+    try:
+        svc.users().messages().modify(
+            userId=user, id=msg_id,
+            body={"addLabelIds": ["UNREAD"]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to re-mark msg=%s unread: %s", msg_id, e)
+
+
 def archive_with_outcome(svc, user: str, msg_id: str, *,
                          processed_label_id: str, outcome_label_id: str) -> None:
     """Apply both the bot-seen label and the outcome label, then remove
