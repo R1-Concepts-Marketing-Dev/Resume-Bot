@@ -278,4 +278,4 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
             "reasoning": str(item.get("reasoning", "")).strip(),
         })
     cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
-    r["best_fit_roles"] = cleane
+    r["best_fit_roles"] = cleaned
