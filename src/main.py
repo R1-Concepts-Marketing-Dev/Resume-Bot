@@ -247,18 +247,21 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         # never cross-match into paused/pending roles; those go through the
         # Pending tab via the normal paused_match flow.
         top_active = active_matches[0]["role"] if active_matches else ""
-        cross_fit_flag = (
-            "Yes"
-            if (applied_for != "unspecified" and top_active and applied_for != top_active)
-            else "No"
+        is_cross_fit = (
+            applied_for != "unspecified"
+            and top_active
+            and applied_for != top_active
         )
+        # Big emoji for the Cross-Fit column so it grabs HR attention.
+        # Empty cell when there's no cross-fit (only the "yes" stands out).
+        cross_fit_flag = "🚨" if is_cross_fit else ""
 
         # Cross-fit suppression: if the candidate has a strong fit for a
         # different ACTIVE role, never auto-send the rejection. Let HR
         # follow up via the Cross-Match tab. In practice bucket is already
         # "qualified" when there's an active match, but be explicit so this
         # never regresses.
-        if cross_fit_flag == "Yes" and template_key == "denied":
+        if is_cross_fit and template_key == "denied":
             template_key = None
             log.info("  -> cross-fit detected; suppressing 'denied' template")
 
@@ -282,7 +285,27 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 "gmail_link": msg.thread_link,
             })
 
-        best_fit_with_scores = [f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]]
+        # Best-Fit column: show only the role the candidate applied for.
+        # If they didn't specify a role, fall back to the single best match.
+        applied_lower = applied_for.lower()
+        if applied_lower != "unspecified":
+            match = next(
+                (r for r in result["best_fit_roles"]
+                 if r["role"].lower() == applied_lower),
+                None,
+            )
+            if match:
+                best_fit_with_scores = [f"{match['role']} ({match['fit_level']})"]
+            else:
+                # applied_for wasn't in best_fit_roles (no_fit got dropped,
+                # or candidate applied for a role we don't have a filter for)
+                best_fit_with_scores = [f"{applied_for} (no_fit)"]
+        else:
+            if result["best_fit_roles"]:
+                top = result["best_fit_roles"][0]
+                best_fit_with_scores = [f"{top['role']} ({top['fit_level']})"]
+            else:
+                best_fit_with_scores = []
 
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
