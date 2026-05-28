@@ -202,11 +202,17 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
 
 def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     """Read column O (Gmail Thread Link) from the dashboard and return the
-    set of Gmail thread IDs we've already logged."""
+    set of Gmail thread IDs we've already logged.
+
+    Uses valueRenderOption=FORMULA so HYPERLINK formula text is returned
+    (instead of the displayed label "Link"). The thread ID is embedded
+    in the URL inside the formula."""
     import re
     try:
         resp = svc.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=f"{tab}!O2:O",
+            spreadsheetId=sheet_id,
+            range=f"{tab}!O2:O",
+            valueRenderOption="FORMULA",
         ).execute()
     except Exception:
         return set()
@@ -214,8 +220,8 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     for row in resp.get("values", []):
         if not row:
             continue
-        url = str(row[0])
-        m = re.search(r"#inbox/([A-Za-z0-9]+)", url)
+        cell = str(row[0])
+        m = re.search(r"#inbox/([A-Za-z0-9]+)", cell)
         if m:
             ids.add(m.group(1))
     return ids
