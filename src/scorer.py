@@ -279,3 +279,22 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
         })
     cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
     r["best_fit_roles"] = cleaned
+
+    # Applied-for trump rule: derive overall_decision from the candidate's
+    # fit on the role they actually applied to, when present. Otherwise
+    # fall back to the model's own decision.
+    applied_for = str(r.get("applied_for_role", "") or "").strip()
+    if applied_for and applied_for.lower() != "unspecified":
+        applied_level = "no_fit"
+        for item in cleaned:
+            if item["role"].strip().lower() == applied_for.lower():
+                applied_level = item["fit_level"]
+                break
+        if applied_level in QUALIFIED_LEVELS:
+            r["overall_decision"] = "qualified"
+        elif applied_level == "borderline":
+            r["overall_decision"] = "needs_review"
+        else:
+            r["overall_decision"] = "not_qualified"
+
+    return r
