@@ -83,10 +83,28 @@ def run() -> int:
     templates = sheets_client.load_templates(sheets, cfg.sheet_id, cfg.templates_tab)
     log.info("Loaded %d active template(s): %s", len(templates), list(templates.keys()))
 
-    label_id = gmail_client.ensure_label(gmail, cfg.gmail_user, cfg.processed_label)
-    msg_ids = gmail_client.list_unprocessed(
-        gmail, cfg.gmail_user, cfg.processed_label, cfg.max_messages_per_run
-    )
+    if cfg.shadow_mode:
+        # Shadow mode: do not touch Gmail labels. Dedup is done by reading
+        # which thread IDs the Sheet already has. We still need a query to
+        # find candidate emails, so fall back to a broad inbox scan.
+        log.info("SHADOW MODE on -- no Gmail labels, no archive, no auto-replies, no Drive uploads.")
+        label_id = ""
+        outcome_label_ids = {}
+        seen_thread_ids = sheets_client.load_processed_thread_ids(
+            sheets, cfg.sheet_id, cfg.dashboard_tab
+        )
+        log.info("Loaded %d already-processed thread id(s) from Sheet.", len(seen_thread_ids))
+        resp = gmail.users().messages().list(
+            userId=cfg.gmail_user, q="in:inbox", maxResults=cfg.max_messages_per_run,
+        ).execute()
+        msg_ids = [m["id"] for m in resp.get("messages", [])]
+    else:
+        seen_thread_ids = set()
+        label_id = gmail_client.ensure_label(gmail, cfg.gmail_user, cfg.processed_label)
+        outcome_label_ids = gmail_client.ensure_outcome_labels(gmail, cfg.gmail_user)
+        msg_ids = gmail_client.list_unprocessed(
+            gmail, cfg.gmail_user, cfg.processed_label, cfg.max_messages_per_run
+        )
     if not msg_ids:
         log.info("No unprocessed inbox messages. Nothing to do.")
         return 0
@@ -99,6 +117,7 @@ def run() -> int:
             scored += _handle_one(
                 cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg_id, label_id,
+                outcome_label_ids, seen_thread_ids,
             )
         except Exception:
             log.exception("Failed to handle message %s.", msg_id)
@@ -109,26 +128,41 @@ def run() -> int:
 
 
 def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
-                active_role_names, paused_role_names, msg_id, label_id) -> int:
+                active_role_names, paused_role_names, msg_id, label_id,
+                outcome_label_ids, seen_thread_ids) -> int:
     msg = gmail_client.fetch(gmail, cfg.gmail_user, msg_id)
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
 
+    # Shadow mode dedup: if we've already logged this thread to the Sheet,
+    # skip it. Cheap (no Claude call, no further work).
+    if cfg.shadow_mode and msg.thread_id in seen_thread_ids:
+        log.info("  -> shadow mode: thread already in Sheet, skipping.")
+        return 0
+
     if not msg.has_resume:
-        if msg.sender_email and "no_resume" in templates:
-            _send_template(
-                gmail, cfg, templates["no_resume"], msg,
-                vars_extra={"applicant_name": msg.sender_name or "there"},
-            )
-            log.info("  -> no resume; sent 'no_resume' reply to %s", msg.sender_email)
-        else:
-            log.info("  -> no resume / no sender / no template; skipped.")
-        gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        # No resume-shaped attachment. In live mode, mark inspected so we
+        # don't re-fetch next run. In shadow mode, do nothing -- the Sheet
+        # won't have a row for this email so the next run will see it
+        # again, but skip again (no Claude call wasted).
+        if not cfg.shadow_mode:
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        log.info("  -> no resume attachment; left in inbox for human review.")
         return 0
 
     scored = 0
+    last_bucket = None
     for att in msg.attachments:
         text, used_ocr = resume_parser.extract(att.filename, att.mime_type, att.data)
+
+        # Couldn't pull any text out of the attachment. Skip scoring, label
+        # Unreadable, and let HR pull the resume from the email thread.
+        if not text.strip():
+            log.warning("  -> could not extract text from %s; labeling Unreadable",
+                        att.filename)
+            last_bucket = "unreadable"
+            continue
+
         result = scorer.score(
             api_key=cfg.anthropic_api_key,
             model=cfg.anthropic_model,
@@ -160,12 +194,22 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             folder_id = cfg.folder_not_qualified
             template_key = "denied"
 
+        # Track best outcome across all attachments on this email -- used
+        # below to pick which Gmail label to apply.
+        last_bucket = _better_bucket(last_bucket, bucket)
+
         tag_roles = active_matches or paused_matches or qualifying
         tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
         tagged_name = f"{tag}{att.filename}" if tag else att.filename
-        drive_link = drive_client.upload(
-            drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
-        )
+        if cfg.shadow_mode:
+            # Don't copy the resume to Drive in shadow mode. The Sheet's
+            # Drive Link column will be empty -- HR can pull the resume
+            # from the original Gmail thread (link is in column O).
+            drive_link = ""
+        else:
+            drive_link = drive_client.upload(
+                drive, tagged_name, att.data, att.mime_type or "application/pdf", folder_id
+            )
 
         best_fit_with_scores = [f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]]
 
@@ -200,7 +244,13 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             },
         )
 
-        if template_key and template_key in templates and msg.sender_email:
+        if cfg.shadow_mode:
+            # Shadow mode: never send anything to applicants. Just log what
+            # we WOULD have sent so it's auditable in the run logs.
+            would_have_sent = template_key if template_key in templates else None
+            log.info("  -> %s | conf=%.2f | shadow: would_have_sent=%s",
+                     bucket, result["confidence"], would_have_sent)
+        elif template_key and template_key in templates and msg.sender_email:
             applicant_name = result["candidate_name"] or msg.sender_name or "there"
             primary_role = (paused_matches[0]["role"] if paused_matches
                             else (qualifying[0]["role"] if qualifying else ""))
@@ -219,8 +269,48 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
 
         scored += 1
 
-    gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+    final_bucket = last_bucket or "unreadable"
+    if cfg.shadow_mode:
+        # Shadow mode: do not touch Gmail at all. The new Sheet row IS the
+        # bot's footprint. Next run will see this row's gmail_link and skip.
+        log.info("  -> email outcome=%s, shadow mode (no Gmail changes)", final_bucket)
+        return scored
+
+    # Live mode: apply the bot-seen label and the outcome label, then
+    # archive (remove INBOX). last_bucket is the best-of-all-attachments
+    # outcome -- see _better_bucket. Falls back to "unreadable" if nothing
+    # parsed.
+    outcome_id = outcome_label_ids.get(final_bucket)
+    if outcome_id:
+        gmail_client.archive_with_outcome(
+            gmail, cfg.gmail_user, msg_id,
+            processed_label_id=label_id,
+            outcome_label_id=outcome_id,
+        )
+    else:
+        # Defensive: if outcome label is missing for some reason, at least
+        # mark inspected so we don't loop on this email.
+        gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        log.warning("  -> no outcome label found for bucket=%r; email left in inbox",
+                    final_bucket)
+    log.info("  -> email outcome=%s, archived", final_bucket)
     return scored
+
+
+# Ordering of buckets from BEST (for the candidate) to worst. Used when an
+# email has multiple resume attachments so the best outcome wins the label.
+_BUCKET_PRIORITY = ("qualified", "pending_paused", "needs_review",
+                    "not_qualified", "unreadable")
+
+
+def _better_bucket(current, new):
+    """Return whichever bucket is higher priority. None loses to any value."""
+    if current is None:
+        return new
+    if new is None:
+        return current
+    return min(current, new, key=lambda b: _BUCKET_PRIORITY.index(b)
+               if b in _BUCKET_PRIORITY else len(_BUCKET_PRIORITY))
 
 
 def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
