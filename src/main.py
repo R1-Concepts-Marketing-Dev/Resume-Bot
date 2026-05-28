@@ -149,22 +149,29 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     if not msg.has_resume:
-        # No resume attachment. Treat as a question / forgot-to-attach / etc.
-        # In live mode, send the no_resume redirect template once per thread
-        # and mark processed. In shadow mode, log what we WOULD have sent
-        # but stay silent.
+        # No resume attachment. Classify intent: is this an applicant who
+        # forgot to attach, or is it someone asking a question?
+        intent = scorer.classify_no_resume_intent(
+            api_key=cfg.anthropic_api_key,
+            subject=msg.subject,
+            body=msg.body_text,
+        )
+        template_key = "no_resume" if intent == "application" else "question"
+        log.info("  -> no resume; intent=%s -> template=%s", intent, template_key)
+
         if cfg.shadow_mode:
-            would_send = "no_resume" if "no_resume" in templates else None
-            log.info("  -> no resume; shadow: would_have_sent=%s", would_send)
+            would_send = template_key if template_key in templates else None
+            log.info("  -> shadow: would_have_sent=%s", would_send)
             return 0
-        if "no_resume" in templates and msg.sender_email:
+
+        if template_key in templates and msg.sender_email:
             _send_template(
-                gmail, cfg, templates["no_resume"], msg,
+                gmail, cfg, templates[template_key], msg,
                 vars_extra={"applicant_name": msg.sender_name or "there"},
             )
-            log.info("  -> no resume; sent 'no_resume' redirect to %s", msg.sender_email)
+            log.info("  -> sent '%s' to %s", template_key, msg.sender_email)
         else:
-            log.info("  -> no resume; no template or no sender; not replying.")
+            log.info("  -> no template '%s' or no sender; not replying.", template_key)
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
 
