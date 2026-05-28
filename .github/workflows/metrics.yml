@@ -1,0 +1,53 @@
+name: Resume Bot Metrics
+
+# Nightly aggregator that reads Candidates from the main Resume Bot
+# sheet, rolls up six forward months, and writes the result to the
+# Overview tab on the Resume Bot Metrics sheet.
+#
+# Cron is in UTC. GitHub Actions does not handle DST, so we pick one
+# UTC time and accept a 1-hour drift twice a year:
+#
+#   PDT (Mar-Nov, UTC-7):  00:00 UTC == 5pm PT
+#   PST (Nov-Mar, UTC-8):  00:00 UTC == 4pm PT
+#
+# Manual runs are available via the Actions tab (workflow_dispatch).
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metrics
+  cancel-in-progress: false
+
+jobs:
+  aggregate-metrics:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Aggregate metrics
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          METRICS_SHEET_ID: ${{ secrets.METRICS_SHEET_ID }}
+          DASHBOARD_TAB_NAME: ${{ secrets.DASHBOARD_TAB_NAME }}
+        run: python -m src.metrics
