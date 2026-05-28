@@ -141,7 +141,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
 
-    if cfg.shadow_mode:
+    if cfg.shadow_mode and msg.was_unread:
         gmail_client.mark_unread(gmail, cfg.gmail_user, msg_id)
 
     if cfg.shadow_mode and msg.thread_id in seen_thread_ids:
@@ -149,8 +149,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     if not msg.has_resume:
-        # No resume attachment. Classify intent: is this an applicant who
-        # forgot to attach, or is it someone asking a question?
         intent = scorer.classify_no_resume_intent(
             api_key=cfg.anthropic_api_key,
             subject=msg.subject,
@@ -243,6 +241,27 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
 
         last_bucket = _better_bucket(last_bucket, bucket)
 
+        applied_for = result.get("applied_for_role", "unspecified") or "unspecified"
+        # top_active comes from active_matches only -- never from paused. So
+        # cross_fit only triggers when there's an ACTIVE role mismatch. We
+        # never cross-match into paused/pending roles; those go through the
+        # Pending tab via the normal paused_match flow.
+        top_active = active_matches[0]["role"] if active_matches else ""
+        cross_fit_flag = (
+            "Yes"
+            if (applied_for != "unspecified" and top_active and applied_for != top_active)
+            else "No"
+        )
+
+        # Cross-fit suppression: if the candidate has a strong fit for a
+        # different ACTIVE role, never auto-send the rejection. Let HR
+        # follow up via the Cross-Match tab. In practice bucket is already
+        # "qualified" when there's an active match, but be explicit so this
+        # never regresses.
+        if cross_fit_flag == "Yes" and template_key == "denied":
+            template_key = None
+            log.info("  -> cross-fit detected; suppressing 'denied' template")
+
         tag_roles = active_matches or paused_matches or qualifying
         tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
         tagged_name = f"{tag}{att.filename}" if tag else att.filename
@@ -264,14 +283,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             })
 
         best_fit_with_scores = [f"{r['role']} ({r['fit_level']})" for r in result["best_fit_roles"]]
-
-        applied_for = result.get("applied_for_role", "unspecified") or "unspecified"
-        top_active = active_matches[0]["role"] if active_matches else ""
-        cross_fit_flag = (
-            "Yes"
-            if (applied_for != "unspecified" and top_active and applied_for != top_active)
-            else "No"
-        )
 
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
