@@ -1,11 +1,13 @@
 """Extract plain text from a resume attachment. Tries fast text extraction
-first (pypdf for PDF, python-docx for Word). If a PDF returns very little
-text (likely a scanned image), falls back to OCR via Tesseract."""
+first (pypdf for PDF, python-docx for Word, plain decode for TXT/RTF, OCR
+for images). If a PDF returns very little text (likely a scanned image),
+falls back to OCR via Tesseract."""
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ def _extract_docx_text(data: bytes) -> str:
     import docx
     doc = docx.Document(io.BytesIO(data))
     parts = [p.text for p in doc.paragraphs if p.text]
-    # Also grab table cell text — resumes often use tables for layout
+    # Also grab table cell text -- resumes often use tables for layout
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
@@ -62,11 +64,54 @@ def _extract_docx_text(data: bytes) -> str:
     return "\n".join(parts).strip()
 
 
+def _extract_txt(data: bytes) -> str:
+    """Plain text or RTF-lite attachment. Tries utf-8 first, then utf-16
+    and latin-1 as fallbacks for older Windows-saved files."""
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            text = data.decode(enc, errors="strict")
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        # Strip RTF control words if it looks like an RTF document
+        if text.lstrip().startswith("{\\rtf"):
+            text = re.sub(r"\\[a-z]+-?\d* ?", " ", text)
+            text = re.sub(r"[{}]", "", text)
+        return text.strip()
+    # Last resort: lossy decode
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def _ocr_image(data: bytes) -> str:
+    """Run OCR directly on an image attachment (JPG/PNG/HEIC). Some
+    applicants send photos of printed resumes."""
+    try:
+        from PIL import Image
+        import pytesseract
+    except ImportError as e:
+        log.warning("Image OCR dependencies unavailable: %s", e)
+        return ""
+    try:
+        img = Image.open(io.BytesIO(data))
+        return (pytesseract.image_to_string(img) or "").strip()
+    except Exception as e:
+        log.warning("Image OCR failed: %s", e)
+        return ""
+
+
 def extract(filename: str, mime_type: str, data: bytes) -> tuple[str, bool]:
-    """Returns (text, used_ocr). Empty text means we couldn't read it."""
+    """Returns (text, used_ocr). Empty text means we couldn't read it --
+    main.py treats that as Unreadable."""
     name = (filename or "").lower()
-    is_pdf = "pdf" in (mime_type or "") or name.endswith(".pdf")
-    is_docx = "wordprocessingml" in (mime_type or "") or name.endswith(".docx")
+    mt = (mime_type or "").lower()
+    is_pdf = "pdf" in mt or name.endswith(".pdf")
+    is_docx = "wordprocessingml" in mt or name.endswith(".docx")
+    is_txt = (
+        mt.startswith("text/plain") or mt.startswith("text/rtf")
+        or name.endswith((".txt", ".rtf"))
+    )
+    is_image = mt.startswith("image/") or name.endswith(
+        (".jpg", ".jpeg", ".png", ".heic", ".webp", ".tif", ".tiff")
+    )
 
     if is_pdf:
         text = _extract_pdf_text(data)
@@ -79,5 +124,15 @@ def extract(filename: str, mime_type: str, data: bytes) -> tuple[str, bool]:
     if is_docx:
         return _extract_docx_text(data), False
 
+    if is_txt:
+        return _extract_txt(data), False
+
+    if is_image:
+        text = _ocr_image(data)
+        return text, bool(text)
+
+    # Older .doc (binary Word) isn't handled in pure Python. We could shell
+    # out to LibreOffice but that's a 30s startup hit. For now we surface
+    # "Unreadable" and let HR pull the resume manually from the email thread.
     log.warning("Unsupported attachment type: %s (%s)", filename, mime_type)
     return "", False
