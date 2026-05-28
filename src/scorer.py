@@ -110,6 +110,51 @@ Concurrent-role exception: before counting roles for the job-hopping cap, check 
 """
 
 
+def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
+    """For an email that has no resume attached, decide if the sender is
+    (a) APPLYING (likely forgot to attach the resume) or
+    (b) asking a QUESTION (about pay / hours / open positions / process).
+
+    Returns 'application' or 'question'. Defaults to 'question' on any
+    error -- the question reply is more generic and safer to send."""
+    if not (subject or body):
+        return "question"
+    user_msg = (
+        f"Subject: {subject or '(none)'}\n\n"
+        f"Body:\n{(body or '(empty)')[:1500]}"
+    )
+    system = (
+        "You classify a single email's intent. Reply with exactly one word: "
+        "APPLICATION or QUESTION.\n\n"
+        "APPLICATION = the sender is applying for a job at this company. "
+        "Signals: mentions 'applying for', 'interested in the position', "
+        "'please find my resume attached', names a specific role, attaches "
+        "a cover letter, etc. Likely forgot to attach the resume.\n\n"
+        "QUESTION = the sender is asking about open positions, pay, "
+        "scheduling, application process, hours, benefits, or anything "
+        "else needing a human response. They are NOT submitting an "
+        "application.\n\n"
+        "If genuinely ambiguous, reply QUESTION."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        # Use Haiku for this tiny classification call -- cheap and fast.
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=10,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        text = text.strip().upper()
+        if "APPLICATION" in text and "QUESTION" not in text:
+            return "application"
+        return "question"
+    except Exception as e:
+        log.warning("Intent classifier failed, defaulting to question: %s", e)
+        return "question"
+
+
 def _build_filter_block(filters: list) -> str:
     return "\n".join(f"- {f.role} - {f.requirement}" for f in filters)
 
@@ -233,53 +278,4 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
             "reasoning": str(item.get("reasoning", "")).strip(),
         })
     cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
-    r["best_fit_roles"] = cleaned
-
-    r.setdefault("years_relevant_experience", 0)
-    r.setdefault("job_hopping_flag", "neutral")
-    r.setdefault("reasoning", "")
-    r.setdefault("confidence", 0)
-    r.setdefault("candidate_name", "")
-    r.setdefault("candidate_email", "")
-    r.setdefault("candidate_phone", "")
-    r.setdefault("applied_for_role", "unspecified")
-    if not str(r["applied_for_role"]).strip():
-        r["applied_for_role"] = "unspecified"
-
-    # Deterministic overall_decision derived from fit_levels. The model is
-    # asked to return overall_decision too, but it sometimes contradicts its
-    # own per-role assessments. Recomputing here keeps the decision aligned
-    # with the per-role levels.
-    try:
-        confidence = float(r.get("confidence") or 0)
-    except (TypeError, ValueError):
-        confidence = 0.0
-
-    applied = str(r.get("applied_for_role", "unspecified")).strip()
-    if applied and applied.lower() != "unspecified":
-        # Applied-for trump: decision is driven by the applied role's level.
-        applied_level = next(
-            (it["fit_level"] for it in cleaned if it["role"].lower() == applied.lower()),
-            "no_fit",
-        )
-        if applied_level in QUALIFIED_LEVELS:
-            r["overall_decision"] = "qualified"
-        elif applied_level == "borderline":
-            r["overall_decision"] = "needs_review"
-        else:
-            r["overall_decision"] = "not_qualified"
-    else:
-        # Unspecified: top role across all surfaces drives the decision.
-        top_level = cleaned[0]["fit_level"] if cleaned else "no_fit"
-        if top_level in QUALIFIED_LEVELS:
-            r["overall_decision"] = "qualified"
-        elif top_level == "borderline":
-            r["overall_decision"] = "needs_review"
-        else:
-            r["overall_decision"] = "not_qualified"
-
-    # Low confidence always demotes a "qualified" verdict to "needs_review".
-    if confidence and confidence < 0.6 and r["overall_decision"] == "qualified":
-        r["overall_decision"] = "needs_review"
-
-    return r
+    r["best_fit_roles"] = cleane
