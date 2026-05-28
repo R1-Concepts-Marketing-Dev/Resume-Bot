@@ -134,6 +134,12 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
 
+    # In shadow mode, immediately re-mark UNREAD so the bot's read of the
+    # message doesn't poison HR's unread-count queue. Gmail's messages.get
+    # doesn't officially flip read state, but this is belt-and-suspenders.
+    if cfg.shadow_mode:
+        gmail_client.mark_unread(gmail, cfg.gmail_user, msg_id)
+
     # Shadow mode dedup: if we've already logged this thread to the Sheet,
     # skip it. Cheap (no Claude call, no further work).
     if cfg.shadow_mode and msg.thread_id in seen_thread_ids:
