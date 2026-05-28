@@ -149,9 +149,23 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     if not msg.has_resume:
-        if not cfg.shadow_mode:
-            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
-        log.info("  -> no resume attachment; left in inbox for human review.")
+        # No resume attachment. Treat as a question / forgot-to-attach / etc.
+        # In live mode, send the no_resume redirect template once per thread
+        # and mark processed. In shadow mode, log what we WOULD have sent
+        # but stay silent.
+        if cfg.shadow_mode:
+            would_send = "no_resume" if "no_resume" in templates else None
+            log.info("  -> no resume; shadow: would_have_sent=%s", would_send)
+            return 0
+        if "no_resume" in templates and msg.sender_email:
+            _send_template(
+                gmail, cfg, templates["no_resume"], msg,
+                vars_extra={"applicant_name": msg.sender_name or "there"},
+            )
+            log.info("  -> no resume; sent 'no_resume' redirect to %s", msg.sender_email)
+        else:
+            log.info("  -> no resume; no template or no sender; not replying.")
+        gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
 
     scored = 0
@@ -184,8 +198,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             used_ocr=used_ocr,
         )
 
-        # Scorer returns a fallback dict (confidence == 0) when the Claude
-        # API errors or returns invalid JSON. Log that to Bot Errors.
         try:
             _conf = float(result.get("confidence") or 0)
         except (TypeError, ValueError):
