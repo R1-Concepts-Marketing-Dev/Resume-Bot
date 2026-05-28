@@ -105,7 +105,10 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
         # Pad to 17 columns so missing trailing cells become empty strings
         row = (raw + [""] * 17)[:17]
         timestamp = row[0]
-        cross_fit = (row[7] or "").strip().lower()
+        cross_fit_raw = (row[7] or "").strip()
+        # Cross-fit flag was historically "Yes"/"No", now "🚨"/blank.
+        # Treat both representations as cross-fit so historical rows still count.
+        cross_fit_is_yes = cross_fit_raw == "🚨" or cross_fit_raw.lower() == "yes"
         decision = (row[8] or "").strip().lower()
         hr_status = (row[15] or "").strip()
 
@@ -137,7 +140,7 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
         elif decision == "unreadable":
             c["unreadable"] += 1
 
-        if cross_fit == "yes" and hr_status in ENGAGED_HR_STATUSES:
+        if cross_fit_is_yes and hr_status in ENGAGED_HR_STATUSES:
             c["cross_fit_catches"] += 1
 
         if decision in {"qualified", "not_qualified", "pending_paused"}:
