@@ -37,16 +37,16 @@ class Config:
     filters_tab: str
     dashboard_tab: str
     templates_tab: str
+    errors_tab: str
 
     processed_label: str
     max_messages_per_run: int
     company_name: str
 
-    # Shadow mode: bot reads + scores + writes to the Sheet, but does NOT
-    # touch Gmail (no labels, no archiving, no auto-replies) and does NOT
-    # upload to Drive. Dedup happens by reading existing rows from the
-    # Sheet on each run. Set SHADOW_MODE=true to enable.
     shadow_mode: bool
+
+    # Floor date for inbox lookup. Empty = no floor.
+    bot_start_date: str
 
 
 def load() -> Config:
@@ -66,9 +66,11 @@ def load() -> Config:
         filters_tab=_optional("FILTERS_TAB_NAME", "Filters"),
         dashboard_tab=_optional("DASHBOARD_TAB_NAME", "Candidates"),
         templates_tab=_optional("TEMPLATES_TAB_NAME", "Templates"),
+        errors_tab=_optional("ERRORS_TAB_NAME", "Bot Errors"),
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
         company_name=_optional("COMPANY_NAME", "R1 Concepts"),
         shadow_mode=_optional("SHADOW_MODE", "false").strip().lower()
                     in {"1", "true", "yes", "on"},
+        bot_start_date=_optional("BOT_START_DATE", "").strip(),
     )
