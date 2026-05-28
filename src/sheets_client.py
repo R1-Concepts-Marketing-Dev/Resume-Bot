@@ -109,6 +109,24 @@ def _is_truthy(v) -> bool:
     return s in {"true", "yes", "y", "on", "1", "x"}
 
 
+def _safe(v) -> str:
+    """Escape values that Sheets USER_ENTERED would parse as formulas/operators.
+    Phone numbers starting with + are the most common culprit."""
+    if v is None:
+        return ""
+    s = str(v)
+    if s and s[0] in ("=", "+", "-", "@"):
+        return "'" + s
+    return s
+
+
+def _hyperlink(url: str, label: str = "Link") -> str:
+    if not url:
+        return ""
+    escaped = url.replace('"', '""')
+    return f'=HYPERLINK("{escaped}","{label}")'
+
+
 def load_filters(svc, sheet_id, tab):
     rng = f"{tab}!A2:D"
     resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
@@ -231,26 +249,26 @@ def append_candidate(svc, sheet_id, tab, row):
     best_fit_str = ", ".join(row.get("best_fit_with_scores") or [])
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        row.get("candidate_name", ""),
-        row.get("email", ""),
-        row.get("phone", ""),
-        row.get("filename", ""),
-        row.get("applied_for", ""),
-        best_fit_str,
+        _safe(row.get("candidate_name", "")),
+        _safe(row.get("email", "")),
+        _safe(row.get("phone", "")),
+        _safe(row.get("filename", "")),
+        _safe(row.get("applied_for", "")),
+        _safe(best_fit_str),
         row.get("cross_fit_flag", ""),
         row.get("decision", ""),
         row.get("years_relevant_experience", ""),
-        row.get("job_hopping_flag", ""),
+        _safe(row.get("job_hopping_flag", "")),
         row.get("confidence", ""),
-        row.get("reasoning", ""),
-        row.get("drive_link", ""),
-        row.get("gmail_link", ""),
+        _safe(row.get("reasoning", "")),
+        _hyperlink(row.get("drive_link", "")),
+        _hyperlink(row.get("gmail_link", "")),
         "", "",
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
         range=f"{tab}!A:Q",
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
