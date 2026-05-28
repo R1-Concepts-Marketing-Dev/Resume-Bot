@@ -16,6 +16,24 @@ RESUME_MIME_TYPES = {
     "application/pdf": ".pdf",
     "application/msword": ".doc",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "text/plain": ".txt",
+    "text/rtf": ".rtf",
+    "application/rtf": ".rtf",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/heic": ".heic",
+    "image/webp": ".webp",
+    "image/tiff": ".tif",
+}
+
+# Outcome labels the bot applies to processed emails. Nested under a
+# "Resume Bot" parent so they group together in Gmail's sidebar.
+OUTCOME_LABELS = {
+    "qualified":       "Resume Bot/Qualified",
+    "needs_review":    "Resume Bot/Needs Review",
+    "not_qualified":   "Resume Bot/Not Qualified",
+    "pending_paused":  "Resume Bot/Pending Paused Role",
+    "unreadable":      "Resume Bot/Unreadable",
 }
 
 
@@ -57,6 +75,36 @@ def ensure_label(svc, user: str, name: str) -> str:
               "messageListVisibility": "show"},
     ).execute()
     return created["id"]
+
+
+def ensure_outcome_labels(svc, user: str) -> dict[str, str]:
+    """Create the 5 outcome labels under a 'Resume Bot' parent if they don't
+    already exist. Returns a mapping from outcome key (e.g. 'qualified') to
+    the Gmail label id."""
+    existing = {lbl["name"]: lbl["id"]
+                for lbl in svc.users().labels().list(userId=user).execute().get("labels", [])}
+    # Parent label first so the children nest cleanly in Gmail's sidebar.
+    if "Resume Bot" not in existing:
+        created = svc.users().labels().create(
+            userId=user,
+            body={"name": "Resume Bot",
+                  "labelListVisibility": "labelShow",
+                  "messageListVisibility": "show"},
+        ).execute()
+        existing["Resume Bot"] = created["id"]
+    out: dict[str, str] = {}
+    for key, name in OUTCOME_LABELS.items():
+        if name in existing:
+            out[key] = existing[name]
+            continue
+        created = svc.users().labels().create(
+            userId=user,
+            body={"name": name,
+                  "labelListVisibility": "labelShow",
+                  "messageListVisibility": "show"},
+        ).execute()
+        out[key] = created["id"]
+    return out
 
 
 def list_unprocessed(svc, user: str, processed_label: str, max_results: int) -> list[str]:
@@ -147,8 +195,24 @@ def fetch(svc, user: str, msg_id: str) -> Message:
 
 
 def mark_processed(svc, user: str, msg_id: str, label_id: str) -> None:
+    """Apply the 'I've seen this' label without archiving. Used for emails
+    the bot looked at but had no resume attachment to act on."""
     svc.users().messages().modify(
         userId=user, id=msg_id, body={"addLabelIds": [label_id]}
+    ).execute()
+
+
+def archive_with_outcome(svc, user: str, msg_id: str, *,
+                         processed_label_id: str, outcome_label_id: str) -> None:
+    """Apply both the bot-seen label and the outcome label, then remove
+    INBOX so the email is archived. The outcome label keeps the thread
+    findable in Gmail's sidebar; archiving keeps the inbox clean."""
+    svc.users().messages().modify(
+        userId=user, id=msg_id,
+        body={
+            "addLabelIds": [processed_label_id, outcome_label_id],
+            "removeLabelIds": ["INBOX"],
+        },
     ).execute()
 
 
