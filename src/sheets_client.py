@@ -1,4 +1,4 @@
-"""Sheets operations: filters, templates, dashboard."""
+"""Sheets operations: filters, templates, dashboard, errors."""
 
 from __future__ import annotations
 
@@ -165,9 +165,7 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
 
 def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     """Read column O (Gmail Thread Link) from the dashboard and return the
-    set of Gmail thread IDs we've already logged. Used by shadow mode to
-    dedup: in shadow mode we can't apply a Gmail label, so the Sheet is
-    the source of truth for what we've already processed."""
+    set of Gmail thread IDs we've already logged."""
     import re
     try:
         resp = svc.spreadsheets().values().get(
@@ -180,11 +178,39 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
         if not row:
             continue
         url = str(row[0])
-        # Thread links look like https://mail.google.com/.../#inbox/<threadId>
         m = re.search(r"#inbox/([A-Za-z0-9]+)", url)
         if m:
             ids.add(m.group(1))
     return ids
+
+
+def append_error(svc, sheet_id, tab, row):
+    """Append a row to the Bot Errors tab. Records runtime errors and
+    edge cases the bot hits during a run (parse fail, scorer fail, drive
+    upload fail, uncaught exception, low-confidence decision).
+
+    Swallows its own exceptions -- a logging failure must not crash the
+    main run loop."""
+    try:
+        values = [
+            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            row.get("msg_id", ""),
+            row.get("sender_email", ""),
+            row.get("filename", ""),
+            row.get("error_type", ""),
+            str(row.get("detail", ""))[:1000],
+            row.get("bot_action", ""),
+            row.get("gmail_link", ""),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:H",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to log to %s tab: %s", tab, e)
 
 
 def append_candidate(svc, sheet_id, tab, row):
