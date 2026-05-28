@@ -49,4 +49,11 @@ jobs:
           PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'resume-bot/processed' }}
           MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '25' }}
           COMPANY_NAME: ${{ vars.COMPANY_NAME || 'R1 Concepts' }}
+          # SHADOW_MODE: beta-testing flag.
+          #   true  = observe only -- read + score + log to Sheet. No Gmail
+          #           label changes, no archiving, no auto-replies, no Drive
+          #           uploads. Bot re-marks UNREAD so HR's queue is untouched.
+          #   false = live -- full operation.
+          # Flip to "false" once when testing is complete.
+          SHADOW_MODE: "true"
         run: python -m src.main
