@@ -27,7 +27,7 @@ class Template:
 
 DASHBOARD_HEADERS = [
     "Timestamp", "Candidate Name", "Email", "Phone", "Original Filename",
-    "Applied For", "Best-Fit Roles & Scores", "Cross-Fit Flag", "Decision",
+    "Applied For", "Cross-Fit Match", "Cross-Fit Flag", "Decision",
     "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
     "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
 ]
@@ -305,7 +305,6 @@ def append_error(svc, sheet_id, tab, row):
 
 
 def append_candidate(svc, sheet_id, tab, row):
-    best_fit_str = ", ".join(row.get("best_fit_with_scores") or [])
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         _safe(row.get("candidate_name", "")),
@@ -313,7 +312,7 @@ def append_candidate(svc, sheet_id, tab, row):
         _safe(row.get("phone", "")),
         _safe(row.get("filename", "")),
         _safe(row.get("applied_for", "")),
-        _safe(best_fit_str),
+        _safe(row.get("cross_fit_match", "")),
         row.get("cross_fit_flag", ""),
         row.get("decision", ""),
         row.get("years_relevant_experience", ""),
