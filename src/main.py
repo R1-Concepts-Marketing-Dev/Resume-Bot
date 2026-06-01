@@ -64,6 +64,7 @@ def run() -> int:
 
     sheets_client.ensure_dashboard_headers(sheets, cfg.sheet_id, cfg.dashboard_tab)
     sheets_client.ensure_templates_seeded(sheets, cfg.sheet_id, cfg.templates_tab)
+    sheets_client.ensure_misc_headers(sheets, cfg.sheet_id, cfg.misc_tab)
 
     all_filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
     if not all_filters:
@@ -218,6 +219,27 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 "gmail_link": msg.thread_link,
             })
 
+        # Not-a-resume diversion: skip Drive upload, skip auto-reply, skip
+        # Candidates row. Log it to Archive - Misc and move on. The email
+        # still gets labeled "Resume Bot/Not A Resume" via last_bucket so
+        # HR can find it later if they want.
+        if result["overall_decision"] == "not_a_resume":
+            log.info("  -> not a resume; logging to %s, skipping Drive/reply",
+                     cfg.misc_tab)
+            sheets_client.append_misc(
+                sheets, cfg.sheet_id, cfg.misc_tab,
+                {
+                    "sender": msg.sender,
+                    "subject": msg.subject,
+                    "filename": att.filename,
+                    "reasoning": result.get("reasoning", ""),
+                    "gmail_link": msg.thread_link,
+                },
+            )
+            last_bucket = _better_bucket(last_bucket, "not_a_resume")
+            scored += 1
+            continue
+
         qualifying = [r for r in result["best_fit_roles"] if r["fit_level"] in QUALIFIED_LEVELS]
         active_matches = [r for r in qualifying if r["role"] in active_role_names]
         paused_matches = [r for r in qualifying if r["role"] in paused_role_names]
@@ -371,7 +393,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
 
 
 _BUCKET_PRIORITY = ("qualified", "pending_paused", "needs_review",
-                    "not_qualified", "unreadable")
+                    "not_qualified", "unreadable", "not_a_resume")
 
 
 def _better_bucket(current, new):
