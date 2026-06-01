@@ -38,6 +38,7 @@ class Config:
     dashboard_tab: str
     templates_tab: str
     errors_tab: str
+    misc_tab: str
 
     processed_label: str
     max_messages_per_run: int
@@ -67,6 +68,7 @@ def load() -> Config:
         dashboard_tab=_optional("DASHBOARD_TAB_NAME", "Candidates"),
         templates_tab=_optional("TEMPLATES_TAB_NAME", "Templates"),
         errors_tab=_optional("ERRORS_TAB_NAME", "Bot Errors"),
+        misc_tab=_optional("MISC_TAB_NAME", "Archive - Misc"),
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
         company_name=_optional("COMPANY_NAME", "R1 Concepts"),
