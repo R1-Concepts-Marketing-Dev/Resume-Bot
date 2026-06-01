@@ -32,6 +32,7 @@ OUTCOME_LABELS = {
     "not_qualified":   "Resume Bot/Not Qualified",
     "pending_paused":  "Resume Bot/Pending Paused Role",
     "unreadable":      "Resume Bot/Unreadable",
+    "not_a_resume":    "Resume Bot/Not A Resume",
 }
 
 
