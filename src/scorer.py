@@ -31,7 +31,14 @@ and decide how well they match each open role.
 You always reply with a single JSON object and nothing else. No prose, no \
 markdown, no backticks. The JSON must conform exactly to the schema in the \
 user message. If the resume is unreadable or you cannot reasonably score it, \
-set overall_decision to "needs_review" and explain in reasoning."""
+set overall_decision to "needs_review" and explain in reasoning.
+
+If the document is NOT a candidate resume at all -- e.g. a company \
+newsletter, internal HR communication, security alert, drive-share \
+notification, marketing/sales pitch, automated bounce, or any other \
+non-application document -- set overall_decision to "not_a_resume", return \
+an empty best_fit_roles array, and explain in reasoning what the document \
+actually is."""
 
 
 USER_TEMPLATE = """Today's date: {today}. Use this as your anchor for "recent" and "current." Any "Present" or "Current" in the resume means up through today. Treat all date math relative to today, not your training cutoff.
@@ -65,7 +72,7 @@ Respond with this exact JSON schema:
       "reasoning": "<1-2 sentence justification of the level>"
     }}
   ],
-  "overall_decision": "qualified" | "not_qualified" | "needs_review",
+  "overall_decision": "qualified" | "not_qualified" | "needs_review" | "not_a_resume",
   "years_relevant_experience": <number, 0 if unknown>,
   "job_hopping_flag": "positive" | "caution" | "neutral",
   "reasoning": "<2-4 sentence overall explanation HR will read>",
@@ -89,6 +96,9 @@ overall_decision rules:
   qualified       - at least one role is "excellent" or "strong"
   not_qualified   - no role is "borderline" or higher
   needs_review    - anything ambiguous, OCR-degraded, or confidence < 0.6
+  not_a_resume    - the document is not a candidate resume at all (see Not-a-resume rule below)
+
+Not-a-resume rule: BEFORE applying any of the rules below, look at what the document actually is. If it is NOT a candidate resume -- e.g. a company newsletter, internal memo, security alert (Google account warnings, Drive share notifications, calendar invites), bounced-message report, marketing/sales pitch, automated transactional email, vendor outreach, or anything else that is not a person submitting their work history for a job -- set overall_decision to "not_a_resume", return an empty best_fit_roles list, set applied_for_role to "unspecified", set years_relevant_experience to 0, and explain in reasoning what the document actually is and who likely sent it. Do NOT score it against the open roles. This decision overrides every other rule below.
 
 Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your assessment. If they don't specify, evaluate against every open role.
 
@@ -254,8 +264,15 @@ def _score_to_level(n: int) -> str:
 
 def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     decision = r.get("overall_decision")
-    if decision not in {"qualified", "not_qualified", "needs_review"}:
+    if decision not in {"qualified", "not_qualified", "needs_review", "not_a_resume"}:
         r["overall_decision"] = "needs_review"
+
+    # not_a_resume short-circuits everything. No role scoring, no trump rule.
+    if r["overall_decision"] == "not_a_resume":
+        r["best_fit_roles"] = []
+        r["applied_for_role"] = "unspecified"
+        r["years_relevant_experience"] = 0
+        return r
 
     cleaned = []
     for item in r.get("best_fit_roles") or []:
