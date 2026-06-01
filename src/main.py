@@ -425,4 +425,3 @@ def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
 
 if __name__ == "__main__":
     sys.exit(run())
-())
