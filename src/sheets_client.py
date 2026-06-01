@@ -33,6 +33,12 @@ DASHBOARD_HEADERS = [
 ]
 
 
+MISC_HEADERS = [
+    "Timestamp", "Sender", "Subject", "Original Filename",
+    "Why Not A Resume", "Gmail Thread Link",
+]
+
+
 SEED_TEMPLATES: list[Template] = [
     Template(
         key="no_resume",
@@ -198,6 +204,53 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
         spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
         body={"values": [DASHBOARD_HEADERS]},
     ).execute()
+
+
+def ensure_misc_headers(svc, sheet_id, tab):
+    """Idempotently write headers to the Archive - Misc tab.
+
+    Tolerates the tab not existing yet -- a missing tab raises a Sheets API
+    400, which we swallow because the Apps Script side is expected to have
+    created the tab. The next run will succeed once it's there."""
+    rng = f"{tab}!A1:F1"
+    try:
+        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+    except Exception as e:
+        log.warning("Could not read %s headers (tab may not exist yet): %s", tab, e)
+        return
+    if resp.get("values"):
+        return
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
+            body={"values": [MISC_HEADERS]},
+        ).execute()
+    except Exception as e:
+        log.warning("Could not write %s headers: %s", tab, e)
+
+
+def append_misc(svc, sheet_id, tab, row):
+    """Append a row to the Archive - Misc tab for emails the bot decided
+    were not candidate resumes (newsletters, alerts, internal comms, etc.).
+    Swallows its own exceptions so a missing tab doesn't break the run."""
+    try:
+        values = [
+            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            _safe(row.get("sender", "")),
+            _safe(row.get("subject", "")),
+            _safe(row.get("filename", "")),
+            _safe(row.get("reasoning", "")),
+            _hyperlink(row.get("gmail_link", "")),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:F",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to log to %s tab: %s", tab, e)
 
 
 def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
