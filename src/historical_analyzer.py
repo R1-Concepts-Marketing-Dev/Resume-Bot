@@ -313,13 +313,14 @@ def call_bot_baseline(api_key: str, info: dict) -> str:
     measures bot accuracy against the ground truth Claude derives from
     HR's behavior."""
     try:
-        return scorer.classify_inbound_email(
+        cr = scorer.classify_inbound_email(
             api_key=api_key,
             subject=info.get("subject", ""),
             body=info.get("body", ""),
             sender_email=info.get("sender_email", ""),
             has_attachment=info.get("has_attachment", False),
         )
+        return cr.label
     except Exception as e:
         log.warning("Bot baseline classifier failed: %s", e)
         return "error"
