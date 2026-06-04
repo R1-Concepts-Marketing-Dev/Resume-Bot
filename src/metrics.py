@@ -1,11 +1,19 @@
-"""Resume Bot Metrics — nightly aggregator.
+"""Resume Bot Metrics -- nightly aggregator.
 
 Reads the Candidates tab from the source Resume Bot sheet, rolls up six
 forward months of activity starting at the current month, and writes
 the result into the Overview tab of the metrics sheet.
 
+The framing is INTERVIEW-STAGE FILTER ACCURACY, not hire prediction:
+the bot's job is to decide whether HR should look at a candidate; we
+measure that by whether HR engaged (moved the candidate to In Review,
+Contacted, Interview Scheduled, Offer Made, On Hold, or Hired) -- not
+by whether they were ultimately hired. Hire outcomes depend on too
+many factors the bot doesn't see (interview performance, offers,
+salary, references).
+
 Designed to run as a standalone GitHub Actions job at 5pm PT each night.
-Self-contained — does NOT import from the rest of the bot package so it
+Self-contained -- does NOT import from the rest of the bot package so it
 can be invoked independently. The only required env vars are OAuth
 credentials and the two sheet IDs.
 """
@@ -27,6 +35,8 @@ log = logging.getLogger(__name__)
 
 # ----------------------------- Configuration --------------------------------
 
+# Statuses where HR is currently working a candidate (point-in-time queue
+# count). Excludes Hired, which is terminal.
 ACTIVE_HR_STATUSES = {
     "In Review",
     "Contacted",
@@ -34,6 +44,9 @@ ACTIVE_HR_STATUSES = {
     "Offer Made",
     "On Hold",
 }
+# All statuses where HR moved a candidate past the auto-archive stage --
+# i.e. the bot's "qualified" decision was validated by an HR action.
+# This is what we count for pass-through rate.
 ENGAGED_HR_STATUSES = ACTIVE_HR_STATUSES | {"Hired"}
 
 # Estimated seconds of HR time saved per resume the bot auto-handled
@@ -101,6 +114,12 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
 
     rows: raw values from Candidates!A2:Q (17 columns A..Q)
     months: list of YYYY-MM keys we want to aggregate over
+
+    Engagement framing: any time we measure "the bot's decision was
+    validated by HR," we check hr_status in ENGAGED_HR_STATUSES, which
+    includes all engaged statuses (In Review through Hired). Hire-only
+    is no longer used as a success metric because the bot's job is to
+    filter to interview, not to predict hire.
     """
     counts: dict[str, dict[str, int]] = {m: defaultdict(int) for m in months}
     active_queue = 0
@@ -111,13 +130,15 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
         row = (raw + [""] * 17)[:17]
         timestamp = row[0]
         cross_fit_raw = (row[7] or "").strip()
-        # Cross-fit flag was historically "Yes"/"No", now "🚨"/blank.
+        # Cross-fit flag was historically "Yes"/"No", now an emoji.
         # Treat both representations as cross-fit so historical rows still count.
-        cross_fit_is_yes = cross_fit_raw == "🚨" or cross_fit_raw.lower() == "yes"
+        cross_fit_is_yes = cross_fit_raw == "\U0001F6A8" or cross_fit_raw.lower() == "yes"
         decision = (row[8] or "").strip().lower()
         hr_status = (row[15] or "").strip()
 
-        # Point-in-time queue state (NOT month-scoped)
+        # Point-in-time queue state (NOT month-scoped):
+        #   active_queue = candidates HR is currently working
+        #   backlog = bot output that HR hasn't touched yet
         if hr_status in ACTIVE_HR_STATUSES:
             active_queue += 1
         if not hr_status and decision in {"qualified", "needs_review"}:
@@ -132,12 +153,12 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
 
         if decision == "qualified":
             c["qualified"] += 1
-            if hr_status == "Hired":
-                c["qualified_hired"] += 1
+            if hr_status in ENGAGED_HR_STATUSES:
+                c["qualified_engaged"] += 1
         elif decision == "needs_review":
             c["needs_review"] += 1
-            if hr_status == "Hired":
-                c["needs_review_hired"] += 1
+            if hr_status in ENGAGED_HR_STATUSES:
+                c["needs_review_engaged"] += 1
         elif decision == "not_qualified":
             c["not_qualified"] += 1
         elif decision == "pending_paused":
@@ -145,6 +166,8 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
         elif decision == "unreadable":
             c["unreadable"] += 1
 
+        # Cross-fit catches: HR engaged with a candidate the bot flagged
+        # as a fit for a DIFFERENT role than they applied to.
         if cross_fit_is_yes and hr_status in ENGAGED_HR_STATUSES:
             c["cross_fit_catches"] += 1
 
@@ -170,9 +193,15 @@ def safe_pct(num: int, den: int) -> str:
 def build_blocks(metrics: dict) -> dict:
     """Produce the value blocks for each region of the Overview tab.
 
-    Returns a dict with keys: header (1xN), volume (6xN), outcomes (5xN),
-    workflow (3xN). All values are 2D lists ready to drop into a sheet
-    range using values.batchUpdate.
+    Returns a dict with keys:
+      header   (1xN): month labels
+      volume   (6xN): per-month volume counts
+      outcomes (5xN): per-month filter accuracy (engagement-framed)
+      workflow (3xN): point-in-time HR pipeline + per-month time saved
+      kpi_band (dict): hero KPI tile values for the top of the sheet
+
+    All values are 2D lists ready to drop into a sheet range using
+    values.batchUpdate, except kpi_band (dict consumed by write_overview).
     """
     months = metrics["months"]
 
@@ -190,23 +219,28 @@ def build_blocks(metrics: dict) -> dict:
         per_month(lambda c: c["unreadable"]),
     ]
 
+    # FILTER ACCURACY: engagement-framed (bot decision validated by HR
+    # moving the candidate past auto-archive). Five rows, matches sheet
+    # labels at A15:A19.
     outcomes = [
-        per_month(lambda c: c["qualified_hired"]),
-        per_month(lambda c: safe_pct(c["qualified_hired"], c["qualified"])),
-        per_month(lambda c: c["needs_review_hired"]),
-        per_month(lambda c: safe_pct(c["needs_review_hired"], c["needs_review"])),
+        per_month(lambda c: c["qualified_engaged"]),
+        per_month(lambda c: safe_pct(c["qualified_engaged"], c["qualified"])),
+        per_month(lambda c: c["needs_review_engaged"]),
+        per_month(lambda c: safe_pct(c["needs_review_engaged"], c["needs_review"])),
         per_month(lambda c: c["cross_fit_catches"]),
     ]
 
-    # Active queue and backlog are point-in-time: only meaningful in the
-    # current-month column (idx 0). Estimated time saved IS per-month.
+    # HR PIPELINE: row order matches sheet labels at A22:A24.
+    #   Row 22: Awaiting HR action       -> backlog (point-in-time)
+    #   Row 23: Active in HR pipeline    -> active_queue (point-in-time)
+    #   Row 24: Estimated HR time saved  -> per-month, in HOURS (not min)
     workflow = [
-        [metrics["active_queue"]] + [""] * 5,
         [metrics["backlog"]] + [""] * 5,
-        per_month(lambda c: round(c["time_saved_sec"] / 60)),
+        [metrics["active_queue"]] + [""] * 5,
+        per_month(lambda c: round(c["time_saved_sec"] / 3600, 1)),
     ]
 
-    # ----- Upper-management KPI band (current month at-a-glance) -----
+    # ----- Upper-management KPI band (top of sheet, current-month focus) -----
     # Reads HOURLY_RATE_USD from env at build time so changes propagate
     # without redeploying the workflow.
     try:
@@ -220,15 +254,20 @@ def build_blocks(metrics: dict) -> dict:
     hours_saved = sec_saved / 3600
     dollars_saved = hours_saved * hourly_rate
 
+    # Pass-through rate: of candidates the bot said "qualified," what %
+    # did HR validate by engaging? Empty string if no qualified yet --
+    # avoids a misleading "0.0%" on day 1.
+    pass_through_pct = safe_pct(this_month["qualified_engaged"],
+                                this_month["qualified"]) or "--"
+
     kpi_band = {
-        "hours_saved": f"{hours_saved:.1f} hrs",
-        "dollars_saved": f"${dollars_saved:,.0f}",
-        "resumes_scored": this_month["total"],
-        "qualified": this_month["qualified"],
+        "hours_saved":       f"{hours_saved:.1f} hrs",
+        "dollars_saved":     f"${dollars_saved:,.0f}",
+        "resumes_scored":    this_month["total"],
+        "pass_through":      pass_through_pct,
         "cross_fit_catches": this_month["cross_fit_catches"],
-        "active_queue": metrics["active_queue"],
-        "month_label": month_label(months[0]),
-        "hourly_rate": f"${hourly_rate:.0f}/hr assumed",
+        "month_label":       month_label(months[0]),
+        "hourly_rate":       f"${hourly_rate:.0f}/hr assumed",
     }
 
     return {
@@ -271,22 +310,22 @@ def write_overview(sheets, metrics_sheet_id: str, blocks: dict,
     )
 
     kpi = blocks["kpi_band"]
-    # Hero KPI band at the top: five cells across, with a label row above
-    # the value row, and a third row of context (current month, assumption).
-    # Layout occupies rows 3-5; row 5 stays clear of the existing month
-    # header which lives at B5:G5 because the KPI band only uses A-E.
+    # Hero KPI band at the top, five cells across. Tile #4 is the bot's
+    # pass-through rate (qualified -> HR engaged) -- the headline accuracy
+    # number for upper management. Replaces the old "Qualified" count,
+    # which was redundant with the Volume block.
     kpi_labels = [
         f"Hours Saved ({kpi['month_label']})",
         f"$ Saved ({kpi['month_label']})",
         "Resumes Scored",
-        "Qualified",
+        "Pass-through Rate",
         "Cross-Fit Catches",
     ]
     kpi_values = [
         kpi["hours_saved"],
         kpi["dollars_saved"],
         kpi["resumes_scored"],
-        kpi["qualified"],
+        kpi["pass_through"],
         kpi["cross_fit_catches"],
     ]
 
@@ -296,7 +335,8 @@ def write_overview(sheets, metrics_sheet_id: str, blocks: dict,
         {"range": "Overview!A4:E4", "values": [kpi_values]},
         {"range": "Overview!H3",
          "values": [[f"Assumes {kpi['hourly_rate']}, "
-                     f"{TIME_SAVED_PER_CASE_SEC}s saved per auto-handled resume"]]},
+                     f"{TIME_SAVED_PER_CASE_SEC}s saved per auto-handled resume. "
+                     "Pass-through rate stabilizes as HR works through pipeline."]]},
         {"range": "Overview!B5:G5", "values": [blocks["header"]]},
         {"range": "Overview!B7:G12", "values": blocks["volume"]},
         {"range": "Overview!B15:G19", "values": blocks["outcomes"]},
