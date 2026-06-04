@@ -17,6 +17,33 @@ def _optional(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _optional_int(key: str, default: int) -> int:
+    val = (_optional(key, "") or "").strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _optional_float(key: str, default: float) -> float:
+    val = (_optional(key, "") or "").strip()
+    if not val:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+def _optional_bool(key: str, default: bool = False) -> bool:
+    val = (_optional(key, "") or "").strip().lower()
+    if not val:
+        return default
+    return val in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Config:
     oauth_client_id: str
@@ -32,9 +59,6 @@ class Config:
     folder_review: str
     folder_pending: str
     folder_incoming: str
-    # Drive folder for resumes that arrived as internal forwards (e.g. Derek
-    # forwarding a candidate's email from his own inbox to jobs@). Optional
-    # -- if unset, the bot falls back to the normal outcome-based folder.
     folder_internal: str
 
     sheet_id: str
@@ -44,6 +68,7 @@ class Config:
     errors_tab: str
     misc_tab: str
     inbox_log_tab: str
+    needs_human_tab: str
 
     processed_label: str
     max_messages_per_run: int
@@ -51,13 +76,33 @@ class Config:
 
     shadow_mode: bool
 
-    # Floor date for inbox lookup. Empty = no floor.
     bot_start_date: str
 
-    # Email domains we consider "internal" -- senders from these domains
-    # are treated as forwarders (e.g. an employee forwarding a candidate's
-    # resume) rather than as job applicants. Lower-cased, no '@'.
     internal_domains: tuple
+
+    # ----- Pre-filter blocklist -----
+    # Sender emails / domains to always classify as MISC without an LLM call.
+    # Comma-separated. Domain entries can be "example.com" or "@example.com".
+    blocklist_senders: tuple
+
+    # ----- Needs Human review queue -----
+    # If the classifier's confidence is below this, route the email to
+    # the Needs Human queue (Gmail label + sheet tab) instead of acting.
+    classifier_confidence_threshold: float
+    # If the same sender has N+ messages in the past LOOP_WINDOW_HOURS,
+    # route to Needs Human as a loop-detection signal.
+    loop_threshold: int
+    loop_window_hours: int
+
+    # ----- Business-hours-only auto-replies -----
+    # When true, template auto-replies fire only inside the PT window
+    # [business_hours_start_pt, business_hours_end_pt). Outside the
+    # window the bot still classifies, scores, and logs -- it just
+    # skips the actual outbound send and does NOT mark Gmail-processed,
+    # so the next business-hours run picks the email back up.
+    business_hours_only_replies: bool
+    business_hours_start_pt: int
+    business_hours_end_pt: int
 
 
 def load() -> Config:
@@ -65,6 +110,10 @@ def load() -> Config:
     internal_domains = tuple(
         d.strip().lower().lstrip("@") for d in internal_domains_raw.split(",")
         if d.strip()
+    )
+    blocklist_raw = _optional("BLOCKLIST_SENDERS", "")
+    blocklist = tuple(
+        s.strip().lower() for s in blocklist_raw.split(",") if s.strip()
     )
     return Config(
         oauth_client_id=_required("GOOGLE_OAUTH_CLIENT_ID"),
@@ -86,11 +135,22 @@ def load() -> Config:
         errors_tab=_optional("ERRORS_TAB_NAME", "Bot Errors"),
         misc_tab=_optional("MISC_TAB_NAME", "Archive - Misc"),
         inbox_log_tab=_optional("INBOX_LOG_TAB_NAME", "Inbox Log"),
+        needs_human_tab=_optional("NEEDS_HUMAN_TAB_NAME", "Needs Human"),
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
         company_name=_optional("COMPANY_NAME", "R1 Concepts"),
-        shadow_mode=_optional("SHADOW_MODE", "false").strip().lower()
-                    in {"1", "true", "yes", "on"},
+        shadow_mode=_optional_bool("SHADOW_MODE", False),
         bot_start_date=_optional("BOT_START_DATE", "").strip(),
         internal_domains=internal_domains,
+        blocklist_senders=blocklist,
+        classifier_confidence_threshold=_optional_float(
+            "CLASSIFIER_CONFIDENCE_THRESHOLD", 0.7,
+        ),
+        loop_threshold=_optional_int("LOOP_THRESHOLD", 3),
+        loop_window_hours=_optional_int("LOOP_WINDOW_HOURS", 24),
+        business_hours_only_replies=_optional_bool(
+            "BUSINESS_HOURS_ONLY_REPLIES", True,
+        ),
+        business_hours_start_pt=_optional_int("BUSINESS_HOURS_START_PT", 8),
+        business_hours_end_pt=_optional_int("BUSINESS_HOURS_END_PT", 19),
     )
