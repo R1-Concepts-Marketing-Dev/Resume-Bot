@@ -65,6 +65,7 @@ def run() -> int:
     sheets_client.ensure_dashboard_headers(sheets, cfg.sheet_id, cfg.dashboard_tab)
     sheets_client.ensure_templates_seeded(sheets, cfg.sheet_id, cfg.templates_tab)
     sheets_client.ensure_misc_headers(sheets, cfg.sheet_id, cfg.misc_tab)
+    sheets_client.ensure_inbox_log_headers(sheets, cfg.sheet_id, cfg.inbox_log_tab)
 
     all_filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
     if not all_filters:
@@ -149,18 +150,71 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         log.info("  -> shadow mode: thread already in Sheet, skipping.")
         return 0
 
-    if not msg.has_resume:
-        intent = scorer.classify_no_resume_intent(
-            api_key=cfg.anthropic_api_key,
-            subject=msg.subject,
-            body=msg.body_text,
+    # Pre-filter: classify EVERY inbound email into one of 4 buckets BEFORE
+    # any expensive scoring. This catches newsletters/spam/internal emails
+    # upstream (saves API cost), and lets the main routing dispatch cleanly.
+    email_type = scorer.classify_inbound_email(
+        api_key=cfg.anthropic_api_key,
+        subject=msg.subject,
+        body=msg.body_text,
+        sender_email=msg.sender_email,
+        has_attachment=msg.has_resume,
+    )
+    log.info("  -> classifier: type=%s has_attachment=%s",
+             email_type, msg.has_resume)
+
+    def _log_inbox(email_type_label: str, action: str):
+        sheets_client.append_inbox_log(
+            sheets, cfg.sheet_id, cfg.inbox_log_tab,
+            {
+                "sender": msg.sender,
+                "subject": msg.subject,
+                "type": email_type_label,
+                "action": action,
+                "has_attachment": msg.has_resume,
+                "gmail_link": msg.thread_link,
+            },
         )
-        template_key = "no_resume" if intent == "application" else "question"
-        log.info("  -> no resume; intent=%s -> template=%s", intent, template_key)
+
+    # ----- Misc branch: not a candidate email at all -----
+    if email_type == "misc":
+        log.info("  -> misc (not candidate-related); logging to %s and skipping",
+                 cfg.misc_tab)
+        # Also write a "Misc" archive row for parity with the not_a_resume path.
+        sheets_client.append_misc(
+            sheets, cfg.sheet_id, cfg.misc_tab,
+            {
+                "sender": msg.sender,
+                "subject": msg.subject,
+                "filename": "",
+                "reasoning": "Classifier flagged as non-candidate (newsletter/alert/internal/spam).",
+                "gmail_link": msg.thread_link,
+            },
+        )
+        _log_inbox("misc", "archived to Misc, no reply")
+        if not cfg.shadow_mode:
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        return 0
+
+    # ----- No-attachment branches: question or application_no_resume -----
+    if not msg.has_resume:
+        # Trust the classifier for the question vs application split. If it
+        # somehow returned "resume" despite no attachment, fall back to
+        # application_no_resume (safer to ask for the file than to assume
+        # they wanted info).
+        if email_type == "question":
+            template_key = "question"
+            log_type = "question"
+        else:
+            template_key = "no_resume"
+            log_type = "application_no_resume"
+        log.info("  -> no attachment; %s -> template=%s", log_type, template_key)
 
         if cfg.shadow_mode:
             would_send = template_key if template_key in templates else None
             log.info("  -> shadow: would_have_sent=%s", would_send)
+            _log_inbox(log_type,
+                       f"shadow: would_have_sent={would_send}")
             return 0
 
         if template_key in templates and msg.sender_email:
@@ -169,10 +223,17 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 vars_extra={"applicant_name": msg.sender_name or "there"},
             )
             log.info("  -> sent '%s' to %s", template_key, msg.sender_email)
+            _log_inbox(log_type, f"replied with {template_key} template")
         else:
             log.info("  -> no template '%s' or no sender; not replying.", template_key)
+            _log_inbox(log_type, "no template / no sender, no reply")
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
+
+    # ----- Resume branch: has attachment, proceed to scoring -----
+    # Stash the inbox log helper so the per-attachment loop below can call
+    # it once we know the scoring outcome.
+    _inbox_log_for_resume = _log_inbox
 
     scored = 0
     last_bucket = None
@@ -365,6 +426,9 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                      bucket, result["confidence"], template_key, msg.sender_email)
         else:
             log.info("  -> %s | conf=%.2f | no email", bucket, result["confidence"])
+
+        # Inbox Log: one row per attachment scored on the resume branch.
+        _inbox_log_for_resume("resume", f"scored - {bucket}")
 
         scored += 1
 
