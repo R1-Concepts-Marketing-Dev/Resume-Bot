@@ -53,8 +53,7 @@ def _sanitize_filename_tag(roles: list[str]) -> str:
 
 def _is_internal_sender(sender_email: str, internal_domains: tuple) -> bool:
     """True if sender's email domain is one of the configured internal
-    domains (e.g. r1concepts.com). Used to detect resumes forwarded from
-    inside the company rather than submitted by a candidate."""
+    domains (e.g. r1concepts.com)."""
     if not sender_email or "@" not in sender_email:
         return False
     domain = sender_email.rsplit("@", 1)[-1].strip().lower()
@@ -93,10 +92,6 @@ def run() -> int:
     templates = sheets_client.load_templates(sheets, cfg.sheet_id, cfg.templates_tab)
     log.info("Loaded %d active template(s): %s", len(templates), list(templates.keys()))
 
-    # Load every candidate email already on the Candidates dashboard. Used
-    # below in _can_send() to suppress auto-replies to anyone HR is already
-    # engaged with -- prevents the bot from auto-responding into an active
-    # HR conversation.
     known_emails = sheets_client.load_known_candidate_emails(
         sheets, cfg.sheet_id, cfg.dashboard_tab,
     )
@@ -170,8 +165,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         log.info("  -> shadow mode: thread already in Sheet, skipping.")
         return 0
 
-    # Helper: write one row to the Inbox Log audit tab. Defined up here so
-    # short-circuits below (auto-response, internal forward) can use it.
     def _log_inbox(email_type_label: str, action: str):
         sheets_client.append_inbox_log(
             sheets, cfg.sheet_id, cfg.inbox_log_tab,
@@ -186,9 +179,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
 
     # ----- Pre-filter #1: auto-reply / OOO / newsletter short-circuit -----
-    # Header-based detection (Auto-Submitted, List-Unsubscribe, Precedence,
-    # X-Autoreply, etc.). Replying to these is at best wasted, at worst a
-    # ping-pong loop. Route to misc and skip the classifier call entirely.
     if msg.is_auto_response:
         log.info("  -> auto-response/bulk headers detected; skipping classifier, archiving as misc")
         sheets_client.append_misc(
@@ -207,17 +197,10 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     # ----- Pre-filter #2: internal-forward short-circuit -----
-    # If sender's domain matches a configured internal domain (e.g.
-    # r1concepts.com), this is an employee forwarding a candidate resume
-    # rather than a candidate applying directly. Bypass the classifier
-    # (we already know it's a forward), score any attachments, route
-    # everything to the Internal Drive folder, never auto-reply.
     if _is_internal_sender(msg.sender_email, cfg.internal_domains):
         log.info("  -> internal forward from %s; treating as forwarded resume",
                  msg.sender_email)
         if not msg.has_resume:
-            # Internal email with no attachment -- probably a question or
-            # admin note. Log as misc; HR can read the thread directly.
             sheets_client.append_misc(
                 sheets, cfg.sheet_id, cfg.misc_tab,
                 {
@@ -233,8 +216,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             if not cfg.shadow_mode:
                 gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
             return 0
-        # Has attachment -- process via the resume branch but force the
-        # Internal Drive folder and suppress auto-replies.
         scored = _process_resume_attachments(
             cfg, gmail, drive, sheets, all_filters, templates,
             active_role_names, paused_role_names, msg, msg_id, label_id,
@@ -244,39 +225,49 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return scored
 
-    # ----- Pre-filter #3: thread-state introspection -----
-    # Load the set of templates the bot has already sent in this thread.
-    # Enforces the "no-duplicate-template + outcome-terminal" rule.
+    # ----- Pre-filter #3: thread-history introspection -----
+    # One API call: returns (templates the bot has already sent in this
+    # thread) AND (whether a human HR rep has manually replied). Both
+    # signals gate auto-replies in _can_send below.
     if cfg.shadow_mode:
-        sent_in_thread: set[str] = set()
+        thread_history = gmail_client.ThreadHistory(frozenset(), False)
     else:
-        sent_in_thread = gmail_client.get_sent_templates_in_thread(
-            gmail, cfg.gmail_user, msg.thread_id,
+        thread_history = gmail_client.get_thread_history(
+            gmail, cfg.gmail_user, msg.thread_id, cfg.internal_domains,
         )
+    sent_in_thread = set(thread_history.bot_templates_sent)
+    hr_manual = thread_history.hr_replied_manually
     if sent_in_thread:
         log.info("  -> thread already has bot templates: %s", sorted(sent_in_thread))
+    if hr_manual:
+        log.info("  -> thread already has manual HR reply (HR engaged)")
 
     def _can_send(template_key: str) -> tuple[bool, str]:
-        """Return (allowed, reason_if_blocked) for sending template_key.
-        Implements three rules:
-          1. no-duplicate: don't send the same template twice in a thread
-          2. outcome-terminal: don't reply after denied/paused_match was sent
-          3. known-candidate: don't reply if sender already in Candidates"""
+        """Decide whether the bot is allowed to send template_key in this
+        thread. Layered gates, in priority order:
+          1. HR has manually replied in this thread -> never auto-reply
+             (HR is in the conversation, the bot must not talk over them)
+          2. Sender is already on the Candidates dashboard (HR engaged
+             at the candidate level, even if not in this thread)
+          3. A terminal outcome template (denied / paused_match) has
+             already been sent in this thread
+          4. The same template_key has already been sent (no duplicates)
+        Returns (allowed, reason_if_blocked)."""
         if not template_key:
             return False, "no template selected"
-        if template_key in sent_in_thread:
-            return False, f"duplicate {template_key} (already sent in thread)"
-        if sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS:
-            terminal = sorted(sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS)
-            return False, f"terminal template already sent in thread: {terminal}"
+        if hr_manual:
+            return False, "HR replied manually in this thread"
         sender = (msg.sender_email or "").strip().lower()
         if sender and sender in known_emails:
             return False, "sender already in Candidates dashboard (HR engaged)"
+        if sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS:
+            terminal = sorted(sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS)
+            return False, f"terminal template already sent in thread: {terminal}"
+        if template_key in sent_in_thread:
+            return False, f"duplicate {template_key} (already sent in thread)"
         return True, ""
 
     # ----- Pre-filter #4: classify the email into one of 4 buckets -----
-    # Strip quoted/forwarded text first so the classifier only sees what
-    # the current sender typed this turn, not previously-quoted bot output.
     classifier_body = gmail_client.strip_quoted_text(msg.body_text)
     if classifier_body != msg.body_text:
         log.info("  -> stripped quoted text for classifier (%d -> %d chars)",
@@ -291,7 +282,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     log.info("  -> classifier: type=%s has_attachment=%s",
              email_type, msg.has_resume)
 
-    # ----- Misc branch: not a candidate email at all -----
+    # ----- Misc branch -----
     if email_type == "misc":
         log.info("  -> misc (not candidate-related); logging to %s and skipping",
                  cfg.misc_tab)
@@ -367,18 +358,9 @@ def _process_resume_attachments(
     sent_in_thread: set = None,
     can_send=None,
 ) -> int:
-    """Score every attachment on the message and update Drive/Sheets/Gmail
-    accordingly. Shared between the normal resume branch and the internal-
-    forward branch -- the difference is which Drive folder we land in and
-    whether we ever auto-reply.
-
-    For internal forwards: every attachment goes to cfg.folder_internal
-    (or falls back to the outcome folder if not configured); no template
-    auto-replies are ever sent regardless of scoring outcome.
-
-    For normal applicants: attachments go to the outcome-based folder
-    (qualified/not_qualified/review/pending) and auto-replies fire if
-    allowed by can_send()."""
+    """Shared resume-handling path. Internal forwards bypass auto-reply
+    and route to the Internal Drive folder; regular applicants go through
+    normal scoring + reply flow guarded by can_send()."""
     if sent_in_thread is None:
         sent_in_thread = set()
 
@@ -472,8 +454,6 @@ def _process_resume_attachments(
 
         last_bucket = _better_bucket(last_bucket, bucket)
 
-        # Folder routing: internal forwards override to the Internal folder
-        # (if configured); fall back to the outcome folder otherwise.
         if is_internal_forward and cfg.folder_internal:
             folder_id = cfg.folder_internal
         else:
@@ -486,16 +466,12 @@ def _process_resume_attachments(
             and top_active
             and applied_for != top_active
         )
-        cross_fit_flag = "🚨" if is_cross_fit else ""
+        cross_fit_flag = "\U0001F6A8" if is_cross_fit else ""
 
-        # Cross-fit suppression: if the candidate has a strong fit for a
-        # different ACTIVE role, never auto-send the rejection.
         if is_cross_fit and template_key == "denied":
             template_key = None
             log.info("  -> cross-fit detected; suppressing 'denied' template")
 
-        # Internal forwards: NEVER auto-reply (the sender is internal,
-        # they don't need a templated response).
         if is_internal_forward:
             template_key = None
 
