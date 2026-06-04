@@ -11,16 +11,10 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
-# Ordered worst -> best. Used internally for sorting and for the deterministic
-# overall_decision logic. The model never sees these numbers; they're just so
-# we can compare categories in Python.
 FIT_LEVELS = ("no_fit", "weak", "borderline", "strong", "excellent")
 _LEVEL_RANK = {lvl: i for i, lvl in enumerate(FIT_LEVELS)}
 
-# Levels that count as "qualified" for the overall decision.
 QUALIFIED_LEVELS = {"strong", "excellent"}
-# Levels included on the dashboard's best_fit_roles list (everything except
-# no_fit). "weak" shows up so HR can see roles the bot considered and rejected.
 SURFACED_LEVELS = {"weak", "borderline", "strong", "excellent"}
 
 
@@ -131,17 +125,9 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
 
     Returns one of:
       'resume'                 -- candidate is applying, resume attached
-                                  (also used when an attachment IS clearly
-                                  a resume even if the body doesn't say
-                                  much about it)
-      'application_no_resume'  -- candidate is applying but forgot to attach
-                                  the file (or pasted it inline)
-      'question'               -- person is asking about hours, pay, the
-                                  process, etc. Not submitting work history.
-      'misc'                   -- newsletter, internal company communication,
-                                  vendor/sales pitch, automated notification,
-                                  security alert, spam. Not candidate-related
-                                  in any way.
+      'application_no_resume'  -- candidate is applying but no attachment
+      'question'               -- person asking HR a specific question
+      'misc'                   -- newsletter, internal, automated, spam
 
     Defaults to 'question' on any error -- the question reply is the most
     generic safe response."""
@@ -155,34 +141,103 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         f"Body:\n{(body or '(empty)')[:1500]}"
     )
     system = (
-        "You triage a single inbound email to a jobs@ HR mailbox. "
-        "Reply with exactly ONE word from this set:\n"
+        "You triage a single inbound email to a jobs@ HR mailbox. Reply "
+        "with exactly ONE word from this set:\n"
         "  RESUME, APPLICATION_NO_RESUME, QUESTION, MISC\n\n"
-        "RESUME = the sender is a job applicant AND there is an attachment "
-        "that's almost certainly their resume. Signals: a person's name in "
-        "the subject, 'please find my resume', 'application for X', a "
-        "PDF/DOC attachment with a plausible name. Use this WHENEVER the "
-        "email has an attachment AND the body indicates they're applying.\n\n"
+        "CATEGORY DEFINITIONS\n"
+        "--------------------\n"
+        "RESUME = the sender is a job applicant AND has_attachment is yes. "
+        "An attachment is REQUIRED for this label. If has_attachment is no, "
+        "never use RESUME no matter how the email reads.\n\n"
         "APPLICATION_NO_RESUME = the sender is applying for a job but "
-        "didn't attach a file. Signals: 'I want to apply for X', 'I'm "
-        "interested in the position', their work history pasted into the "
-        "body, etc. No attachment -- they almost certainly forgot it.\n\n"
-        "QUESTION = the sender is asking the HR team something. Signals: "
-        "'is the X position still open?', 'what's the pay range?', 'when "
-        "do you interview?', 'can I drop my resume off in person?'. They "
-        "want a human reply, not an application form.\n\n"
-        "MISC = NOT candidate-related at all. Signals: newsletter, "
-        "marketing/sales pitch from a vendor, recruiter/staffing agency "
-        "outreach, internal company communication (e.g. forwarded from "
-        "another employee), automated notification (Google security alert, "
-        "Drive share, calendar invite), bounced-message report, payroll "
-        "service emails. The sender is not a candidate.\n\n"
-        "If an email is genuinely ambiguous between RESUME and "
-        "APPLICATION_NO_RESUME, use the attachment signal -- attachment "
-        "present = RESUME, no attachment = APPLICATION_NO_RESUME.\n\n"
-        "If an email is genuinely ambiguous between QUESTION and MISC, "
-        "prefer QUESTION (safer to reply to a real person than to ignore "
-        "them).\n\n"
+        "did NOT attach a file. Signals (any of these is enough):\n"
+        "  - 'I want to apply', 'I'm interested in the position', "
+        "'please consider me'\n"
+        "  - Their work history pasted into the body\n"
+        "  - Subject names a specific role + the body introduces themselves\n"
+        "  - Subject is mostly a phone number, a single first name, or "
+        "another tiny fragment AND no attachment (likely a candidate who "
+        "doesn't know how to attach; default to application intent)\n\n"
+        "QUESTION = the sender is asking the HR team a SPECIFIC question "
+        "and wants a human reply. Signals:\n"
+        "  - 'is the X position still open?'\n"
+        "  - 'what's the pay range?', 'what are the hours?'\n"
+        "  - 'when do you interview?', 'where do I drop off my resume?'\n"
+        "  - 'can I apply in person?'\n"
+        "Important: an applicant who says 'I'm interested in X' is NOT "
+        "asking a question -- that's APPLICATION_NO_RESUME. QUESTION "
+        "requires an actual question being asked.\n\n"
+        "MISC = NOT candidate-related at all. Signals:\n"
+        "  - Newsletter, marketing/sales pitch from a vendor\n"
+        "  - Recruiter/staffing agency outreach ('I have a candidate for "
+        "you', third-party submitting on behalf of someone else)\n"
+        "  - Automated notifications (Google security alerts, Drive "
+        "shares, calendar invites, Indeed/Craigslist platform emails "
+        "from no-reply@ addresses)\n"
+        "  - Internal company communications forwarded from a coworker\n"
+        "  - Bounced-message reports, payroll service emails\n"
+        "  - Body is almost entirely a copy of a job posting (the SENDER "
+        "is advertising the job, not applying to it)\n\n"
+        "DECISION ORDER -- check these in order:\n"
+        "1. Is the From: address a no-reply / platform domain (indeed.com, "
+        "craigslist.org, accounts.google.com, etc.)? -> MISC.\n"
+        "2. Is the body a copy of the job posting with no first-person "
+        "self-introduction? -> MISC.\n"
+        "3. Is has_attachment yes AND the email indicates an application? "
+        "-> RESUME.\n"
+        "4. Is the email expressing application intent (any signal in "
+        "APPLICATION_NO_RESUME above), regardless of how short or "
+        "informal it is? -> APPLICATION_NO_RESUME.\n"
+        "5. Is the email asking a specific question and not applying? "
+        "-> QUESTION.\n"
+        "6. Otherwise default to QUESTION (safest -- it's better to "
+        "respond to an ambiguous human than to ignore them).\n\n"
+        "WORKED EXAMPLES\n"
+        "---------------\n"
+        "Example 1:\n"
+        "  Subject: 'Cherry Picker Operator'\n"
+        "  Has attachment: yes\n"
+        "  Body: 'Hello, please find my resume attached for the cherry "
+        "picker role. Thanks, Alex.'\n"
+        "  -> RESUME\n\n"
+        "Example 2:\n"
+        "  Subject: 'Warehouse Packer'\n"
+        "  Has attachment: no\n"
+        "  Body: 'Hi, I'm really interested in this position. Please "
+        "consider me.'\n"
+        "  -> APPLICATION_NO_RESUME  (application intent, no file)\n\n"
+        "Example 3:\n"
+        "  Subject: '5551234567 Oscar'\n"
+        "  Has attachment: no\n"
+        "  Body: ''\n"
+        "  -> APPLICATION_NO_RESUME  (tiny-fragment subject is a "
+        "candidate who didn't know how to apply; default to application "
+        "intent over question)\n\n"
+        "Example 4:\n"
+        "  Subject: 'is the cherry picker job still open?'\n"
+        "  Has attachment: no\n"
+        "  Body: 'I saw it on indeed but the link was broken.'\n"
+        "  -> QUESTION  (asks a specific question, no application intent)\n\n"
+        "Example 5:\n"
+        "  Subject: 'Warehouse Packer Position'\n"
+        "  Has attachment: no\n"
+        "  Body: 'Warehouse Packer - $18/hour. We are looking for "
+        "candidates with 2+ years experience. Apply now. Visit our "
+        "website at...'\n"
+        "  -> MISC  (sender is advertising the job, not applying)\n\n"
+        "Example 6:\n"
+        "  From: no-reply@indeed.com\n"
+        "  Subject: 'New applicants for your job posting'\n"
+        "  Has attachment: no\n"
+        "  -> MISC  (automated platform notification)\n\n"
+        "Example 7:\n"
+        "  Subject: 'Cherry Picker Operator'\n"
+        "  Has attachment: no\n"
+        "  Body: 'Hi! I'm really excited about this opportunity. I saw "
+        "your post on Craigslist and I'd love to apply.'\n"
+        "  -> APPLICATION_NO_RESUME  (mentions Craigslist as the SOURCE, "
+        "not as the body content -- this is a real applicant who hasn't "
+        "attached a file yet)\n\n"
         "Reply with ONLY the one-word label. No punctuation, no prose."
     )
     try:
@@ -204,7 +259,6 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         }
         if text in mapping:
             return mapping[text]
-        # Tolerate slight variants
         for k, v in mapping.items():
             if k in text:
                 return v
@@ -215,8 +269,6 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         return "question"
 
 
-# Backward-compat wrapper -- still exposed for any callers that haven't
-# migrated to the new 4-way classifier yet.
 def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
     """Legacy 2-way classifier. Prefer classify_inbound_email."""
     result = classify_inbound_email(
@@ -227,8 +279,6 @@ def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
         return "application"
     if result == "question":
         return "question"
-    # If the new classifier returned 'resume' or 'misc' for a no-attachment
-    # email, fall back to the safest reply.
     return "question"
 
 
@@ -268,8 +318,6 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
 
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
 
-    # Strip markdown code fences if Claude wrapped the JSON (it often does
-    # despite the system prompt's instruction not to).
     if text.startswith("```"):
         text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
@@ -300,12 +348,10 @@ def _fallback(reason: str) -> dict[str, Any]:
 
 
 def _coerce_level(raw: Any) -> str:
-    """Map any incoming value to one of the FIT_LEVELS, defaulting to no_fit."""
     if isinstance(raw, str):
         s = raw.strip().lower().replace("-", "_").replace(" ", "_")
         if s in _LEVEL_RANK:
             return s
-        # Backwards-compatible: if the model emits a numeric string, bridge it.
         try:
             n = int(float(s))
             return _score_to_level(n)
@@ -317,7 +363,6 @@ def _coerce_level(raw: Any) -> str:
 
 
 def _score_to_level(n: int) -> str:
-    """Legacy bridge: map an old 0-100 score to a fit_level bucket."""
     if n >= 90:
         return "excellent"
     if n >= 70:
@@ -334,7 +379,6 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     if decision not in {"qualified", "not_qualified", "needs_review", "not_a_resume"}:
         r["overall_decision"] = "needs_review"
 
-    # not_a_resume short-circuits everything. No role scoring, no trump rule.
     if r["overall_decision"] == "not_a_resume":
         r["best_fit_roles"] = []
         r["applied_for_role"] = "unspecified"
@@ -348,12 +392,10 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
         role = str(item.get("role", "")).strip()
         if not role:
             continue
-        # Accept either fit_level (new) or fit_score (legacy) from the model.
         if "fit_level" in item:
             level = _coerce_level(item.get("fit_level"))
         else:
             level = _coerce_level(item.get("fit_score"))
-        # Drop roles the model flagged as no_fit -- they shouldn't be on the list.
         if level == "no_fit":
             continue
         cleaned.append({
@@ -364,9 +406,6 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
     cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
     r["best_fit_roles"] = cleaned
 
-    # Applied-for trump rule: derive overall_decision from the candidate's
-    # fit on the role they actually applied to, when present. Otherwise
-    # fall back to the model's own decision.
     applied_for = str(r.get("applied_for_role", "") or "").strip()
     if applied_for and applied_for.lower() != "unspecified":
         applied_level = "no_fit"
