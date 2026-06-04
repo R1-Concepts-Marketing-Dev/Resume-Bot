@@ -42,6 +42,8 @@ jobs:
           DRIVE_FOLDER_REVIEW: ${{ secrets.DRIVE_FOLDER_REVIEW }}
           DRIVE_FOLDER_PENDING: ${{ secrets.DRIVE_FOLDER_PENDING }}
           DRIVE_FOLDER_INCOMING: ${{ secrets.DRIVE_FOLDER_INCOMING }}
+          DRIVE_FOLDER_INTERNAL: ${{ secrets.DRIVE_FOLDER_INTERNAL }}
+          INTERNAL_DOMAINS: ${{ vars.INTERNAL_DOMAINS || 'r1concepts.com' }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           FILTERS_TAB_NAME: ${{ vars.FILTERS_TAB_NAME || 'Filters' }}
           DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
@@ -59,5 +61,5 @@ jobs:
           # BOT_START_DATE: ignore any email received before this date.
           # Prevents the bot from pulling in old applicants on first run.
           # Format YYYY-MM-DD or YYYY/MM/DD. Leave blank for no floor.
-          BOT_START_DATE: "2026-05-28"
+          BOT_START_DATE: "2026-05-29"
         run: python -m src.main
