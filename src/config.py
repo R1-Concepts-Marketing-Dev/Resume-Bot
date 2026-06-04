@@ -32,6 +32,10 @@ class Config:
     folder_review: str
     folder_pending: str
     folder_incoming: str
+    # Drive folder for resumes that arrived as internal forwards (e.g. Derek
+    # forwarding a candidate's email from his own inbox to jobs@). Optional
+    # -- if unset, the bot falls back to the normal outcome-based folder.
+    folder_internal: str
 
     sheet_id: str
     filters_tab: str
@@ -50,8 +54,18 @@ class Config:
     # Floor date for inbox lookup. Empty = no floor.
     bot_start_date: str
 
+    # Email domains we consider "internal" -- senders from these domains
+    # are treated as forwarders (e.g. an employee forwarding a candidate's
+    # resume) rather than as job applicants. Lower-cased, no '@'.
+    internal_domains: tuple
+
 
 def load() -> Config:
+    internal_domains_raw = _optional("INTERNAL_DOMAINS", "r1concepts.com")
+    internal_domains = tuple(
+        d.strip().lower().lstrip("@") for d in internal_domains_raw.split(",")
+        if d.strip()
+    )
     return Config(
         oauth_client_id=_required("GOOGLE_OAUTH_CLIENT_ID"),
         oauth_client_secret=_required("GOOGLE_OAUTH_CLIENT_SECRET"),
@@ -64,6 +78,7 @@ def load() -> Config:
         folder_review=_required("DRIVE_FOLDER_REVIEW"),
         folder_pending=_required("DRIVE_FOLDER_PENDING"),
         folder_incoming=_optional("DRIVE_FOLDER_INCOMING", ""),
+        folder_internal=_optional("DRIVE_FOLDER_INTERNAL", ""),
         sheet_id=_required("SHEET_ID"),
         filters_tab=_optional("FILTERS_TAB_NAME", "Filters"),
         dashboard_tab=_optional("DASHBOARD_TAB_NAME", "Candidates"),
@@ -77,4 +92,5 @@ def load() -> Config:
         shadow_mode=_optional("SHADOW_MODE", "false").strip().lower()
                     in {"1", "true", "yes", "on"},
         bot_start_date=_optional("BOT_START_DATE", "").strip(),
+        internal_domains=internal_domains,
     )
