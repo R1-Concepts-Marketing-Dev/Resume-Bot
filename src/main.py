@@ -150,19 +150,9 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         log.info("  -> shadow mode: thread already in Sheet, skipping.")
         return 0
 
-    # Pre-filter: classify EVERY inbound email into one of 4 buckets BEFORE
-    # any expensive scoring. This catches newsletters/spam/internal emails
-    # upstream (saves API cost), and lets the main routing dispatch cleanly.
-    email_type = scorer.classify_inbound_email(
-        api_key=cfg.anthropic_api_key,
-        subject=msg.subject,
-        body=msg.body_text,
-        sender_email=msg.sender_email,
-        has_attachment=msg.has_resume,
-    )
-    log.info("  -> classifier: type=%s has_attachment=%s",
-             email_type, msg.has_resume)
-
+    # Helper: write one row to the Inbox Log audit tab. Defined up here so
+    # the auto-response short-circuit below can use it before the resume-
+    # branch logic is reached.
     def _log_inbox(email_type_label: str, action: str):
         sheets_client.append_inbox_log(
             sheets, cfg.sheet_id, cfg.inbox_log_tab,
@@ -176,11 +166,76 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             },
         )
 
+    # ----- Pre-filter #1: auto-reply / OOO / newsletter short-circuit -----
+    # Header-based detection (Auto-Submitted, List-Unsubscribe, Precedence,
+    # X-Autoreply, etc.). Replying to these is at best wasted, at worst a
+    # ping-pong loop. Route to misc and skip the classifier call entirely.
+    if msg.is_auto_response:
+        log.info("  -> auto-response/bulk headers detected; skipping classifier, archiving as misc")
+        sheets_client.append_misc(
+            sheets, cfg.sheet_id, cfg.misc_tab,
+            {
+                "sender": msg.sender,
+                "subject": msg.subject,
+                "filename": "",
+                "reasoning": "Auto-reply / OOO / newsletter headers present; bot never replies to these.",
+                "gmail_link": msg.thread_link,
+            },
+        )
+        _log_inbox("misc", "auto-response headers; archived to Misc, no reply")
+        if not cfg.shadow_mode:
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        return 0
+
+    # ----- Pre-filter #2: thread-state introspection -----
+    # Load the set of templates the bot has already sent in this thread.
+    # Used below to enforce the "no-duplicate-template + outcome-terminal"
+    # rule -- prevents replying with the same template twice or replying
+    # after a terminal outcome (denied/paused_match) has already been sent.
+    if cfg.shadow_mode:
+        sent_in_thread: set[str] = set()
+    else:
+        sent_in_thread = gmail_client.get_sent_templates_in_thread(
+            gmail, cfg.gmail_user, msg.thread_id,
+        )
+    if sent_in_thread:
+        log.info("  -> thread already has bot templates: %s", sorted(sent_in_thread))
+
+    def _can_send(template_key: str) -> tuple[bool, str]:
+        """Return (allowed, reason_if_blocked) for sending template_key in
+        this thread. Implements the no-duplicate + outcome-terminal rule."""
+        if not template_key:
+            return False, "no template selected"
+        if template_key in sent_in_thread:
+            return False, f"duplicate {template_key} (already sent in thread)"
+        if sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS:
+            terminal = sorted(sent_in_thread & gmail_client.TERMINAL_TEMPLATE_KEYS)
+            return False, f"terminal template already sent in thread: {terminal}"
+        return True, ""
+
+    # ----- Pre-filter #3: classify the email into one of 4 buckets -----
+    # Strip quoted/forwarded text first so the classifier only sees what
+    # the current sender typed this turn, not previously-quoted bot output
+    # or forwarded headers. Original msg.body_text stays intact for the
+    # scorer (which benefits from the full context).
+    classifier_body = gmail_client.strip_quoted_text(msg.body_text)
+    if classifier_body != msg.body_text:
+        log.info("  -> stripped quoted text for classifier (%d -> %d chars)",
+                 len(msg.body_text), len(classifier_body))
+    email_type = scorer.classify_inbound_email(
+        api_key=cfg.anthropic_api_key,
+        subject=msg.subject,
+        body=classifier_body,
+        sender_email=msg.sender_email,
+        has_attachment=msg.has_resume,
+    )
+    log.info("  -> classifier: type=%s has_attachment=%s",
+             email_type, msg.has_resume)
+
     # ----- Misc branch: not a candidate email at all -----
     if email_type == "misc":
         log.info("  -> misc (not candidate-related); logging to %s and skipping",
                  cfg.misc_tab)
-        # Also write a "Misc" archive row for parity with the not_a_resume path.
         sheets_client.append_misc(
             sheets, cfg.sheet_id, cfg.misc_tab,
             {
@@ -198,10 +253,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
 
     # ----- No-attachment branches: question or application_no_resume -----
     if not msg.has_resume:
-        # Trust the classifier for the question vs application split. If it
-        # somehow returned "resume" despite no attachment, fall back to
-        # application_no_resume (safer to ask for the file than to assume
-        # they wanted info).
         if email_type == "question":
             template_key = "question"
             log_type = "question"
@@ -213,8 +264,15 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if cfg.shadow_mode:
             would_send = template_key if template_key in templates else None
             log.info("  -> shadow: would_have_sent=%s", would_send)
-            _log_inbox(log_type,
-                       f"shadow: would_have_sent={would_send}")
+            _log_inbox(log_type, f"shadow: would_have_sent={would_send}")
+            return 0
+
+        # Gate: thread-state check (no duplicates, no replies after terminal)
+        allowed, block_reason = _can_send(template_key)
+        if not allowed:
+            log.info("  -> %s suppressed: %s", template_key, block_reason)
+            _log_inbox(log_type, f"suppressed ({block_reason})")
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
             return 0
 
         if template_key in templates and msg.sender_email:
@@ -231,10 +289,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     # ----- Resume branch: has attachment, proceed to scoring -----
-    # Stash the inbox log helper so the per-attachment loop below can call
-    # it once we know the scoring outcome.
-    _inbox_log_for_resume = _log_inbox
-
     scored = 0
     last_bucket = None
     for att in msg.attachments:
@@ -281,9 +335,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             })
 
         # Not-a-resume diversion: skip Drive upload, skip auto-reply, skip
-        # Candidates row. Log it to Archive - Misc and move on. The email
-        # still gets labeled "Resume Bot/Not A Resume" via last_bucket so
-        # HR can find it later if they want.
+        # Candidates row. Log it to Archive - Misc and move on.
         if result["overall_decision"] == "not_a_resume":
             log.info("  -> not a resume; logging to %s, skipping Drive/reply",
                      cfg.misc_tab)
@@ -325,25 +377,16 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         last_bucket = _better_bucket(last_bucket, bucket)
 
         applied_for = result.get("applied_for_role", "unspecified") or "unspecified"
-        # top_active comes from active_matches only -- never from paused. So
-        # cross_fit only triggers when there's an ACTIVE role mismatch. We
-        # never cross-match into paused/pending roles; those go through the
-        # Pending tab via the normal paused_match flow.
         top_active = active_matches[0]["role"] if active_matches else ""
         is_cross_fit = (
             applied_for != "unspecified"
             and top_active
             and applied_for != top_active
         )
-        # Big emoji for the Cross-Fit column so it grabs HR attention.
-        # Empty cell when there's no cross-fit (only the "yes" stands out).
         cross_fit_flag = "🚨" if is_cross_fit else ""
 
         # Cross-fit suppression: if the candidate has a strong fit for a
-        # different ACTIVE role, never auto-send the rejection. Let HR
-        # follow up via the Cross-Match tab. In practice bucket is already
-        # "qualified" when there's an active match, but be explicit so this
-        # never regresses.
+        # different ACTIVE role, never auto-send the rejection.
         if is_cross_fit and template_key == "denied":
             template_key = None
             log.info("  -> cross-fit detected; suppressing 'denied' template")
@@ -368,15 +411,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 "gmail_link": msg.thread_link,
             })
 
-        # Cross-Fit Match column (col G): populated only when there's a
-        # role mismatch worth surfacing. Three cases:
-        #   1. Cross-fit row: show the top non-applied active match -- this
-        #      is the role HR should consider them for instead.
-        #   2. Unspecified applicant: show the single best match -- there's
-        #      no Applied For to anchor on, so the top fit is what HR sees.
-        #   3. Everything else (candidate applied for what they're best at,
-        #      not_qualified, etc.): leave blank. The Decision column
-        #      already says everything that needs saying.
         if is_cross_fit and active_matches:
             top = active_matches[0]
             cross_fit_match = f"{top['role']} ({top['fit_level']})"
@@ -410,25 +444,35 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             would_have_sent = template_key if template_key in templates else None
             log.info("  -> %s | conf=%.2f | shadow: would_have_sent=%s",
                      bucket, result["confidence"], would_have_sent)
+            _log_inbox("resume", f"shadow: scored={bucket}, would_have_sent={would_have_sent}")
         elif template_key and template_key in templates and msg.sender_email:
-            applicant_name = result["candidate_name"] or msg.sender_name or "there"
-            primary_role = (paused_matches[0]["role"] if paused_matches
-                            else (qualifying[0]["role"] if qualifying else ""))
-            _send_template(
-                gmail, cfg, templates[template_key], msg,
-                vars_extra={
-                    "applicant_name": applicant_name,
-                    "role": primary_role,
-                    "best_fit_roles": ", ".join([r["role"] for r in qualifying]),
-                },
-            )
-            log.info("  -> %s | conf=%.2f | sent '%s' to %s",
-                     bucket, result["confidence"], template_key, msg.sender_email)
+            allowed, block_reason = _can_send(template_key)
+            if not allowed:
+                log.info("  -> %s | conf=%.2f | suppressed %s: %s",
+                         bucket, result["confidence"], template_key, block_reason)
+                _log_inbox("resume",
+                           f"scored - {bucket}; reply suppressed ({block_reason})")
+            else:
+                applicant_name = result["candidate_name"] or msg.sender_name or "there"
+                primary_role = (paused_matches[0]["role"] if paused_matches
+                                else (qualifying[0]["role"] if qualifying else ""))
+                _send_template(
+                    gmail, cfg, templates[template_key], msg,
+                    vars_extra={
+                        "applicant_name": applicant_name,
+                        "role": primary_role,
+                        "best_fit_roles": ", ".join([r["role"] for r in qualifying]),
+                    },
+                )
+                # Track in-process so a second attachment in the same loop
+                # won't try to send the same template again.
+                sent_in_thread.add(template_key)
+                log.info("  -> %s | conf=%.2f | sent '%s' to %s",
+                         bucket, result["confidence"], template_key, msg.sender_email)
+                _log_inbox("resume", f"scored - {bucket}; replied with {template_key}")
         else:
-            log.info("  -> %s | conf=%.2f | no email", bucket, result["confidence"])
-
-        # Inbox Log: one row per attachment scored on the resume branch.
-        _inbox_log_for_resume("resume", f"scored - {bucket}")
+            log.info("  -> %s | conf=%.2f | no template / no email", bucket, result["confidence"])
+            _log_inbox("resume", f"scored - {bucket}; no auto-reply")
 
         scored += 1
 
@@ -484,6 +528,7 @@ def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
         body=body,
         thread_id=msg.thread_id,
         in_reply_to_msg_id=in_reply_to,
+        template_key=template.key,
     )
 
 
