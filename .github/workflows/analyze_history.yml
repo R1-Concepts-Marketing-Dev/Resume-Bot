@@ -1,0 +1,61 @@
+name: Analyze pre-bot email history
+
+# Manual trigger only. Mines historical jobs@ threads to extract real
+# labeled training examples for the classifier prompt. Not on a cron --
+# you run this once to seed the few-shot pool, then again every few
+# months if you want to refresh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Days to scan before BOT_START_DATE (default 180 = 6 months)"
+        required: false
+        default: "180"
+      max_threads:
+        description: "Cap on total threads to analyze in one run (cost control)"
+        required: false
+        default: "500"
+
+concurrency:
+  group: resume-bot-history-analyzer
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run historical analyzer
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-5' }}
+          # Required by config.load(); not used by the analyzer itself.
+          DRIVE_FOLDER_QUALIFIED: ${{ secrets.DRIVE_FOLDER_QUALIFIED }}
+          DRIVE_FOLDER_NOT_QUALIFIED: ${{ secrets.DRIVE_FOLDER_NOT_QUALIFIED }}
+          DRIVE_FOLDER_REVIEW: ${{ secrets.DRIVE_FOLDER_REVIEW }}
+          DRIVE_FOLDER_PENDING: ${{ secrets.DRIVE_FOLDER_PENDING }}
+          DRIVE_FOLDER_INCOMING: ${{ secrets.DRIVE_FOLDER_INCOMING }}
+          DRIVE_FOLDER_INTERNAL: ${{ secrets.DRIVE_FOLDER_INTERNAL }}
+          INTERNAL_DOMAINS: ${{ vars.INTERNAL_DOMAINS || 'r1concepts.com' }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
+          BOT_START_DATE: "2026-05-29"
+        run: |
+          python -m src.historical_analyzer \
+            --days-back ${{ inputs.days_back }} \
+            --max-threads ${{ inputs.max_threads }}
