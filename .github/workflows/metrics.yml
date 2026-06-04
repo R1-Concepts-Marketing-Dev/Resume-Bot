@@ -50,4 +50,10 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           METRICS_SHEET_ID: ${{ secrets.METRICS_SHEET_ID }}
           DASHBOARD_TAB_NAME: ${{ secrets.DASHBOARD_TAB_NAME }}
+          # Tuning knobs for the KPI band. Defaults in code: 120 sec
+          # saved per auto-handled resume, $20/hr triage rate. Override
+          # here via repo Variables (no commit needed) if assumptions
+          # change. Keep blank to use the defaults.
+          TIME_SAVED_PER_CASE_SEC: ${{ vars.TIME_SAVED_PER_CASE_SEC || '' }}
+          HOURLY_RATE_USD: ${{ vars.HOURLY_RATE_USD || '' }}
         run: python -m src.metrics
