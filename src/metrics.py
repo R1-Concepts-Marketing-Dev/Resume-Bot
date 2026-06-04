@@ -51,12 +51,19 @@ ENGAGED_HR_STATUSES = ACTIVE_HR_STATUSES | {"Hired"}
 
 # Estimated seconds of HR time saved per resume the bot auto-handled
 # (qualified auto-reply, denial, or paused-role notice). Tuning knob.
-TIME_SAVED_PER_CASE_SEC = 90
+DEFAULT_TIME_SAVED_PER_CASE_SEC = 120
+try:
+    TIME_SAVED_PER_CASE_SEC = int(
+        (os.environ.get("TIME_SAVED_PER_CASE_SEC") or "").strip()
+        or DEFAULT_TIME_SAVED_PER_CASE_SEC
+    )
+except ValueError:
+    TIME_SAVED_PER_CASE_SEC = DEFAULT_TIME_SAVED_PER_CASE_SEC
 
 # Fully loaded hourly rate for HR triage work. Used to convert time-saved
 # into a dollar figure for the upper-management KPI band. Tunable via the
-# HOURLY_RATE_USD env var; defaults to $35/hour.
-DEFAULT_HOURLY_RATE_USD = 35.0
+# HOURLY_RATE_USD env var; defaults to $20/hour.
+DEFAULT_HOURLY_RATE_USD = 20.0
 
 MONTH_NAMES = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
