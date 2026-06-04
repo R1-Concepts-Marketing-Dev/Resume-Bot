@@ -38,7 +38,12 @@ ENGAGED_HR_STATUSES = ACTIVE_HR_STATUSES | {"Hired"}
 
 # Estimated seconds of HR time saved per resume the bot auto-handled
 # (qualified auto-reply, denial, or paused-role notice). Tuning knob.
-TIME_SAVED_PER_CASE_SEC = 30
+TIME_SAVED_PER_CASE_SEC = 90
+
+# Fully loaded hourly rate for HR triage work. Used to convert time-saved
+# into a dollar figure for the upper-management KPI band. Tunable via the
+# HOURLY_RATE_USD env var; defaults to $35/hour.
+DEFAULT_HOURLY_RATE_USD = 35.0
 
 MONTH_NAMES = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -201,11 +206,37 @@ def build_blocks(metrics: dict) -> dict:
         per_month(lambda c: round(c["time_saved_sec"] / 60)),
     ]
 
+    # ----- Upper-management KPI band (current month at-a-glance) -----
+    # Reads HOURLY_RATE_USD from env at build time so changes propagate
+    # without redeploying the workflow.
+    try:
+        hourly_rate = float(_optional("HOURLY_RATE_USD",
+                                       str(DEFAULT_HOURLY_RATE_USD)))
+    except ValueError:
+        hourly_rate = DEFAULT_HOURLY_RATE_USD
+
+    this_month = metrics["per_month"][months[0]]
+    sec_saved = this_month["time_saved_sec"]
+    hours_saved = sec_saved / 3600
+    dollars_saved = hours_saved * hourly_rate
+
+    kpi_band = {
+        "hours_saved": f"{hours_saved:.1f} hrs",
+        "dollars_saved": f"${dollars_saved:,.0f}",
+        "resumes_scored": this_month["total"],
+        "qualified": this_month["qualified"],
+        "cross_fit_catches": this_month["cross_fit_catches"],
+        "active_queue": metrics["active_queue"],
+        "month_label": month_label(months[0]),
+        "hourly_rate": f"${hourly_rate:.0f}/hr assumed",
+    }
+
     return {
         "header": header,
         "volume": volume,
         "outcomes": outcomes,
         "workflow": workflow,
+        "kpi_band": kpi_band,
     }
 
 
@@ -239,8 +270,33 @@ def write_overview(sheets, metrics_sheet_id: str, blocks: dict,
         f"Last run: {pt.strftime('%Y-%m-%d %H:%M PT')}"
     )
 
+    kpi = blocks["kpi_band"]
+    # Hero KPI band at the top: five cells across, with a label row above
+    # the value row, and a third row of context (current month, assumption).
+    # Layout occupies rows 3-5; row 5 stays clear of the existing month
+    # header which lives at B5:G5 because the KPI band only uses A-E.
+    kpi_labels = [
+        f"Hours Saved ({kpi['month_label']})",
+        f"$ Saved ({kpi['month_label']})",
+        "Resumes Scored",
+        "Qualified",
+        "Cross-Fit Catches",
+    ]
+    kpi_values = [
+        kpi["hours_saved"],
+        kpi["dollars_saved"],
+        kpi["resumes_scored"],
+        kpi["qualified"],
+        kpi["cross_fit_catches"],
+    ]
+
     data = [
         {"range": "Overview!A2", "values": [[last_run]]},
+        {"range": "Overview!A3:E3", "values": [kpi_labels]},
+        {"range": "Overview!A4:E4", "values": [kpi_values]},
+        {"range": "Overview!H3",
+         "values": [[f"Assumes {kpi['hourly_rate']}, "
+                     f"{TIME_SAVED_PER_CASE_SEC}s saved per auto-handled resume"]]},
         {"range": "Overview!B5:G5", "values": [blocks["header"]]},
         {"range": "Overview!B7:G12", "values": blocks["volume"]},
         {"range": "Overview!B15:G19", "values": blocks["outcomes"]},
