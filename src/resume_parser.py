@@ -1,10 +1,11 @@
 """Extract plain text from a resume attachment. Tries fast text extraction
-first (pypdf for PDF, python-docx for Word, plain decode for TXT/RTF, OCR
-for images). If a PDF returns very little text (likely a scanned image),
-falls back to OCR via Tesseract."""
+first (pypdf for PDF, python-docx for Word, plain decode for TXT/RTF, Claude
+vision for images). If a PDF returns very little text (likely a scanned
+image), falls back to OCR via Tesseract."""
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import re
@@ -14,6 +15,29 @@ log = logging.getLogger(__name__)
 # If pypdf extracts fewer than this many characters from a PDF, we treat it
 # as image-based and OCR it instead.
 OCR_FALLBACK_CHAR_THRESHOLD = 200
+
+# MIME types Anthropic's vision API accepts. HEIC/TIFF/etc. fall through to
+# the Tesseract OCR path because Claude can't read them natively yet.
+_CLAUDE_VISION_MIME_MAP = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg":  "image/jpeg",
+    "image/png":  "image/png",
+    "image/webp": "image/webp",
+    "image/gif":  "image/gif",
+}
+
+# Cheap, fast model for OCR-style image-to-text extraction.
+_VISION_MODEL = "claude-haiku-4-5"
+
+# Prompt for the vision extraction call. Kept deliberately minimal -- we
+# want raw text, not commentary or formatting.
+_VISION_PROMPT = (
+    "This is a resume image. Extract ALL text from it verbatim, preserving "
+    "section order and bullets where you can. Do not summarize, paraphrase, "
+    "or add any commentary -- just return the raw text content. If the image "
+    "is not a resume, return the text you do see plus a single line at the "
+    "top saying: [NOT A RESUME]."
+)
 
 
 def _extract_pdf_text(data: bytes) -> str:
@@ -81,9 +105,9 @@ def _extract_txt(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").strip()
 
 
-def _ocr_image(data: bytes) -> str:
-    """Run OCR directly on an image attachment (JPG/PNG/HEIC). Some
-    applicants send photos of printed resumes."""
+def _ocr_image_tesseract(data: bytes) -> str:
+    """Local OCR via Tesseract. Used as a fallback when Claude vision is
+    unavailable or doesn't support the image MIME type."""
     try:
         from PIL import Image
         import pytesseract
@@ -98,9 +122,66 @@ def _ocr_image(data: bytes) -> str:
         return ""
 
 
-def extract(filename: str, mime_type: str, data: bytes) -> tuple[str, bool]:
+def _extract_image_claude(data: bytes, mime_type: str, api_key: str) -> str:
+    """Use Claude's vision API to read a resume image. Returns extracted
+    text on success, empty string if the call fails (caller will fall
+    back to Tesseract OCR).
+
+    Cost: ~1 cent per image with claude-haiku-4-5 (varies with image size
+    and text density). Much better accuracy than Tesseract on phone-camera
+    photos, angled scans, and handwriting."""
+    if not api_key:
+        return ""
+    mt = (mime_type or "").lower()
+    api_mime = _CLAUDE_VISION_MIME_MAP.get(mt)
+    if not api_mime:
+        log.info("Image MIME %r not supported by Claude vision; using Tesseract", mime_type)
+        return ""
+
+    try:
+        import anthropic
+    except ImportError as e:
+        log.warning("anthropic SDK unavailable, falling back to Tesseract: %s", e)
+        return ""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=_VISION_MODEL,
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": api_mime,
+                            "data": base64.standard_b64encode(data).decode("ascii"),
+                        },
+                    },
+                    {"type": "text", "text": _VISION_PROMPT},
+                ],
+            }],
+        )
+        text = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        ).strip()
+        return text
+    except Exception as e:
+        log.warning("Claude vision failed (%s); will fall back to Tesseract", e)
+        return ""
+
+
+def extract(filename: str, mime_type: str, data: bytes,
+            *, api_key: str = "") -> tuple[str, bool]:
     """Returns (text, used_ocr). Empty text means we couldn't read it --
-    main.py treats that as Unreadable."""
+    main.py treats that as Unreadable.
+
+    api_key (optional): Anthropic API key. If provided AND the attachment
+    is an image type Claude vision supports (JPEG/PNG/WEBP/GIF), uses
+    Claude vision instead of Tesseract for better accuracy. Falls back
+    to Tesseract on errors or unsupported formats (HEIC, TIFF)."""
     name = (filename or "").lower()
     mt = (mime_type or "").lower()
     is_pdf = "pdf" in mt or name.endswith(".pdf")
@@ -128,8 +209,15 @@ def extract(filename: str, mime_type: str, data: bytes) -> tuple[str, bool]:
         return _extract_txt(data), False
 
     if is_image:
-        text = _ocr_image(data)
-        return text, bool(text)
+        # Try Claude vision first (better accuracy, especially on photos);
+        # fall back to local Tesseract if Claude doesn't support the MIME
+        # type, the API call fails, or no api_key was provided.
+        claude_text = _extract_image_claude(data, mime_type, api_key)
+        if claude_text:
+            return claude_text, True
+        log.info("Claude vision unavailable for this image; trying Tesseract")
+        tesseract_text = _ocr_image_tesseract(data)
+        return tesseract_text, bool(tesseract_text)
 
     # Older .doc (binary Word) isn't handled in pure Python. We could shell
     # out to LibreOffice but that's a 30s startup hit. For now we surface
