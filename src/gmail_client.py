@@ -12,6 +12,49 @@ from email.mime.text import MIMEText
 
 log = logging.getLogger(__name__)
 
+# Custom header the bot adds to every outgoing reply, naming which template
+# was used. Lets us detect "what has the bot already said in this thread?"
+# without parsing subject lines.
+BOT_TEMPLATE_HEADER = "X-Resume-Bot-Template"
+
+# Templates that count as terminal -- once sent, the bot must not auto-reply
+# again in that thread. HR owns the conversation from here.
+TERMINAL_TEMPLATE_KEYS = frozenset({"denied", "paused_match"})
+
+# Every template key the bot might send. Used to filter unknown values
+# out of the X-Resume-Bot-Template header, just in case.
+ALL_TEMPLATE_KEYS = frozenset({"no_resume", "question", "denied", "paused_match"})
+
+# Headers that signal "this is an automated / bulk email, do not auto-reply".
+# Value of None means "any non-empty value triggers". Otherwise tuple of
+# substrings (case-insensitive) that must appear in the header value.
+_AUTO_REPLY_HEADER_SIGNALS = {
+    "auto-submitted":   ("auto-replied", "auto-generated", "auto-notified"),
+    "x-autoreply":      None,
+    "x-autorespond":    None,
+    "x-autoresponder":  None,
+    "precedence":       ("auto_reply", "bulk", "list", "junk"),
+    "list-unsubscribe": None,
+    "list-id":          None,
+}
+
+# Regex patterns that mark the start of quoted/forwarded content in an
+# email body. Used by strip_quoted_text() so the classifier sees only
+# what the current sender typed this turn.
+_QUOTE_PATTERNS = [
+    # Gmail / Apple Mail: "On Mon, Jan 1, 2024 at 1:23 PM, Name <e@x> wrote:"
+    re.compile(r"\n\s*On\s[^\n]{1,200}\swrote:\s*\n", re.IGNORECASE),
+    # Outlook reply separator: "-----Original Message-----"
+    re.compile(r"\n\s*-{2,}\s*Original Message\s*-{2,}\s*\n", re.IGNORECASE),
+    # Outlook forwarded-header block ("From: ...\nSent: ...")
+    re.compile(r"\n\s*From:\s[^\n]{1,200}\n\s*Sent:\s", re.IGNORECASE),
+    # Apple Mail forward marker
+    re.compile(r"\n\s*Begin forwarded message:\s*\n", re.IGNORECASE),
+    # Long underscore separator (some clients)
+    re.compile(r"\n_{10,}\s*\n"),
+]
+
+
 RESUME_MIME_TYPES = {
     "application/pdf": ".pdf",
     "application/msword": ".doc",
@@ -54,6 +97,9 @@ class Message:
     body_text: str
     attachments: list[Attachment] = field(default_factory=list)
     was_unread: bool = False
+    # All inbound headers, lower-cased keys. Used by is_auto_response and
+    # any caller that needs to inspect specific headers like Message-ID.
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def thread_link(self) -> str:
@@ -62,6 +108,22 @@ class Message:
     @property
     def has_resume(self) -> bool:
         return bool(self.attachments)
+
+    @property
+    def is_auto_response(self) -> bool:
+        """True if the headers indicate this is an auto-reply, OOO,
+        newsletter, mailing-list traffic, or otherwise automated. The bot
+        should never reply to these -- replying creates ping-pong loops
+        and the recipient isn't a human anyway."""
+        for hdr, allowed_substrings in _AUTO_REPLY_HEADER_SIGNALS.items():
+            val = (self.headers.get(hdr) or "").lower()
+            if not val:
+                continue
+            if allowed_substrings is None:
+                return True
+            if any(s in val for s in allowed_substrings):
+                return True
+        return False
 
 
 def ensure_label(svc, user: str, name: str) -> str:
@@ -198,6 +260,14 @@ def fetch(svc, user: str, msg_id: str) -> Message:
     if not sender_email and "@" in sender_raw:
         sender_email = sender_raw.strip().strip("<>")
 
+    # Capture all headers as a lower-cased-key dict so is_auto_response (and
+    # any future header-based checks) doesn't need to walk the list each time.
+    headers_map: dict[str, str] = {}
+    for h in payload.get("headers", []):
+        key = (h.get("name") or "").lower()
+        if key:
+            headers_map[key] = h.get("value", "")
+
     return Message(
         id=msg_id,
         thread_id=msg.get("threadId", ""),
@@ -208,6 +278,7 @@ def fetch(svc, user: str, msg_id: str) -> Message:
         body_text=_extract_body_text(payload),
         attachments=attachments,
         was_unread="UNREAD" in msg.get("labelIds", []),
+        headers=headers_map,
     )
 
 
@@ -242,7 +313,11 @@ def archive_with_outcome(svc, user: str, msg_id: str, *,
 
 
 def send_reply(svc, user: str, *, to: str, subject: str, body: str,
-               thread_id: str = "", in_reply_to_msg_id: str = "") -> None:
+               thread_id: str = "", in_reply_to_msg_id: str = "",
+               template_key: str = "") -> None:
+    """Send a plaintext reply. If template_key is provided, stamps the
+    outgoing message with the X-Resume-Bot-Template header so future runs
+    can detect what was already sent in this thread."""
     mime = MIMEText(body, "plain", "utf-8")
     mime["To"] = to
     mime["From"] = user
@@ -250,6 +325,8 @@ def send_reply(svc, user: str, *, to: str, subject: str, body: str,
     if in_reply_to_msg_id:
         mime["In-Reply-To"] = in_reply_to_msg_id
         mime["References"] = in_reply_to_msg_id
+    if template_key:
+        mime[BOT_TEMPLATE_HEADER] = template_key
 
     raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")
     body_obj: dict = {"raw": raw}
@@ -257,3 +334,111 @@ def send_reply(svc, user: str, *, to: str, subject: str, body: str,
         body_obj["threadId"] = thread_id
 
     svc.users().messages().send(userId=user, body=body_obj).execute()
+
+
+# --------------------------- Quote / forward stripping -----------------------
+
+def strip_quoted_text(body: str) -> str:
+    """Strip quoted and forwarded content from an email body so a classifier
+    sees only what the current sender typed this turn.
+
+    Conservative by design:
+    - If no quote markers are found, returns the body unchanged.
+    - If stripping would leave fewer than 30 chars, returns the body
+      unchanged (we'd be cutting too aggressively to be useful).
+
+    Does NOT modify the body kept on the Message dataclass; callers should
+    invoke this just before passing text to the classifier, and keep the
+    original around for audit / scoring purposes."""
+    if not body or len(body) < 50:
+        return body
+
+    earliest = len(body)
+    for pat in _QUOTE_PATTERNS:
+        m = pat.search(body)
+        if m and m.start() < earliest:
+            earliest = m.start()
+
+    # Markdown-style quoting: two consecutive lines starting with ">". Find
+    # the start of the first such block and use it as a cut point.
+    lines = body.split("\n")
+    running_pos = 0
+    for i, line in enumerate(lines[:-1]):
+        if line.lstrip().startswith(">") and lines[i + 1].lstrip().startswith(">"):
+            if running_pos < earliest:
+                earliest = running_pos
+            break
+        running_pos += len(line) + 1  # +1 for the newline we split on
+
+    stripped = body[:earliest].rstrip()
+    if len(stripped) < 30:
+        # Too aggressive -- give back the original rather than feed the
+        # classifier an empty string.
+        return body
+    return stripped
+
+
+# --------------------------- Thread / template introspection ----------------
+
+def get_sent_templates_in_thread(svc, user: str, thread_id: str) -> set[str]:
+    """Return the set of template keys the bot has already sent in this
+    thread. Used to enforce two rules in main.py:
+
+      1. No-duplicate-template: don't send the same template twice in a
+         thread (kills "please attach resume" ping-pong loops).
+      2. Outcome-terminal: once any TERMINAL_TEMPLATE_KEYS template has
+         been sent, the bot stops auto-replying in that thread -- HR
+         owns the conversation from there.
+
+    Detection uses two signals, in priority order:
+
+      a) X-Resume-Bot-Template header on outgoing messages (modern bot
+         sends, post the gmail_client.send_reply update).
+      b) Subject-line match against known template subjects (legacy
+         fallback for threads where the bot replied before we started
+         adding the header).
+
+    Returns an empty set if the thread can't be loaded -- treated as
+    'no bot replies yet'. This errs toward sending a reply, which is
+    the safer default for a brand-new conversation."""
+    try:
+        thread = svc.users().threads().get(
+            userId=user, id=thread_id, format="full",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load thread %s: %s", thread_id, e)
+        return set()
+
+    sent: set[str] = set()
+    user_lower = (user or "").lower()
+
+    for msg in thread.get("messages", []):
+        payload = msg.get("payload", {})
+        msg_headers = {h.get("name", "").lower(): h.get("value", "")
+                       for h in payload.get("headers", [])}
+
+        # Only inspect messages WE (the bot) sent.
+        from_addr = (msg_headers.get("from") or "").lower()
+        if user_lower and user_lower not in from_addr:
+            continue
+
+        # (a) Modern detection: explicit header naming the template.
+        tmpl = (msg_headers.get(BOT_TEMPLATE_HEADER.lower()) or "").strip()
+        if tmpl in ALL_TEMPLATE_KEYS:
+            sent.add(tmpl)
+            continue
+
+        # (b) Legacy detection: subject-line match. We compare against the
+        # known template subject prefixes (stripped of any "Re:" prefix).
+        subj = (msg_headers.get("subject") or "").strip()
+        subj = re.sub(r"^(re|fwd?):\s*", "", subj, flags=re.IGNORECASE).lower()
+        if subj.startswith("please resend with your resume"):
+            sent.add("no_resume")
+        elif subj.startswith("thanks for reaching out to "):
+            sent.add("question")
+        elif subj.startswith("thank you for your interest in "):
+            sent.add("denied")
+        elif subj.startswith("we'll keep your resume on file for "):
+            sent.add("paused_match")
+
+    return sent
