@@ -1,4 +1,4 @@
-"""Gmail operations: find unprocessed messages, pull attachments, apply 
+"""Gmail operations: find unprocessed messages, pull attachments, apply
 labels, and send reply emails."""
 
 from __future__ import annotations

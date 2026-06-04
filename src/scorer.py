@@ -382,3 +382,101 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
             r["overall_decision"] = "not_qualified"
 
     return r
+n: str) -> dict[str, Any]:
+    return {
+        "best_fit_roles": [],
+        "overall_decision": "needs_review",
+        "years_relevant_experience": 0,
+        "job_hopping_flag": "neutral",
+        "reasoning": reason,
+        "confidence": 0.0,
+        "candidate_name": "",
+        "candidate_email": "",
+        "candidate_phone": "",
+        "applied_for_role": "unspecified",
+    }
+
+
+def _coerce_level(raw: Any) -> str:
+    """Map any incoming value to one of the FIT_LEVELS, defaulting to no_fit."""
+    if isinstance(raw, str):
+        s = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        if s in _LEVEL_RANK:
+            return s
+        # Backwards-compatible: if the model emits a numeric string, bridge it.
+        try:
+            n = int(float(s))
+            return _score_to_level(n)
+        except ValueError:
+            return "no_fit"
+    if isinstance(raw, (int, float)):
+        return _score_to_level(int(raw))
+    return "no_fit"
+
+
+def _score_to_level(n: int) -> str:
+    """Legacy bridge: map an old 0-100 score to a fit_level bucket."""
+    if n >= 90:
+        return "excellent"
+    if n >= 70:
+        return "strong"
+    if n >= 50:
+        return "borderline"
+    if n >= 30:
+        return "weak"
+    return "no_fit"
+
+
+def _normalize(r: dict[str, Any]) -> dict[str, Any]:
+    decision = r.get("overall_decision")
+    if decision not in {"qualified", "not_qualified", "needs_review", "not_a_resume"}:
+        r["overall_decision"] = "needs_review"
+
+    # not_a_resume short-circuits everything. No role scoring, no trump rule.
+    if r["overall_decision"] == "not_a_resume":
+        r["best_fit_roles"] = []
+        r["applied_for_role"] = "unspecified"
+        r["years_relevant_experience"] = 0
+        return r
+
+    cleaned = []
+    for item in r.get("best_fit_roles") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        if not role:
+            continue
+        # Accept either fit_level (new) or fit_score (legacy) from the model.
+        if "fit_level" in item:
+            level = _coerce_level(item.get("fit_level"))
+        else:
+            level = _coerce_level(item.get("fit_score"))
+        # Drop roles the model flagged as no_fit -- they shouldn't be on the list.
+        if level == "no_fit":
+            continue
+        cleaned.append({
+            "role": role,
+            "fit_level": level,
+            "reasoning": str(item.get("reasoning", "")).strip(),
+        })
+    cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
+    r["best_fit_roles"] = cleaned
+
+    # Applied-for trump rule: derive overall_decision from the candidate's
+    # fit on the role they actually applied to, when present. Otherwise
+    # fall back to the model's own decision.
+    applied_for = str(r.get("applied_for_role", "") or "").strip()
+    if applied_for and applied_for.lower() != "unspecified":
+        applied_level = "no_fit"
+        for item in cleaned:
+            if item["role"].strip().lower() == applied_for.lower():
+                applied_level = item["fit_level"]
+                break
+        if applied_level in QUALIFIED_LEVELS:
+            r["overall_decision"] = "qualified"
+        elif applied_level == "borderline":
+            r["overall_decision"] = "needs_review"
+        else:
+            r["overall_decision"] = "not_qualified"
+
+    return r
