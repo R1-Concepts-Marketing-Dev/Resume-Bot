@@ -39,6 +39,16 @@ MISC_HEADERS = [
 ]
 
 
+# Master audit log of every email the bot processed. One row per email,
+# regardless of outcome. Resumes also get a row on Candidates; misc emails
+# also get a row on Archive - Misc. Inbox Log is the single source of truth
+# for "what emails did the bot see this week" reporting.
+INBOX_LOG_HEADERS = [
+    "Timestamp", "Sender", "Subject", "Type", "Action Taken",
+    "Has Attachment", "Gmail Thread Link",
+]
+
+
 SEED_TEMPLATES: list[Template] = [
     Template(
         key="no_resume",
@@ -229,6 +239,56 @@ def ensure_misc_headers(svc, sheet_id, tab):
         log.warning("Could not write %s headers: %s", tab, e)
 
 
+def ensure_inbox_log_headers(svc, sheet_id, tab):
+    """Idempotently write headers to the Inbox Log tab. Tolerates the tab
+    not existing yet -- the Apps Script side is expected to have created
+    it. Swallows missing-tab errors so the run doesn't crash."""
+    rng = f"{tab}!A1:G1"
+    try:
+        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+    except Exception as e:
+        log.warning("Could not read %s headers (tab may not exist yet): %s", tab, e)
+        return
+    if resp.get("values"):
+        return
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
+            body={"values": [INBOX_LOG_HEADERS]},
+        ).execute()
+    except Exception as e:
+        log.warning("Could not write %s headers: %s", tab, e)
+
+
+def append_inbox_log(svc, sheet_id, tab, row):
+    """Append a row to the Inbox Log -- the master audit trail.
+
+    Every email the bot processes gets ONE row here, with Type being one
+    of: resume, application_no_resume, question, misc, unreadable.
+    Action Taken is a short string describing what the bot did
+    (e.g. 'scored - qualified', 'replied with question template',
+    'archived to Misc')."""
+    try:
+        values = [
+            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            _safe(row.get("sender", "")),
+            _safe(row.get("subject", "")),
+            _safe(row.get("type", "")),
+            _safe(row.get("action", "")),
+            "yes" if row.get("has_attachment") else "no",
+            _hyperlink(row.get("gmail_link", "")),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:G",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to log to %s tab: %s", tab, e)
+
+
 def append_misc(svc, sheet_id, tab, row):
     """Append a row to the Archive - Misc tab for emails the bot decided
     were not candidate resumes (newsletters, alerts, internal comms, etc.).
@@ -260,6 +320,77 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     Uses valueRenderOption=FORMULA so HYPERLINK formula text is returned
     (instead of the displayed label "Link"). The thread ID is embedded
     in the URL inside the formula."""
+    import re
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!O2:O",
+            valueRenderOption="FORMULA",
+        ).execute()
+    except Exception:
+        return set()
+    ids: set[str] = set()
+    for row in resp.get("values", []):
+        if not row:
+            continue
+        cell = str(row[0])
+        m = re.search(r"#inbox/([A-Za-z0-9]+)", cell)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
+def append_error(svc, sheet_id, tab, row):
+    """Append a row to the Bot Errors tab. Swallows its own exceptions."""
+    try:
+        values = [
+            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            row.get("msg_id", ""),
+            row.get("sender_email", ""),
+            row.get("filename", ""),
+            row.get("error_type", ""),
+            str(row.get("detail", ""))[:1000],
+            row.get("bot_action", ""),
+            row.get("gmail_link", ""),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:H",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to log to %s tab: %s", tab, e)
+
+
+def append_candidate(svc, sheet_id, tab, row):
+    values = [
+        row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        _safe(row.get("candidate_name", "")),
+        _safe(row.get("email", "")),
+        _safe(row.get("phone", "")),
+        _safe(row.get("filename", "")),
+        _safe(row.get("applied_for", "")),
+        _safe(row.get("cross_fit_match", "")),
+        row.get("cross_fit_flag", ""),
+        row.get("decision", ""),
+        row.get("years_relevant_experience", ""),
+        _safe(row.get("job_hopping_flag", "")),
+        row.get("confidence", ""),
+        _safe(row.get("reasoning", "")),
+        _hyperlink(row.get("drive_link", "")),
+        _hyperlink(row.get("gmail_link", "")),
+        "", "",
+    ]
+    svc.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A:Q",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [values]},
+    ).execute()
+"""
     import re
     try:
         resp = svc.spreadsheets().values().get(
