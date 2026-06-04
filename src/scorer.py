@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import anthropic
@@ -16,6 +17,15 @@ _LEVEL_RANK = {lvl: i for i, lvl in enumerate(FIT_LEVELS)}
 
 QUALIFIED_LEVELS = {"strong", "excellent"}
 SURFACED_LEVELS = {"weak", "borderline", "strong", "excellent"}
+
+
+@dataclass(frozen=True)
+class ClassifierResult:
+    """Output of classify_inbound_email: the routing label plus the
+    model's confidence in that label. Confidence is used to escalate
+    ambiguous cases to the Needs Human review queue."""
+    label: str          # "resume" | "application_no_resume" | "question" | "misc"
+    confidence: float   # 0.0 - 1.0
 
 
 SYSTEM_PROMPT = """You are an HR screening assistant for a brake parts \
@@ -116,23 +126,28 @@ Concurrent-role exception: before counting roles for the job-hopping cap, check 
 
 INBOUND_TYPES = ("resume", "application_no_resume", "question", "misc")
 
+# Lowercase string labels used internally + by main.py routing.
+_LABEL_NORMALIZE = {
+    "RESUME":                "resume",
+    "APPLICATION_NO_RESUME": "application_no_resume",
+    "QUESTION":              "question",
+    "MISC":                  "misc",
+}
+
 
 def classify_inbound_email(*, api_key: str, subject: str, body: str,
-                           sender_email: str, has_attachment: bool) -> str:
-    """Classify an inbound jobs@ email into one of four categories so
-    main.py can route it without paying for a full resume scoring call
-    on emails that clearly aren't candidate applications.
+                           sender_email: str,
+                           has_attachment: bool) -> ClassifierResult:
+    """Classify an inbound jobs@ email and return (label, confidence).
 
-    Returns one of:
-      'resume'                 -- candidate is applying, resume attached
-      'application_no_resume'  -- candidate is applying but no attachment
-      'question'               -- person asking HR a specific question
-      'misc'                   -- newsletter, internal, automated, spam
+    Confidence is the model's self-reported certainty in [0, 1]. main.py
+    uses it to escalate low-confidence calls to the Needs Human queue
+    instead of trusting them.
 
-    Defaults to 'question' on any error -- the question reply is the most
-    generic safe response."""
+    Defaults to ('question', 0.5) on error -- the safest action and
+    a confidence low enough to flag for human review."""
     if not (subject or body or has_attachment):
-        return "question"
+        return ClassifierResult(label="question", confidence=0.5)
 
     user_msg = (
         f"From: {sender_email or '(unknown)'}\n"
@@ -141,9 +156,11 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         f"Body:\n{(body or '(empty)')[:1500]}"
     )
     system = (
-        "You triage a single inbound email to a jobs@ HR mailbox. Reply "
-        "with exactly ONE word from this set:\n"
-        "  RESUME, APPLICATION_NO_RESUME, QUESTION, MISC\n\n"
+        "You triage a single inbound email to a jobs@ HR mailbox. Return "
+        "ONLY a JSON object with this exact schema (no prose, no markdown, "
+        "no code fences):\n"
+        "  {\"label\": \"RESUME|APPLICATION_NO_RESUME|QUESTION|MISC\", "
+        "\"confidence\": <number 0.0-1.0>}\n\n"
         "CATEGORY DEFINITIONS\n"
         "--------------------\n"
         "RESUME = the sender is a job applicant AND has_attachment is yes. "
@@ -169,104 +186,88 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         "requires an actual question being asked.\n\n"
         "MISC = NOT candidate-related at all. Signals:\n"
         "  - Newsletter, marketing/sales pitch from a vendor\n"
-        "  - Recruiter/staffing agency outreach ('I have a candidate for "
-        "you', third-party submitting on behalf of someone else)\n"
-        "  - Automated notifications (Google security alerts, Drive "
-        "shares, calendar invites, Indeed/Craigslist platform emails "
-        "from no-reply@ addresses)\n"
+        "  - Recruiter/staffing agency outreach\n"
+        "  - Automated notifications (no-reply@ addresses, platform mail)\n"
         "  - Internal company communications forwarded from a coworker\n"
         "  - Bounced-message reports, payroll service emails\n"
-        "  - Body is almost entirely a copy of a job posting (the SENDER "
-        "is advertising the job, not applying to it)\n\n"
-        "DECISION ORDER -- check these in order:\n"
-        "1. Is the From: address a no-reply / platform domain (indeed.com, "
-        "craigslist.org, accounts.google.com, etc.)? -> MISC.\n"
-        "2. Is the body a copy of the job posting with no first-person "
-        "self-introduction? -> MISC.\n"
-        "3. Is has_attachment yes AND the email indicates an application? "
+        "  - Body is almost entirely a copy of a job posting (sender is "
+        "advertising the job, not applying to it)\n\n"
+        "DECISION ORDER -- check in order:\n"
+        "1. no-reply / platform-domain sender -> MISC.\n"
+        "2. Body reads as a copy of a job posting with no self-intro -> MISC.\n"
+        "3. has_attachment is yes AND the email indicates an application "
         "-> RESUME.\n"
-        "4. Is the email expressing application intent (any signal in "
-        "APPLICATION_NO_RESUME above), regardless of how short or "
-        "informal it is? -> APPLICATION_NO_RESUME.\n"
-        "5. Is the email asking a specific question and not applying? "
-        "-> QUESTION.\n"
-        "6. Otherwise default to QUESTION (safest -- it's better to "
-        "respond to an ambiguous human than to ignore them).\n\n"
+        "4. Application intent (any APPLICATION_NO_RESUME signal) "
+        "-> APPLICATION_NO_RESUME.\n"
+        "5. Specific question being asked, not applying -> QUESTION.\n"
+        "6. Otherwise default to QUESTION.\n\n"
+        "CONFIDENCE GUIDE\n"
+        "----------------\n"
+        "0.95+ = textbook example, all signals point one way (e.g. clear "
+        "resume attachment + 'please find my resume attached')\n"
+        "0.85-0.94 = strong signals one direction, no contradictions\n"
+        "0.7-0.84 = correct call but some ambiguity (short body, "
+        "unusual subject)\n"
+        "0.5-0.69 = could go two ways, you're guessing the more likely one\n"
+        "below 0.5 = genuinely unclear (you'd want a human to look)\n\n"
         "WORKED EXAMPLES\n"
         "---------------\n"
-        "Example 1:\n"
-        "  Subject: 'Cherry Picker Operator'\n"
-        "  Has attachment: yes\n"
-        "  Body: 'Hello, please find my resume attached for the cherry "
-        "picker role. Thanks, Alex.'\n"
-        "  -> RESUME\n\n"
-        "Example 2:\n"
-        "  Subject: 'Warehouse Packer'\n"
-        "  Has attachment: no\n"
-        "  Body: 'Hi, I'm really interested in this position. Please "
-        "consider me.'\n"
-        "  -> APPLICATION_NO_RESUME  (application intent, no file)\n\n"
-        "Example 3:\n"
-        "  Subject: '5551234567 Oscar'\n"
-        "  Has attachment: no\n"
-        "  Body: ''\n"
-        "  -> APPLICATION_NO_RESUME  (tiny-fragment subject is a "
-        "candidate who didn't know how to apply; default to application "
-        "intent over question)\n\n"
-        "Example 4:\n"
-        "  Subject: 'is the cherry picker job still open?'\n"
-        "  Has attachment: no\n"
-        "  Body: 'I saw it on indeed but the link was broken.'\n"
-        "  -> QUESTION  (asks a specific question, no application intent)\n\n"
-        "Example 5:\n"
-        "  Subject: 'Warehouse Packer Position'\n"
-        "  Has attachment: no\n"
-        "  Body: 'Warehouse Packer - $18/hour. We are looking for "
-        "candidates with 2+ years experience. Apply now. Visit our "
-        "website at...'\n"
-        "  -> MISC  (sender is advertising the job, not applying)\n\n"
-        "Example 6:\n"
-        "  From: no-reply@indeed.com\n"
-        "  Subject: 'New applicants for your job posting'\n"
-        "  Has attachment: no\n"
-        "  -> MISC  (automated platform notification)\n\n"
-        "Example 7:\n"
-        "  Subject: 'Cherry Picker Operator'\n"
-        "  Has attachment: no\n"
-        "  Body: 'Hi! I'm really excited about this opportunity. I saw "
-        "your post on Craigslist and I'd love to apply.'\n"
-        "  -> APPLICATION_NO_RESUME  (mentions Craigslist as the SOURCE, "
-        "not as the body content -- this is a real applicant who hasn't "
-        "attached a file yet)\n\n"
-        "Reply with ONLY the one-word label. No punctuation, no prose."
+        "Example 1: subject 'Cherry Picker Operator', attachment yes, body "
+        "'Please find my resume attached.' -> "
+        "{\"label\":\"RESUME\",\"confidence\":0.97}\n\n"
+        "Example 2: subject 'Warehouse Packer', attachment no, body "
+        "'Hi, I'm really interested in this position.' -> "
+        "{\"label\":\"APPLICATION_NO_RESUME\",\"confidence\":0.9}\n\n"
+        "Example 3: subject '5551234567 Oscar', attachment no, body '' "
+        "-> {\"label\":\"APPLICATION_NO_RESUME\",\"confidence\":0.75}\n\n"
+        "Example 4: subject 'is the cherry picker job still open?', "
+        "attachment no, body 'I saw it on indeed.' -> "
+        "{\"label\":\"QUESTION\",\"confidence\":0.92}\n\n"
+        "Example 5: subject 'Warehouse Packer Position', attachment no, "
+        "body 'Warehouse Packer - $18/hour. Apply now at...' -> "
+        "{\"label\":\"MISC\",\"confidence\":0.88}\n\n"
+        "Example 6: from no-reply@indeed.com -> "
+        "{\"label\":\"MISC\",\"confidence\":0.98}\n\n"
+        "Example 7: subject 'Cherry Picker', attachment no, body 'Hi! "
+        "I'm excited about this. I saw your post on Craigslist.' -> "
+        "{\"label\":\"APPLICATION_NO_RESUME\",\"confidence\":0.85}\n\n"
+        "Return ONLY the JSON object. No prose."
     )
     try:
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=20,
+            max_tokens=80,
             system=system,
             messages=[{"role": "user", "content": user_msg}],
         )
         text = "".join(b.text for b in resp.content
-                       if getattr(b, "type", "") == "text")
-        text = text.strip().upper().rstrip(".,;:")
-        mapping = {
-            "RESUME": "resume",
-            "APPLICATION_NO_RESUME": "application_no_resume",
-            "QUESTION": "question",
-            "MISC": "misc",
-        }
-        if text in mapping:
-            return mapping[text]
-        for k, v in mapping.items():
-            if k in text:
-                return v
-        log.warning("Classifier returned unexpected label %r; defaulting", text)
-        return "question"
+                       if getattr(b, "type", "") == "text").strip()
+        # Strip code fences if the model wrapped JSON.
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+            text = re.sub(r"\n?```\s*$", "", text).strip()
+        data = json.loads(text)
+        label_raw = str(data.get("label", "")).strip().upper().rstrip(".,;:")
+        label = _LABEL_NORMALIZE.get(label_raw)
+        if not label:
+            # Tolerate slight variants.
+            for k, v in _LABEL_NORMALIZE.items():
+                if k in label_raw:
+                    label = v
+                    break
+        if not label:
+            log.warning("Classifier returned unknown label %r; defaulting", label_raw)
+            return ClassifierResult(label="question", confidence=0.4)
+        try:
+            conf = float(data.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            conf = 0.5
+        conf = max(0.0, min(1.0, conf))
+        return ClassifierResult(label=label, confidence=conf)
     except Exception as e:
-        log.warning("Email classifier failed, defaulting to question: %s", e)
-        return "question"
+        log.warning("Email classifier failed (%s); defaulting to question", e)
+        return ClassifierResult(label="question", confidence=0.3)
 
 
 def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
@@ -275,10 +276,8 @@ def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
         api_key=api_key, subject=subject, body=body,
         sender_email="", has_attachment=False,
     )
-    if result == "application_no_resume":
+    if result.label == "application_no_resume":
         return "application"
-    if result == "question":
-        return "question"
     return "question"
 
 
