@@ -1,8 +1,17 @@
 name: Resume bot
 
+# Smart cadence:
+#   - Business hours (~6am-7pm PT, with a buffer for PST/PDT): every 10 min
+#   - Off-hours (~7pm-6am PT): hourly
+# Hours are UTC. PDT = UTC-7 (most of the year); PST = UTC-8. The buffer
+# covers both seasons -- accept ~1h slop in winter rather than handling DST.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # Business hours: every 10 min during UTC 13-23 and 0-2
+    # (= 6am-7pm PT in PDT, 5am-6pm PT in PST)
+    - cron: "*/10 13-23,0-2 * * *"
+    # Off-hours: hourly during UTC 3-12 (= 8pm-5am PT roughly)
+    - cron: "0 3-12 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -48,18 +57,31 @@ jobs:
           FILTERS_TAB_NAME: ${{ vars.FILTERS_TAB_NAME || 'Filters' }}
           DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
           TEMPLATES_TAB_NAME: ${{ vars.TEMPLATES_TAB_NAME || 'Templates' }}
+          NEEDS_HUMAN_TAB_NAME: ${{ vars.NEEDS_HUMAN_TAB_NAME || 'Needs Human' }}
           PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'resume-bot/processed' }}
           MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '25' }}
           COMPANY_NAME: ${{ vars.COMPANY_NAME || 'R1 Concepts' }}
+          # Optional comma-separated list. Senders matching exactly (john@x.com)
+          # or by domain (example.com / @example.com) are auto-archived as misc
+          # without an LLM call. Tune over time as you spot recurring spammers.
+          BLOCKLIST_SENDERS: ${{ vars.BLOCKLIST_SENDERS || '' }}
+          # Needs Human review queue thresholds.
+          CLASSIFIER_CONFIDENCE_THRESHOLD: ${{ vars.CLASSIFIER_CONFIDENCE_THRESHOLD || '0.7' }}
+          LOOP_THRESHOLD: ${{ vars.LOOP_THRESHOLD || '3' }}
+          LOOP_WINDOW_HOURS: ${{ vars.LOOP_WINDOW_HOURS || '24' }}
+          # Business-hours-only template replies. Outside the window the
+          # bot still classifies and scores but doesn't send replies AND
+          # doesn't mark the email processed -- so the next biz-hour run
+          # picks it back up. Times are PT (with ~1h drift in winter).
+          BUSINESS_HOURS_ONLY_REPLIES: ${{ vars.BUSINESS_HOURS_ONLY_REPLIES || 'true' }}
+          BUSINESS_HOURS_START_PT: ${{ vars.BUSINESS_HOURS_START_PT || '8' }}
+          BUSINESS_HOURS_END_PT: ${{ vars.BUSINESS_HOURS_END_PT || '19' }}
           # SHADOW_MODE: beta-testing flag.
           #   true  = observe only -- read + score + log to Sheet. No Gmail
           #           label changes, no archiving, no auto-replies, no Drive
           #           uploads. Bot re-marks UNREAD so HR's queue is untouched.
           #   false = live -- full operation.
-          # Flip to "false" once when testing is complete.
           SHADOW_MODE: "true"
           # BOT_START_DATE: ignore any email received before this date.
-          # Prevents the bot from pulling in old applicants on first run.
-          # Format YYYY-MM-DD or YYYY/MM/DD. Leave blank for no floor.
           BOT_START_DATE: "2026-05-29"
         run: python -m src.main
