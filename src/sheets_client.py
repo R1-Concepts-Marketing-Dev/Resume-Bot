@@ -313,6 +313,36 @@ def append_misc(svc, sheet_id, tab, row):
         log.warning("Failed to log to %s tab: %s", tab, e)
 
 
+def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
+    """Read column C (Email) from the Candidates tab and return the set of
+    emails already on the dashboard, lower-cased and stripped. Used by
+    main.py to suppress auto-replies to candidates HR is already engaged
+    with -- if they're in the dashboard, HR owns the conversation.
+
+    Tolerant: if the read fails (tab missing, permissions, etc.) returns an
+    empty set. Empty-set behavior is the safe default -- the bot will
+    auto-reply as it did before."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!C2:C",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load known candidate emails: %s", e)
+        return set()
+    out: set[str] = set()
+    for row in resp.get("values", []):
+        if not row:
+            continue
+        val = str(row[0]).strip().lower()
+        # Strip the leading apostrophe added by _safe() for formula-escape.
+        if val.startswith("'"):
+            val = val[1:]
+        if val and "@" in val:
+            out.add(val)
+    return out
+
+
 def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     """Read column O (Gmail Thread Link) from the dashboard and return the
     set of Gmail thread IDs we've already logged.
