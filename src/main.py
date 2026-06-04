@@ -6,6 +6,7 @@ import logging
 import pathlib
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 import yaml
 
@@ -52,12 +53,39 @@ def _sanitize_filename_tag(roles: list[str]) -> str:
 
 
 def _is_internal_sender(sender_email: str, internal_domains: tuple) -> bool:
-    """True if sender's email domain is one of the configured internal
-    domains (e.g. r1concepts.com)."""
     if not sender_email or "@" not in sender_email:
         return False
     domain = sender_email.rsplit("@", 1)[-1].strip().lower()
     return domain in internal_domains
+
+
+def _is_blocklisted_sender(sender_email: str, blocklist: tuple) -> bool:
+    """Check sender against the configured BLOCKLIST_SENDERS. Each entry
+    is either a full email (matches exact) or a domain like 'example.com'
+    or '@example.com' (matches any sender from that domain)."""
+    if not sender_email or not blocklist:
+        return False
+    se = sender_email.strip().lower()
+    if "@" not in se:
+        return False
+    domain = se.rsplit("@", 1)[-1]
+    for entry in blocklist:
+        e = entry.strip().lower().lstrip("@")
+        if not e:
+            continue
+        if e == se:
+            return True
+        if e == domain:
+            return True
+    return False
+
+
+def _is_business_hours(now_utc: datetime, start_pt: int, end_pt: int) -> bool:
+    """True if the current Pacific Time hour is in [start_pt, end_pt).
+    PDT for most of the year (Mar-Nov); accept 1h drift in winter rather
+    than detecting DST."""
+    pt = now_utc - timedelta(hours=7)
+    return start_pt <= pt.hour < end_pt
 
 
 def run() -> int:
@@ -75,6 +103,7 @@ def run() -> int:
     sheets_client.ensure_templates_seeded(sheets, cfg.sheet_id, cfg.templates_tab)
     sheets_client.ensure_misc_headers(sheets, cfg.sheet_id, cfg.misc_tab)
     sheets_client.ensure_inbox_log_headers(sheets, cfg.sheet_id, cfg.inbox_log_tab)
+    sheets_client.ensure_needs_human_headers(sheets, cfg.sheet_id, cfg.needs_human_tab)
 
     all_filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
     if not all_filters:
@@ -97,6 +126,25 @@ def run() -> int:
     )
     log.info("Loaded %d known candidate email(s) for dup-reply suppression",
              len(known_emails))
+
+    # Loop detection: count messages per sender in the past N hours so we
+    # can flag senders who have hit jobs@ 3+ times in 24h (likely stuck
+    # conversation or spam) -> Needs Human queue.
+    recent_sender_counts = sheets_client.load_recent_inbox_senders(
+        sheets, cfg.sheet_id, cfg.inbox_log_tab,
+        hours_back=cfg.loop_window_hours,
+    )
+    log.info("Loaded loop-detection counts for %d sender(s) in past %dh",
+             len(recent_sender_counts), cfg.loop_window_hours)
+
+    now_utc = datetime.now(timezone.utc)
+    in_business_hours = _is_business_hours(
+        now_utc, cfg.business_hours_start_pt, cfg.business_hours_end_pt,
+    )
+    log.info("Run at %s UTC; business hours %d-%d PT -> in_window=%s",
+             now_utc.isoformat(timespec="seconds"),
+             cfg.business_hours_start_pt, cfg.business_hours_end_pt,
+             in_business_hours)
 
     if cfg.shadow_mode:
         log.info("SHADOW MODE on -- no Gmail labels, no archive, no auto-replies. Drive uploads + Sheet writes still happen.")
@@ -136,6 +184,7 @@ def run() -> int:
                 cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg_id, label_id,
                 outcome_label_ids, seen_thread_ids, known_emails,
+                recent_sender_counts, in_business_hours,
             )
         except Exception as e:
             log.exception("Failed to handle message %s.", msg_id)
@@ -153,7 +202,8 @@ def run() -> int:
 
 def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg_id, label_id,
-                outcome_label_ids, seen_thread_ids, known_emails) -> int:
+                outcome_label_ids, seen_thread_ids, known_emails,
+                recent_sender_counts, in_business_hours) -> int:
     msg = gmail_client.fetch(gmail, cfg.gmail_user, msg_id)
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
@@ -178,25 +228,83 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             },
         )
 
-    # ----- Pre-filter #1: auto-reply / OOO / newsletter short-circuit -----
-    if msg.is_auto_response:
-        log.info("  -> auto-response/bulk headers detected; skipping classifier, archiving as misc")
+    def _archive_as_misc(reasoning: str, log_action: str):
         sheets_client.append_misc(
             sheets, cfg.sheet_id, cfg.misc_tab,
             {
                 "sender": msg.sender,
                 "subject": msg.subject,
                 "filename": "",
-                "reasoning": "Auto-reply / OOO / newsletter headers present; bot never replies to these.",
+                "reasoning": reasoning,
                 "gmail_link": msg.thread_link,
             },
         )
-        _log_inbox("misc", "auto-response headers; archived to Misc, no reply")
+        _log_inbox("misc", log_action)
         if not cfg.shadow_mode:
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+
+    def _flag_needs_human(reason: str, bot_guess: str = "",
+                          confidence: str = "",
+                          mark_done: bool = True):
+        """Route to the Needs Human queue: Gmail label + sheet row +
+        Inbox Log. If mark_done is True, also marks the email as
+        processed so the bot doesn't pick it back up. Set False when
+        we want the next run to retry (e.g. waiting on business hours)."""
+        body_preview = (msg.body_text or "").replace("\n", " ")[:500]
+        sheets_client.append_needs_human(
+            sheets, cfg.sheet_id, cfg.needs_human_tab,
+            {
+                "sender": msg.sender,
+                "subject": msg.subject,
+                "body_preview": body_preview,
+                "has_attachment": msg.has_resume,
+                "reason": reason,
+                "bot_guess": bot_guess,
+                "confidence": confidence,
+                "gmail_link": msg.thread_link,
+            },
+        )
+        _log_inbox("needs_human", f"flagged for human ({reason})")
+        if cfg.shadow_mode:
+            return
+        nh_label = outcome_label_ids.get("needs_human", "")
+        if nh_label:
+            gmail_client.flag_needs_human(
+                gmail, cfg.gmail_user, msg_id,
+                needs_human_label_id=nh_label,
+                processed_label_id=label_id if mark_done else "",
+            )
+        elif mark_done:
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+
+    # ----- Pre-filter #1: blocklisted sender -----
+    if _is_blocklisted_sender(msg.sender_email, cfg.blocklist_senders):
+        log.info("  -> sender on blocklist; archiving as misc")
+        _archive_as_misc(
+            "Sender domain/address on configured blocklist.",
+            "sender on blocklist; archived to Misc, no reply",
+        )
         return 0
 
-    # ----- Pre-filter #2: internal-forward short-circuit -----
+    # ----- Pre-filter #2: calendar invite -----
+    if msg.has_calendar_invite:
+        log.info("  -> calendar invite detected; archiving as misc")
+        _archive_as_misc(
+            "Email is a calendar invite (text/calendar or .ics attachment).",
+            "calendar invite; archived to Misc, no reply",
+        )
+        return 0
+
+    # ----- Pre-filter #3: auto-reply / OOO / newsletter -----
+    if msg.is_auto_response or msg.subject_indicates_ooo:
+        log.info("  -> auto-response or OOO-subject detected; archiving as misc")
+        _archive_as_misc(
+            "Auto-reply / OOO / newsletter headers or subject; bot never replies.",
+            "auto-response detected; archived to Misc, no reply",
+        )
+        return 0
+
+    # ----- Pre-filter #4: internal-forward short-circuit -----
     if _is_internal_sender(msg.sender_email, cfg.internal_domains):
         log.info("  -> internal forward from %s; treating as forwarded resume",
                  msg.sender_email)
@@ -207,7 +315,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                     "sender": msg.sender,
                     "subject": msg.subject,
                     "filename": "",
-                    "reasoning": "Internal sender, no attachment -- no candidate resume to process.",
+                    "reasoning": "Internal sender, no attachment -- nothing to process.",
                     "gmail_link": msg.thread_link,
                 },
             )
@@ -221,14 +329,25 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             active_role_names, paused_role_names, msg, msg_id, label_id,
             outcome_label_ids, known_emails,
             is_internal_forward=True,
+            in_business_hours=in_business_hours,
             log_inbox=_log_inbox,
         )
         return scored
 
-    # ----- Pre-filter #3: thread-history introspection -----
-    # One API call: returns (templates the bot has already sent in this
-    # thread) AND (whether a human HR rep has manually replied). Both
-    # signals gate auto-replies in _can_send below.
+    # ----- Pre-filter #5: loop detection -----
+    sender_lc = (msg.sender_email or "").strip().lower()
+    sender_count = recent_sender_counts.get(sender_lc, 0)
+    if sender_count >= cfg.loop_threshold:
+        log.info("  -> sender %s has %d emails in past %dh (>=%d); flagging needs_human",
+                 sender_lc, sender_count, cfg.loop_window_hours, cfg.loop_threshold)
+        _flag_needs_human(
+            reason=f"loop suspected: {sender_count} emails in past {cfg.loop_window_hours}h",
+            bot_guess="",
+            confidence="",
+        )
+        return 0
+
+    # ----- Pre-filter #6: thread-history introspection -----
     if cfg.shadow_mode:
         thread_history = gmail_client.ThreadHistory(frozenset(), False)
     else:
@@ -243,16 +362,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         log.info("  -> thread already has manual HR reply (HR engaged)")
 
     def _can_send(template_key: str) -> tuple[bool, str]:
-        """Decide whether the bot is allowed to send template_key in this
-        thread. Layered gates, in priority order:
-          1. HR has manually replied in this thread -> never auto-reply
-             (HR is in the conversation, the bot must not talk over them)
-          2. Sender is already on the Candidates dashboard (HR engaged
-             at the candidate level, even if not in this thread)
-          3. A terminal outcome template (denied / paused_match) has
-             already been sent in this thread
-          4. The same template_key has already been sent (no duplicates)
-        Returns (allowed, reason_if_blocked)."""
         if not template_key:
             return False, "no template selected"
         if hr_manual:
@@ -265,43 +374,49 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             return False, f"terminal template already sent in thread: {terminal}"
         if template_key in sent_in_thread:
             return False, f"duplicate {template_key} (already sent in thread)"
+        if cfg.business_hours_only_replies and not in_business_hours:
+            return False, "outside business hours (queued for next biz-hour run)"
         return True, ""
 
-    # ----- Pre-filter #4: classify the email into one of 4 buckets -----
+    # ----- Pre-filter #7: classifier -----
     classifier_body = gmail_client.strip_quoted_text(msg.body_text)
     if classifier_body != msg.body_text:
         log.info("  -> stripped quoted text for classifier (%d -> %d chars)",
                  len(msg.body_text), len(classifier_body))
-    email_type = scorer.classify_inbound_email(
+    cr = scorer.classify_inbound_email(
         api_key=cfg.anthropic_api_key,
         subject=msg.subject,
         body=classifier_body,
         sender_email=msg.sender_email,
         has_attachment=msg.has_resume,
     )
-    log.info("  -> classifier: type=%s has_attachment=%s",
-             email_type, msg.has_resume)
+    log.info("  -> classifier: label=%s confidence=%.2f has_attachment=%s",
+             cr.label, cr.confidence, msg.has_resume)
+
+    # ----- Low-confidence -> Needs Human -----
+    if cr.confidence < cfg.classifier_confidence_threshold:
+        log.info("  -> confidence %.2f < threshold %.2f; flagging needs_human",
+                 cr.confidence, cfg.classifier_confidence_threshold)
+        _flag_needs_human(
+            reason=f"low confidence ({cr.confidence:.2f} < {cfg.classifier_confidence_threshold})",
+            bot_guess=cr.label,
+            confidence=f"{cr.confidence:.2f}",
+        )
+        return 0
+
+    email_type = cr.label
 
     # ----- Misc branch -----
     if email_type == "misc":
         log.info("  -> misc (not candidate-related); logging to %s and skipping",
                  cfg.misc_tab)
-        sheets_client.append_misc(
-            sheets, cfg.sheet_id, cfg.misc_tab,
-            {
-                "sender": msg.sender,
-                "subject": msg.subject,
-                "filename": "",
-                "reasoning": "Classifier flagged as non-candidate (newsletter/alert/internal/spam).",
-                "gmail_link": msg.thread_link,
-            },
+        _archive_as_misc(
+            "Classifier flagged as non-candidate (newsletter/alert/internal/spam).",
+            "archived to Misc, no reply",
         )
-        _log_inbox("misc", "archived to Misc, no reply")
-        if not cfg.shadow_mode:
-            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
 
-    # ----- No-attachment branches: question or application_no_resume -----
+    # ----- No-attachment branches -----
     if not msg.has_resume:
         if email_type == "question":
             template_key = "question"
@@ -321,6 +436,11 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if not allowed:
             log.info("  -> %s suppressed: %s", template_key, block_reason)
             _log_inbox(log_type, f"suppressed ({block_reason})")
+            # Business-hours queueing: don't mark processed so the next
+            # biz-hour run picks the email back up and tries again.
+            if "outside business hours" in block_reason:
+                log.info("  -> leaving unprocessed for retry next biz-hour run")
+                return 0
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
             return 0
 
@@ -337,12 +457,13 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
 
-    # ----- Resume branch: has attachment, proceed to scoring -----
+    # ----- Resume branch -----
     return _process_resume_attachments(
         cfg, gmail, drive, sheets, all_filters, templates,
         active_role_names, paused_role_names, msg, msg_id, label_id,
         outcome_label_ids, known_emails,
         is_internal_forward=False,
+        in_business_hours=in_business_hours,
         log_inbox=_log_inbox,
         sent_in_thread=sent_in_thread,
         can_send=_can_send,
@@ -354,18 +475,17 @@ def _process_resume_attachments(
     active_role_names, paused_role_names, msg, msg_id, label_id,
     outcome_label_ids, known_emails, *,
     is_internal_forward: bool,
+    in_business_hours: bool,
     log_inbox,
     sent_in_thread: set = None,
     can_send=None,
 ) -> int:
-    """Shared resume-handling path. Internal forwards bypass auto-reply
-    and route to the Internal Drive folder; regular applicants go through
-    normal scoring + reply flow guarded by can_send()."""
     if sent_in_thread is None:
         sent_in_thread = set()
 
     scored = 0
     last_bucket = None
+    reply_queued_for_biz_hours = False
     inbox_type = "resume_internal_forward" if is_internal_forward else "resume"
 
     for att in msg.attachments:
@@ -454,10 +574,8 @@ def _process_resume_attachments(
 
         last_bucket = _better_bucket(last_bucket, bucket)
 
-        if is_internal_forward and cfg.folder_internal:
-            folder_id = cfg.folder_internal
-        else:
-            folder_id = outcome_folder_id
+        folder_id = (cfg.folder_internal if (is_internal_forward and cfg.folder_internal)
+                     else outcome_folder_id)
 
         applied_for = result.get("applied_for_role", "unspecified") or "unspecified"
         top_active = active_matches[0]["role"] if active_matches else ""
@@ -536,6 +654,8 @@ def _process_resume_attachments(
                          bucket, result["confidence"], template_key, block_reason)
                 log_inbox(inbox_type,
                           f"scored - {bucket}; reply suppressed ({block_reason})")
+                if "outside business hours" in block_reason:
+                    reply_queued_for_biz_hours = True
             else:
                 applicant_name = result["candidate_name"] or msg.sender_name or "there"
                 primary_role = (paused_matches[0]["role"] if paused_matches
@@ -568,6 +688,15 @@ def _process_resume_attachments(
     final_bucket = last_bucket or "unreadable"
     if cfg.shadow_mode:
         log.info("  -> email outcome=%s, shadow mode (no Gmail label changes)", final_bucket)
+        return scored
+
+    # Business-hours queueing: if we had a reply we couldn't send because
+    # it's off-hours, DON'T mark processed -- leave the email in the
+    # inbox so the next biz-hour run picks it back up. Drive upload and
+    # Sheets row already happened, so the work isn't lost.
+    if reply_queued_for_biz_hours:
+        log.info("  -> outcome=%s, leaving unprocessed for biz-hour reply retry",
+                 final_bucket)
         return scored
 
     outcome_id = outcome_label_ids.get(final_bucket)
