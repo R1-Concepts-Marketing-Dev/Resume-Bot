@@ -120,49 +120,116 @@ Concurrent-role exception: before counting roles for the job-hopping cap, check 
 """
 
 
-def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
-    """For an email that has no resume attached, decide if the sender is
-    (a) APPLYING (likely forgot to attach the resume) or
-    (b) asking a QUESTION (about pay / hours / open positions / process).
+INBOUND_TYPES = ("resume", "application_no_resume", "question", "misc")
 
-    Returns 'application' or 'question'. Defaults to 'question' on any
-    error -- the question reply is more generic and safer to send."""
-    if not (subject or body):
+
+def classify_inbound_email(*, api_key: str, subject: str, body: str,
+                           sender_email: str, has_attachment: bool) -> str:
+    """Classify an inbound jobs@ email into one of four categories so
+    main.py can route it without paying for a full resume scoring call
+    on emails that clearly aren't candidate applications.
+
+    Returns one of:
+      'resume'                 -- candidate is applying, resume attached
+                                  (also used when an attachment IS clearly
+                                  a resume even if the body doesn't say
+                                  much about it)
+      'application_no_resume'  -- candidate is applying but forgot to attach
+                                  the file (or pasted it inline)
+      'question'               -- person is asking about hours, pay, the
+                                  process, etc. Not submitting work history.
+      'misc'                   -- newsletter, internal company communication,
+                                  vendor/sales pitch, automated notification,
+                                  security alert, spam. Not candidate-related
+                                  in any way.
+
+    Defaults to 'question' on any error -- the question reply is the most
+    generic safe response."""
+    if not (subject or body or has_attachment):
         return "question"
+
     user_msg = (
+        f"From: {sender_email or '(unknown)'}\n"
+        f"Has attachment: {'yes' if has_attachment else 'no'}\n"
         f"Subject: {subject or '(none)'}\n\n"
         f"Body:\n{(body or '(empty)')[:1500]}"
     )
     system = (
-        "You classify a single email's intent. Reply with exactly one word: "
-        "APPLICATION or QUESTION.\n\n"
-        "APPLICATION = the sender is applying for a job at this company. "
-        "Signals: mentions 'applying for', 'interested in the position', "
-        "'please find my resume attached', names a specific role, attaches "
-        "a cover letter, etc. Likely forgot to attach the resume.\n\n"
-        "QUESTION = the sender is asking about open positions, pay, "
-        "scheduling, application process, hours, benefits, or anything "
-        "else needing a human response. They are NOT submitting an "
-        "application.\n\n"
-        "If genuinely ambiguous, reply QUESTION."
+        "You triage a single inbound email to a jobs@ HR mailbox. "
+        "Reply with exactly ONE word from this set:\n"
+        "  RESUME, APPLICATION_NO_RESUME, QUESTION, MISC\n\n"
+        "RESUME = the sender is a job applicant AND there is an attachment "
+        "that's almost certainly their resume. Signals: a person's name in "
+        "the subject, 'please find my resume', 'application for X', a "
+        "PDF/DOC attachment with a plausible name. Use this WHENEVER the "
+        "email has an attachment AND the body indicates they're applying.\n\n"
+        "APPLICATION_NO_RESUME = the sender is applying for a job but "
+        "didn't attach a file. Signals: 'I want to apply for X', 'I'm "
+        "interested in the position', their work history pasted into the "
+        "body, etc. No attachment -- they almost certainly forgot it.\n\n"
+        "QUESTION = the sender is asking the HR team something. Signals: "
+        "'is the X position still open?', 'what's the pay range?', 'when "
+        "do you interview?', 'can I drop my resume off in person?'. They "
+        "want a human reply, not an application form.\n\n"
+        "MISC = NOT candidate-related at all. Signals: newsletter, "
+        "marketing/sales pitch from a vendor, recruiter/staffing agency "
+        "outreach, internal company communication (e.g. forwarded from "
+        "another employee), automated notification (Google security alert, "
+        "Drive share, calendar invite), bounced-message report, payroll "
+        "service emails. The sender is not a candidate.\n\n"
+        "If an email is genuinely ambiguous between RESUME and "
+        "APPLICATION_NO_RESUME, use the attachment signal -- attachment "
+        "present = RESUME, no attachment = APPLICATION_NO_RESUME.\n\n"
+        "If an email is genuinely ambiguous between QUESTION and MISC, "
+        "prefer QUESTION (safer to reply to a real person than to ignore "
+        "them).\n\n"
+        "Reply with ONLY the one-word label. No punctuation, no prose."
     )
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        # Use Haiku for this tiny classification call -- cheap and fast.
         resp = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=10,
+            max_tokens=20,
             system=system,
             messages=[{"role": "user", "content": user_msg}],
         )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        text = text.strip().upper()
-        if "APPLICATION" in text and "QUESTION" not in text:
-            return "application"
+        text = "".join(b.text for b in resp.content
+                       if getattr(b, "type", "") == "text")
+        text = text.strip().upper().rstrip(".,;:")
+        mapping = {
+            "RESUME": "resume",
+            "APPLICATION_NO_RESUME": "application_no_resume",
+            "QUESTION": "question",
+            "MISC": "misc",
+        }
+        if text in mapping:
+            return mapping[text]
+        # Tolerate slight variants
+        for k, v in mapping.items():
+            if k in text:
+                return v
+        log.warning("Classifier returned unexpected label %r; defaulting", text)
         return "question"
     except Exception as e:
-        log.warning("Intent classifier failed, defaulting to question: %s", e)
+        log.warning("Email classifier failed, defaulting to question: %s", e)
         return "question"
+
+
+# Backward-compat wrapper -- still exposed for any callers that haven't
+# migrated to the new 4-way classifier yet.
+def classify_no_resume_intent(*, api_key: str, subject: str, body: str) -> str:
+    """Legacy 2-way classifier. Prefer classify_inbound_email."""
+    result = classify_inbound_email(
+        api_key=api_key, subject=subject, body=body,
+        sender_email="", has_attachment=False,
+    )
+    if result == "application_no_resume":
+        return "application"
+    if result == "question":
+        return "question"
+    # If the new classifier returned 'resume' or 'misc' for a no-attachment
+    # email, fall back to the safest reply.
+    return "question"
 
 
 def _build_filter_block(filters: list) -> str:
@@ -218,6 +285,104 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
 
 
 def _fallback(reason: str) -> dict[str, Any]:
+    return {
+        "best_fit_roles": [],
+        "overall_decision": "needs_review",
+        "years_relevant_experience": 0,
+        "job_hopping_flag": "neutral",
+        "reasoning": reason,
+        "confidence": 0.0,
+        "candidate_name": "",
+        "candidate_email": "",
+        "candidate_phone": "",
+        "applied_for_role": "unspecified",
+    }
+
+
+def _coerce_level(raw: Any) -> str:
+    """Map any incoming value to one of the FIT_LEVELS, defaulting to no_fit."""
+    if isinstance(raw, str):
+        s = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        if s in _LEVEL_RANK:
+            return s
+        # Backwards-compatible: if the model emits a numeric string, bridge it.
+        try:
+            n = int(float(s))
+            return _score_to_level(n)
+        except ValueError:
+            return "no_fit"
+    if isinstance(raw, (int, float)):
+        return _score_to_level(int(raw))
+    return "no_fit"
+
+
+def _score_to_level(n: int) -> str:
+    """Legacy bridge: map an old 0-100 score to a fit_level bucket."""
+    if n >= 90:
+        return "excellent"
+    if n >= 70:
+        return "strong"
+    if n >= 50:
+        return "borderline"
+    if n >= 30:
+        return "weak"
+    return "no_fit"
+
+
+def _normalize(r: dict[str, Any]) -> dict[str, Any]:
+    decision = r.get("overall_decision")
+    if decision not in {"qualified", "not_qualified", "needs_review", "not_a_resume"}:
+        r["overall_decision"] = "needs_review"
+
+    # not_a_resume short-circuits everything. No role scoring, no trump rule.
+    if r["overall_decision"] == "not_a_resume":
+        r["best_fit_roles"] = []
+        r["applied_for_role"] = "unspecified"
+        r["years_relevant_experience"] = 0
+        return r
+
+    cleaned = []
+    for item in r.get("best_fit_roles") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        if not role:
+            continue
+        # Accept either fit_level (new) or fit_score (legacy) from the model.
+        if "fit_level" in item:
+            level = _coerce_level(item.get("fit_level"))
+        else:
+            level = _coerce_level(item.get("fit_score"))
+        # Drop roles the model flagged as no_fit -- they shouldn't be on the list.
+        if level == "no_fit":
+            continue
+        cleaned.append({
+            "role": role,
+            "fit_level": level,
+            "reasoning": str(item.get("reasoning", "")).strip(),
+        })
+    cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
+    r["best_fit_roles"] = cleaned
+
+    # Applied-for trump rule: derive overall_decision from the candidate's
+    # fit on the role they actually applied to, when present. Otherwise
+    # fall back to the model's own decision.
+    applied_for = str(r.get("applied_for_role", "") or "").strip()
+    if applied_for and applied_for.lower() != "unspecified":
+        applied_level = "no_fit"
+        for item in cleaned:
+            if item["role"].strip().lower() == applied_for.lower():
+                applied_level = item["fit_level"]
+                break
+        if applied_level in QUALIFIED_LEVELS:
+            r["overall_decision"] = "qualified"
+        elif applied_level == "borderline":
+            r["overall_decision"] = "needs_review"
+        else:
+            r["overall_decision"] = "not_qualified"
+
+    return r
+n: str) -> dict[str, Any]:
     return {
         "best_fit_roles": [],
         "overall_decision": "needs_review",
