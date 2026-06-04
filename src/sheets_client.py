@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
 
@@ -39,13 +39,19 @@ MISC_HEADERS = [
 ]
 
 
-# Master audit log of every email the bot processed. One row per email,
-# regardless of outcome. Resumes also get a row on Candidates; misc emails
-# also get a row on Archive - Misc. Inbox Log is the single source of truth
-# for "what emails did the bot see this week" reporting.
 INBOX_LOG_HEADERS = [
     "Timestamp", "Sender", "Subject", "Type", "Action Taken",
     "Has Attachment", "Gmail Thread Link",
+]
+
+
+# Queue for emails the bot routed to human review (low classifier
+# confidence, loop detection, etc.). HR works this queue manually --
+# bot does NOT auto-reply or archive these messages.
+NEEDS_HUMAN_HEADERS = [
+    "Timestamp", "Sender", "Subject", "Body Preview", "Has Attachment",
+    "Why Flagged", "Bot Best Guess", "Confidence",
+    "Gmail Thread Link", "Reviewed",
 ]
 
 
@@ -126,8 +132,6 @@ def _is_truthy(v) -> bool:
 
 
 def _safe(v) -> str:
-    """Escape values that Sheets USER_ENTERED would parse as formulas/operators.
-    Phone numbers starting with + are the most common culprit."""
     if v is None:
         return ""
     s = str(v)
@@ -216,12 +220,35 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
     ).execute()
 
 
-def ensure_misc_headers(svc, sheet_id, tab):
-    """Idempotently write headers to the Archive - Misc tab.
+def _ensure_tab_exists(svc, sheet_id, tab) -> bool:
+    """Create the tab if it's missing. Returns True if the tab exists (or
+    was just created), False if creation failed."""
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties.title",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load sheet metadata: %s", e)
+        return False
+    existing = [s["properties"]["title"]
+                for s in meta.get("sheets", []) if s.get("properties")]
+    if tab in existing:
+        return True
+    try:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+        ).execute()
+        return True
+    except Exception as e:
+        log.warning("Could not create tab %r: %s", tab, e)
+        return False
 
-    Tolerates the tab not existing yet -- a missing tab raises a Sheets API
-    400, which we swallow because the Apps Script side is expected to have
-    created the tab. The next run will succeed once it's there."""
+
+def ensure_misc_headers(svc, sheet_id, tab):
+    """Idempotently write headers to the Archive - Misc tab. Tolerates a
+    missing tab -- swallows the API error so the run doesn't crash."""
     rng = f"{tab}!A1:F1"
     try:
         resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
@@ -240,9 +267,6 @@ def ensure_misc_headers(svc, sheet_id, tab):
 
 
 def ensure_inbox_log_headers(svc, sheet_id, tab):
-    """Idempotently write headers to the Inbox Log tab. Tolerates the tab
-    not existing yet -- the Apps Script side is expected to have created
-    it. Swallows missing-tab errors so the run doesn't crash."""
     rng = f"{tab}!A1:G1"
     try:
         resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
@@ -260,14 +284,30 @@ def ensure_inbox_log_headers(svc, sheet_id, tab):
         log.warning("Could not write %s headers: %s", tab, e)
 
 
-def append_inbox_log(svc, sheet_id, tab, row):
-    """Append a row to the Inbox Log -- the master audit trail.
+def ensure_needs_human_headers(svc, sheet_id, tab):
+    """Create the Needs Human queue tab if missing, then write headers if
+    blank. This tab is auto-created (unlike Misc/Inbox Log which rely on
+    Apps Script) so the bot can ship the feature without a sheet edit."""
+    if not _ensure_tab_exists(svc, sheet_id, tab):
+        return
+    rng = f"{tab}!A1:J1"
+    try:
+        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+    except Exception as e:
+        log.warning("Could not read %s headers: %s", tab, e)
+        return
+    if resp.get("values"):
+        return
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
+            body={"values": [NEEDS_HUMAN_HEADERS]},
+        ).execute()
+    except Exception as e:
+        log.warning("Could not write %s headers: %s", tab, e)
 
-    Every email the bot processes gets ONE row here, with Type being one
-    of: resume, application_no_resume, question, misc, unreadable.
-    Action Taken is a short string describing what the bot did
-    (e.g. 'scored - qualified', 'replied with question template',
-    'archived to Misc')."""
+
+def append_inbox_log(svc, sheet_id, tab, row):
     try:
         values = [
             row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -290,9 +330,6 @@ def append_inbox_log(svc, sheet_id, tab, row):
 
 
 def append_misc(svc, sheet_id, tab, row):
-    """Append a row to the Archive - Misc tab for emails the bot decided
-    were not candidate resumes (newsletters, alerts, internal comms, etc.).
-    Swallows its own exceptions so a missing tab doesn't break the run."""
     try:
         values = [
             row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -313,15 +350,36 @@ def append_misc(svc, sheet_id, tab, row):
         log.warning("Failed to log to %s tab: %s", tab, e)
 
 
-def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
-    """Read column C (Email) from the Candidates tab and return the set of
-    emails already on the dashboard, lower-cased and stripped. Used by
-    main.py to suppress auto-replies to candidates HR is already engaged
-    with -- if they're in the dashboard, HR owns the conversation.
+def append_needs_human(svc, sheet_id, tab, row):
+    """Append a row to the Needs Human queue. Swallows its own
+    exceptions so a missing tab can't break the run."""
+    try:
+        values = [
+            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            _safe(row.get("sender", "")),
+            _safe(row.get("subject", "")),
+            _safe(row.get("body_preview", "")),
+            "yes" if row.get("has_attachment") else "no",
+            _safe(row.get("reason", "")),
+            _safe(row.get("bot_guess", "")),
+            _safe(row.get("confidence", "")),
+            _hyperlink(row.get("gmail_link", "")),
+            "",  # Reviewed -- HR fills in
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:J",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to log to %s tab: %s", tab, e)
 
-    Tolerant: if the read fails (tab missing, permissions, etc.) returns an
-    empty set. Empty-set behavior is the safe default -- the bot will
-    auto-reply as it did before."""
+
+def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
+    """Set of emails already on the Candidates dashboard. Used to suppress
+    auto-replies to candidates HR is already engaged with."""
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -335,7 +393,6 @@ def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
         if not row:
             continue
         val = str(row[0]).strip().lower()
-        # Strip the leading apostrophe added by _safe() for formula-escape.
         if val.startswith("'"):
             val = val[1:]
         if val and "@" in val:
@@ -343,13 +400,50 @@ def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
     return out
 
 
-def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
-    """Read column O (Gmail Thread Link) from the dashboard and return the
-    set of Gmail thread IDs we've already logged.
+def load_recent_inbox_senders(svc, sheet_id, tab,
+                               hours_back: int = 24) -> dict:
+    """Count messages per sender in the Inbox Log within the past N hours.
+    Used by main.py to detect loops (same sender 3+ times in 24h ->
+    escalate to Needs Human queue).
 
-    Uses valueRenderOption=FORMULA so HYPERLINK formula text is returned
-    (instead of the displayed label "Link"). The thread ID is embedded
-    in the URL inside the formula."""
+    Returns dict of {lower-cased sender email: count}. Tolerant: returns
+    empty dict if the tab can't be read."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A2:B",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load Inbox Log for loop detection: %s", e)
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    counts: dict[str, int] = {}
+    for r in resp.get("values", []):
+        if len(r) < 2:
+            continue
+        ts_str, sender_raw = r[0], r[1]
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts < cutoff:
+            continue
+        sender = str(sender_raw).strip().lower()
+        if sender.startswith("'"):
+            sender = sender[1:]
+        # Extract just the email address from "Name <email@domain>".
+        import re
+        m = re.search(r"[\w.+-]+@[\w.-]+", sender)
+        if m:
+            sender = m.group(0)
+        if sender:
+            counts[sender] = counts.get(sender, 0) + 1
+    return counts
+
+
+def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
     import re
     try:
         resp = svc.spreadsheets().values().get(
@@ -371,7 +465,6 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
 
 
 def append_error(svc, sheet_id, tab, row):
-    """Append a row to the Bot Errors tab. Swallows its own exceptions."""
     try:
         values = [
             row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
