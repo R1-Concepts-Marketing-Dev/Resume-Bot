@@ -120,10 +120,16 @@ def _pick_candidate_email(scorer_email: str, fallback_sender: str) -> str:
 
 
 def _is_business_hours(now_utc: datetime, start_pt: int, end_pt: int) -> bool:
-    """True if the current Pacific Time hour is in [start_pt, end_pt).
-    PDT for most of the year (Mar-Nov); accept 1h drift in winter rather
-    than detecting DST."""
+    """True if current Pacific Time is Mon-Fri AND inside [start_pt, end_pt).
+
+    Saturdays and Sundays always return False, so weekend emails get
+    queued by the same outside-biz-hours logic as off-hours emails and
+    pick up on Monday morning. PDT for most of the year (Mar-Nov);
+    accept 1h drift in winter rather than detecting DST."""
     pt = now_utc - timedelta(hours=7)
+    # weekday(): Monday=0 ... Sunday=6. Skip Sat (5) and Sun (6).
+    if pt.weekday() >= 5:
+        return False
     return start_pt <= pt.hour < end_pt
 
 
@@ -189,7 +195,7 @@ def run() -> int:
     in_business_hours = _is_business_hours(
         now_utc, cfg.business_hours_start_pt, cfg.business_hours_end_pt,
     )
-    log.info("Run at %s UTC; business hours %d-%d PT -> in_window=%s",
+    log.info("Run at %s UTC; business hours Mon-Fri %d-%d PT -> in_window=%s",
              now_utc.isoformat(timespec="seconds"),
              cfg.business_hours_start_pt, cfg.business_hours_end_pt,
              in_business_hours)
