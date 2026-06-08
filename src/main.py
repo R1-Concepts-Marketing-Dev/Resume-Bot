@@ -639,6 +639,7 @@ def _process_resume_attachments(
                 "reasoning": result["reasoning"],
                 "drive_link": drive_link,
                 "gmail_link": msg.thread_link,
+                "recruiter_agency": result.get("recruiter_agency", "N/A"),
             },
         )
 
@@ -699,56 +700,4 @@ def _process_resume_attachments(
                  final_bucket)
         return scored
 
-    outcome_id = outcome_label_ids.get(final_bucket)
-    if outcome_id:
-        gmail_client.archive_with_outcome(
-            gmail, cfg.gmail_user, msg_id,
-            processed_label_id=label_id,
-            outcome_label_id=outcome_id,
-        )
-    else:
-        gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
-        log.warning("  -> no outcome label found for bucket=%r; email left in inbox",
-                    final_bucket)
-    log.info("  -> email outcome=%s, archived", final_bucket)
-    return scored
-
-
-_BUCKET_PRIORITY = ("qualified", "pending_paused", "needs_review",
-                    "not_qualified", "unreadable", "not_a_resume")
-
-
-def _better_bucket(current, new):
-    if current is None:
-        return new
-    if new is None:
-        return current
-    return min(current, new, key=lambda b: _BUCKET_PRIORITY.index(b)
-               if b in _BUCKET_PRIORITY else len(_BUCKET_PRIORITY))
-
-
-def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
-    vars_ = {"company_name": cfg.company_name, **vars_extra}
-    subject, body = sheets_client.render_template(template, vars_)
-    msg_full = gmail.users().messages().get(
-        userId=cfg.gmail_user, id=msg.id, format="metadata",
-        metadataHeaders=["Message-ID"],
-    ).execute()
-    in_reply_to = ""
-    for h in msg_full.get("payload", {}).get("headers", []):
-        if h["name"].lower() == "message-id":
-            in_reply_to = h["value"]
-            break
-    gmail_client.send_reply(
-        gmail, cfg.gmail_user,
-        to=msg.sender_email,
-        subject=subject,
-        body=body,
-        thread_id=msg.thread_id,
-        in_reply_to_msg_id=in_reply_to,
-        template_key=template.key,
-    )
-
-
-if __name__ == "__main__":
-    sys.exit(run())
+    outcome_id
