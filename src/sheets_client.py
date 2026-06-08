@@ -30,6 +30,7 @@ DASHBOARD_HEADERS = [
     "Applied For", "Cross-Fit Match", "Cross-Fit Flag", "Decision",
     "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
     "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
+    "Recruiter/Agency",
 ]
 
 
@@ -210,14 +211,59 @@ def render_template(tmpl, vars):
 
 
 def ensure_dashboard_headers(svc, sheet_id, tab):
-    rng = f"{tab}!A1:Q1"
-    resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
-    if resp.get("values"):
+    """Ensure the Candidates dashboard has the full header row.
+
+    On first run: writes all headers into A1:R1. On subsequent runs:
+    checks whether the existing header row already covers every column we
+    know about (DASHBOARD_HEADERS) and, if it's short, extends just the
+    missing trailing cells. This means adding a new column (e.g.
+    Recruiter/Agency) to an existing sheet is a no-op header refresh --
+    existing data rows stay put, the new column appears at the end."""
+    rng = f"{tab}!1:1"
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=rng,
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read %s headers: %s", tab, e)
         return
-    svc.spreadsheets().values().update(
-        spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
-        body={"values": [DASHBOARD_HEADERS]},
-    ).execute()
+    existing = (resp.get("values") or [[]])[0]
+    if not existing:
+        # Empty sheet -- write the full header row.
+        end_col = _col_letter(len(DASHBOARD_HEADERS))
+        write_rng = f"{tab}!A1:{end_col}1"
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=write_rng, valueInputOption="RAW",
+            body={"values": [DASHBOARD_HEADERS]},
+        ).execute()
+        return
+    if len(existing) >= len(DASHBOARD_HEADERS):
+        # Already at or beyond expected width -- nothing to do.
+        return
+    # Existing sheet but missing trailing columns (likely a fresh deploy
+    # that added new columns). Extend just the missing tail.
+    start_col = _col_letter(len(existing) + 1)
+    end_col = _col_letter(len(DASHBOARD_HEADERS))
+    write_rng = f"{tab}!{start_col}1:{end_col}1"
+    new_cells = DASHBOARD_HEADERS[len(existing):]
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=write_rng, valueInputOption="RAW",
+            body={"values": [new_cells]},
+        ).execute()
+        log.info("Extended %s headers with new columns: %s", tab, new_cells)
+    except Exception as e:
+        log.warning("Could not extend %s headers: %s", tab, e)
+
+
+def _col_letter(n: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA. We only need single-letter range for
+    the foreseeable future but handle two-letter just in case."""
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
 
 
 def _ensure_tab_exists(svc, sheet_id, tab) -> bool:
@@ -488,6 +534,13 @@ def append_error(svc, sheet_id, tab, row):
 
 
 def append_candidate(svc, sheet_id, tab, row):
+    """Append a candidate row to the Candidates dashboard.
+
+    Recruiter/Agency column (column R): if row['recruiter_agency'] is
+    missing or empty, defaults to "N/A". When the scorer detects the
+    email came from a third-party recruiter on the candidate's behalf,
+    it populates this field with the agency or recruiter name."""
+    recruiter_agency = (row.get("recruiter_agency") or "N/A").strip() or "N/A"
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         _safe(row.get("candidate_name", "")),
@@ -504,11 +557,13 @@ def append_candidate(svc, sheet_id, tab, row):
         _safe(row.get("reasoning", "")),
         _hyperlink(row.get("drive_link", "")),
         _hyperlink(row.get("gmail_link", "")),
-        "", "",
+        "",  # HR Status (HR fills in)
+        "",  # HR Notes (HR fills in)
+        _safe(recruiter_agency),
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A:Q",
+        range=f"{tab}!A:R",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
