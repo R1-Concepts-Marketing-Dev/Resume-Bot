@@ -152,5 +152,5 @@ def load() -> Config:
             "BUSINESS_HOURS_ONLY_REPLIES", True,
         ),
         business_hours_start_pt=_optional_int("BUSINESS_HOURS_START_PT", 8),
-        business_hours_end_pt=_optional_int("BUSINESS_HOURS_END_PT", 19),
+        business_hours_end_pt=_optional_int("BUSINESS_HOURS_END_PT", 17),
     )
