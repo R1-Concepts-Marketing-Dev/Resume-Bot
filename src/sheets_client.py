@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -49,11 +50,26 @@ INBOX_LOG_HEADERS = [
 # Queue for emails the bot routed to human review (low classifier
 # confidence, loop detection, etc.). HR works this queue manually --
 # bot does NOT auto-reply or archive these messages.
+# NEW SCHEMA (2026-06): added Status + Reason Type, dropped Has Attachment.
+# Migration script (scripts/migrate_needs_human.py) rewrites existing rows
+# into this shape and dedupes by thread_id.
 NEEDS_HUMAN_HEADERS = [
-    "Timestamp", "Sender", "Subject", "Body Preview", "Has Attachment",
-    "Why Flagged", "Bot Best Guess", "Confidence",
-    "Gmail Thread Link", "Reviewed",
+    "Timestamp",     # A - human-readable PT timestamp e.g. "2026-06-04 15:56 PT"
+    "Status",        # B - dropdown: Open / Investigating / Resolved / Ignored
+    "Reason Type",   # C - dropdown: loop / low_confidence / indeed_fetch / manual
+    "Why Flagged",   # D - full reason text
+    "Sender",        # E
+    "Subject",       # F
+    "Body Preview",  # G - quoted text stripped, capped at 150 chars
+    "Bot Guess",     # H - classifier label or empty
+    "Confidence",    # I - 0.0-1.0 or empty
+    "Gmail Thread",  # J - HYPERLINK
 ]
+
+# Status dropdown options. "Open" is the default for new flags.
+NEEDS_HUMAN_STATUSES = ["Open", "Investigating", "Resolved", "Ignored"]
+NEEDS_HUMAN_REASON_TYPES = ["loop", "low_confidence", "indeed_fetch", "manual"]
+NEEDS_HUMAN_OPEN_STATUSES = {"Open", "Investigating", ""}
 
 
 SEED_TEMPLATES: list[Template] = [
@@ -330,27 +346,243 @@ def ensure_inbox_log_headers(svc, sheet_id, tab):
         log.warning("Could not write %s headers: %s", tab, e)
 
 
+def _get_sheet_id_for_tab(svc, spreadsheet_id, tab_name) -> int | None:
+    """Return the integer sheetId (NOT the spreadsheet id) for a tab name.
+    Needed for batchUpdate formatting requests which work on sheetId."""
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load sheet metadata for tab lookup: %s", e)
+        return None
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        if props.get("title") == tab_name:
+            return props.get("sheetId")
+    return None
+
+
 def ensure_needs_human_headers(svc, sheet_id, tab):
-    """Create the Needs Human queue tab if missing, then write headers if
-    blank. This tab is auto-created (unlike Misc/Inbox Log which rely on
-    Apps Script) so the bot can ship the feature without a sheet edit."""
+    """Idempotently set up the Needs Human queue tab: create if missing,
+    write headers, apply formatting (column widths, freeze row 1, Status
+    dropdown, conditional formatting).
+
+    Safe to call on every run -- only writes headers if blank, and the
+    formatting batchUpdate is naturally idempotent (replaces dimension
+    properties, refreshes validation, etc.)."""
     if not _ensure_tab_exists(svc, sheet_id, tab):
         return
+    # 1. Headers
     rng = f"{tab}!A1:J1"
     try:
         resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
     except Exception as e:
         log.warning("Could not read %s headers: %s", tab, e)
         return
-    if resp.get("values"):
+    existing_headers = (resp.get("values") or [[]])[0]
+    if not existing_headers:
+        try:
+            svc.spreadsheets().values().update(
+                spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
+                body={"values": [NEEDS_HUMAN_HEADERS]},
+            ).execute()
+        except Exception as e:
+            log.warning("Could not write %s headers: %s", tab, e)
+            return
+    elif existing_headers != NEEDS_HUMAN_HEADERS:
+        # Old schema detected. Leave it alone -- the migration script handles
+        # this case. Log a hint so the operator knows what's up.
+        log.info(
+            "%s headers don't match new schema -- run scripts/migrate_needs_human.py "
+            "before relying on dedup. Existing headers: %s",
+            tab, existing_headers,
+        )
+        # Don't apply formatting either; the migration script will set it up
+        # cleanly after rewriting the data.
         return
-    try:
-        svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
-            body={"values": [NEEDS_HUMAN_HEADERS]},
-        ).execute()
-    except Exception as e:
-        log.warning("Could not write %s headers: %s", tab, e)
+
+    # 2. Formatting (only if headers were written or already correct)
+    inner_id = _get_sheet_id_for_tab(svc, sheet_id, tab)
+    if inner_id is None:
+        return
+    requests = _build_needs_human_format_requests(inner_id)
+    if requests:
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id, body={"requests": requests},
+            ).execute()
+        except Exception as e:
+            log.warning("Could not apply %s formatting: %s", tab, e)
+
+
+# Pixel widths for each Needs Human column. Tuned so the most-important
+# columns (Reason Type, Why Flagged, Sender, Subject) are readable at a
+# glance and the auxiliary columns (Bot Guess, Confidence) stay narrow.
+_NEEDS_HUMAN_COL_WIDTHS = {
+    0: 140,   # A Timestamp
+    1: 120,   # B Status
+    2: 110,   # C Reason Type
+    3: 280,   # D Why Flagged
+    4: 220,   # E Sender
+    5: 200,   # F Subject
+    6: 360,   # G Body Preview
+    7: 160,   # H Bot Guess
+    8: 90,    # I Confidence
+    9: 80,    # J Gmail Thread
+}
+
+
+def _build_needs_human_format_requests(inner_id: int) -> list:
+    """Build the batchUpdate requests that style the Needs Human tab.
+    Run on every ensure_* call so re-running heals any drift."""
+    requests = []
+
+    # Freeze row 1 (headers)
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": inner_id,
+                "gridProperties": {"frozenRowCount": 1},
+            },
+            "fields": "gridProperties.frozenRowCount",
+        }
+    })
+
+    # Bold + background for header row
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": inner_id,
+                "startRowIndex": 0, "endRowIndex": 1,
+                "startColumnIndex": 0, "endColumnIndex": len(NEEDS_HUMAN_HEADERS),
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.93, "green": 0.93, "blue": 0.93},
+                    "textFormat": {"bold": True},
+                    "verticalAlignment": "MIDDLE",
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+        }
+    })
+
+    # Column widths
+    for col_index, width in _NEEDS_HUMAN_COL_WIDTHS.items():
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": inner_id, "dimension": "COLUMNS",
+                    "startIndex": col_index, "endIndex": col_index + 1,
+                },
+                "properties": {"pixelSize": width},
+                "fields": "pixelSize",
+            }
+        })
+
+    # Wrap text in Why Flagged + Body Preview columns
+    for col_index in (3, 6):  # D Why Flagged, G Body Preview
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": inner_id,
+                    "startRowIndex": 1,
+                    "startColumnIndex": col_index, "endColumnIndex": col_index + 1,
+                },
+                "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
+                "fields": "userEnteredFormat.wrapStrategy",
+            }
+        })
+
+    # Status column (B) -- dropdown validation
+    requests.append({
+        "setDataValidation": {
+            "range": {
+                "sheetId": inner_id,
+                "startRowIndex": 1,
+                "startColumnIndex": 1, "endColumnIndex": 2,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": s} for s in NEEDS_HUMAN_STATUSES],
+                },
+                "showCustomUi": True,
+                "strict": False,
+            },
+        }
+    })
+
+    # Reason Type column (C) -- dropdown validation
+    requests.append({
+        "setDataValidation": {
+            "range": {
+                "sheetId": inner_id,
+                "startRowIndex": 1,
+                "startColumnIndex": 2, "endColumnIndex": 3,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": v} for v in NEEDS_HUMAN_REASON_TYPES],
+                },
+                "showCustomUi": True,
+                "strict": False,
+            },
+        }
+    })
+
+    # Conditional formatting: Resolved rows -> light grey, italic
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": inner_id,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": len(NEEDS_HUMAN_HEADERS),
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": "CUSTOM_FORMULA",
+                        "values": [{"userEnteredValue": "=$B2=\"Resolved\""}],
+                    },
+                    "format": {
+                        "backgroundColor": {"red": 0.93, "green": 0.93, "blue": 0.93},
+                        "textFormat": {"italic": True, "foregroundColor": {"red": 0.5, "green": 0.5, "blue": 0.5}},
+                    },
+                },
+            },
+            "index": 0,
+        }
+    })
+
+    # Conditional formatting: Ignored -> very faint grey
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": inner_id,
+                    "startRowIndex": 1,
+                    "startColumnIndex": 0, "endColumnIndex": len(NEEDS_HUMAN_HEADERS),
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": "CUSTOM_FORMULA",
+                        "values": [{"userEnteredValue": "=$B2=\"Ignored\""}],
+                    },
+                    "format": {
+                        "backgroundColor": {"red": 0.97, "green": 0.97, "blue": 0.97},
+                        "textFormat": {"foregroundColor": {"red": 0.6, "green": 0.6, "blue": 0.6}},
+                    },
+                },
+            },
+            "index": 0,
+        }
+    })
+
+    return requests
 
 
 def append_inbox_log(svc, sheet_id, tab, row):
@@ -396,21 +628,111 @@ def append_misc(svc, sheet_id, tab, row):
         log.warning("Failed to log to %s tab: %s", tab, e)
 
 
-def append_needs_human(svc, sheet_id, tab, row):
-    """Append a row to the Needs Human queue. Swallows its own
-    exceptions so a missing tab can't break the run."""
+def _format_pt_timestamp(iso_or_dt=None) -> str:
+    """Format a UTC ISO string or datetime as 'YYYY-MM-DD HH:MM PT'.
+    Accepts None (uses current time). PT here is UTC-7 with ~1h winter
+    drift (PST), which is fine for human-readable display."""
+    if iso_or_dt is None:
+        dt = datetime.now(timezone.utc)
+    elif isinstance(iso_or_dt, str):
+        try:
+            dt = datetime.fromisoformat(iso_or_dt.replace("Z", "+00:00"))
+        except ValueError:
+            return iso_or_dt  # give up gracefully
+    else:
+        dt = iso_or_dt
+    pt = dt - timedelta(hours=7)
+    return pt.strftime("%Y-%m-%d %H:%M PT")
+
+
+# Body previews are stored on the queue purely for at-a-glance triage --
+# the full message is one click away via the Gmail Thread link.
+_BODY_PREVIEW_MAX_CHARS = 150
+
+
+def _clean_body_preview(body: str) -> str:
+    """Strip quoted reply chains, collapse whitespace, cap length."""
+    if not body:
+        return ""
     try:
+        # Reuse the bot's existing quote-stripper if available
+        from . import gmail_client
+        cleaned = gmail_client.strip_quoted_text(body)
+    except Exception:
+        cleaned = body
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > _BODY_PREVIEW_MAX_CHARS:
+        cleaned = cleaned[:_BODY_PREVIEW_MAX_CHARS - 1].rstrip() + "\u2026"
+    return cleaned
+
+
+# Match Gmail thread URLs in HYPERLINK formulas:
+#   =HYPERLINK("https://mail.google.com/mail/u/0/#inbox/<id>", "Link")
+_THREAD_ID_PATTERN = re.compile(r"#inbox/([A-Za-z0-9_-]+)")
+
+
+def _thread_id_from_link(cell_value: str) -> str | None:
+    """Extract the Gmail thread_id from a HYPERLINK formula cell."""
+    if not cell_value:
+        return None
+    m = _THREAD_ID_PATTERN.search(str(cell_value))
+    return m.group(1) if m else None
+
+
+def load_open_needs_human_threads(svc, sheet_id, tab) -> set[str]:
+    """Return Gmail thread_ids currently sitting in the Needs Human queue
+    with an open-ish status (Open / Investigating / blank). Used by
+    main.py to suppress duplicate flag-attempts so a stuck conversation
+    doesn't accumulate 30 identical rows."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!B2:J",
+            valueRenderOption="FORMULA",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load open Needs Human threads: %s", e)
+        return set()
+    rows = resp.get("values", []) or []
+    threads: set[str] = set()
+    for row in rows:
+        # row indexes are relative to B2:J -- so col B = row[0] (Status),
+        # col J = row[8] (Gmail Thread). Some rows may be short if
+        # trailing columns are blank.
+        status = (row[0] if len(row) > 0 else "").strip()
+        if status and status not in NEEDS_HUMAN_OPEN_STATUSES:
+            continue
+        link_cell = row[8] if len(row) > 8 else ""
+        tid = _thread_id_from_link(link_cell)
+        if tid:
+            threads.add(tid)
+    return threads
+
+
+def append_needs_human(svc, sheet_id, tab, row):
+    """Append a row to the Needs Human queue using the new schema:
+    Timestamp | Status | Reason Type | Why Flagged | Sender | Subject |
+    Body Preview | Bot Guess | Confidence | Gmail Thread.
+
+    Caller is expected to have already checked dedup via
+    load_open_needs_human_threads(). Swallows its own exceptions so a
+    missing tab can't break the run."""
+    try:
+        reason_type = (row.get("reason_type") or "manual").strip().lower()
+        if reason_type not in NEEDS_HUMAN_REASON_TYPES:
+            reason_type = "manual"
+        timestamp = row.get("timestamp")
         values = [
-            row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            _format_pt_timestamp(timestamp),
+            "Open",  # default status -- HR can change via dropdown
+            reason_type,
+            _safe(row.get("reason", "")),
             _safe(row.get("sender", "")),
             _safe(row.get("subject", "")),
-            _safe(row.get("body_preview", "")),
-            "yes" if row.get("has_attachment") else "no",
-            _safe(row.get("reason", "")),
+            _safe(_clean_body_preview(row.get("body_preview", ""))),
             _safe(row.get("bot_guess", "")),
             _safe(row.get("confidence", "")),
             _hyperlink(row.get("gmail_link", "")),
-            "",  # Reviewed -- HR fills in
         ]
         svc.spreadsheets().values().append(
             spreadsheetId=sheet_id,
