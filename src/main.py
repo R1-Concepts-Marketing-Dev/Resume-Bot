@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import yaml
 
-from . import config, drive_client, gmail_client, google_auth, resume_parser, scorer, sheets_client
+from . import config, drive_client, gmail_client, google_auth, indeed_fetcher, resume_parser, scorer, sheets_client
 
 
 logging.basicConfig(
@@ -78,6 +78,45 @@ def _is_blocklisted_sender(sender_email: str, blocklist: tuple) -> bool:
         if e == domain:
             return True
     return False
+
+
+# Job-board forwarders use opaque email aliases (e.g. apply+abc123@indeed.com)
+# that aren't the candidate's real email -- replies are relayed through the
+# board. We can still REPLY to these aliases (Indeed/etc. forward back to the
+# candidate), but we must NOT write them into the Candidates dashboard Email
+# column, where HR would expect a real reply-to address.
+_JOB_BOARD_DOMAINS = (
+    "indeed.com",
+    "indeedemail.com",
+    "ziprecruiter.com",
+    "glassdoor.com",
+    "monster.com",
+    "careerbuilder.com",
+    "snagajob.com",
+)
+
+
+def _is_job_board_alias(email: str) -> bool:
+    if not email or "@" not in email:
+        return False
+    domain = email.strip().lower().rsplit("@", 1)[-1]
+    return any(domain == d or domain.endswith("." + d) for d in _JOB_BOARD_DOMAINS)
+
+
+def _pick_candidate_email(scorer_email: str, fallback_sender: str) -> str:
+    """Return the best candidate email for the Candidates dashboard.
+
+    Priority: scorer-extracted email (from the resume / body) if it's not
+    itself a job-board alias. Otherwise the fallback (typically the From:
+    header) IF that sender isn't a job-board alias. Otherwise empty --
+    we'd rather show no email than write an Indeed alias HR can't use."""
+    se = (scorer_email or "").strip()
+    if se and not _is_job_board_alias(se):
+        return se
+    fb = (fallback_sender or "").strip()
+    if fb and not _is_job_board_alias(fb):
+        return fb
+    return ""
 
 
 def _is_business_hours(now_utc: datetime, start_pt: int, end_pt: int) -> bool:
@@ -416,8 +455,56 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
+    # ----- Indeed Quick Apply: try to fetch resume from public link -----
+    # When a candidate applies via Indeed without uploading a PDF themselves,
+    # Indeed forwards an email containing only a "View resume" link. We follow
+    # that link's tokenized id to Indeed's public download endpoint, fetch the
+    # PDF, and drop it into msg.attachments so the resume branch picks it up
+    # like any other applicant attachment. Fall-through on any failure -- we
+    # route to Needs Human below instead of sending the misleading no_resume
+    # template that would tell the candidate to re-attach a resume they
+    # already submitted on Indeed.
+    indeed_fetch_attempted = False
+    indeed_fetch_failed = False
+    if not msg.has_resume and _is_job_board_alias(msg.sender_email):
+        view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
+        if view_url:
+            indeed_fetch_attempted = True
+            log.info("  -> Indeed Quick Apply detected; attempting to fetch resume from Indeed link")
+            pdf_bytes = indeed_fetcher.fetch_resume_pdf(view_url)
+            if pdf_bytes:
+                log.info("  -> Indeed fetch succeeded (%d bytes); promoting to resume branch", len(pdf_bytes))
+                msg.attachments.append(gmail_client.Attachment(
+                    filename="indeed_quick_apply_resume.pdf",
+                    mime_type="application/pdf",
+                    data=pdf_bytes,
+                ))
+            else:
+                indeed_fetch_failed = True
+                log.warning("  -> Indeed fetch failed; will route to Needs Human")
+        else:
+            # Job-board sender with no recognizable View resume link --
+            # either Indeed changed the email format or this isn't a
+            # candidate application at all. Route to human review.
+            indeed_fetch_failed = True
+            log.info("  -> Job-board sender with no resume link; will route to Needs Human")
+
     # ----- No-attachment branches -----
     if not msg.has_resume:
+        if indeed_fetch_failed:
+            reason = (
+                "Indeed Quick Apply: auto-fetch from Indeed link failed"
+                if indeed_fetch_attempted
+                else "Indeed-style sender but no resume link in email"
+            )
+            log.info("  -> %s; flagging needs_human", reason)
+            _flag_needs_human(
+                reason=reason,
+                bot_guess=email_type,
+                confidence=f"{cr.confidence:.2f}",
+            )
+            return 0
+
         if email_type == "question":
             template_key = "question"
             log_type = "question"
@@ -626,7 +713,7 @@ def _process_resume_attachments(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
             {
                 "candidate_name": result["candidate_name"],
-                "email": result["candidate_email"] or msg.sender_email,
+                "email": _pick_candidate_email(result["candidate_email"], msg.sender_email),
                 "phone": result["candidate_phone"],
                 "filename": att.filename,
                 "applied_for": applied_for,
