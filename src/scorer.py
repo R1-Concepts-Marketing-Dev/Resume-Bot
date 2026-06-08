@@ -84,7 +84,8 @@ Respond with this exact JSON schema:
   "candidate_name": "<best guess or empty string>",
   "candidate_email": "<best guess or empty string>",
   "candidate_phone": "<best guess or empty string>",
-  "applied_for_role": "<exact role name the applicant explicitly applied for, OR 'unspecified'>"
+  "applied_for_role": "<exact role name the applicant explicitly applied for, OR 'unspecified'>",
+  "recruiter_agency": "<recruiter or staffing agency name if the email was sent by a third-party recruiter representing this candidate, OR 'N/A' if the candidate is applying directly>"
 }}
 
 Include EVERY role in best_fit_roles where the candidate is at least "weak" -- i.e. they were considered for the role even if they fall short. Omit only roles where they are clearly "no_fit". Sort by fit_level descending (excellent > strong > borderline > weak).
@@ -107,6 +108,8 @@ Not-a-resume rule: BEFORE applying any of the rules below, look at what the docu
 Email-context rule: if the applicant's email subject or body explicitly mentions a specific role, prioritize that role in your assessment. If they don't specify, evaluate against every open role.
 
 applied_for_role rule: read the email subject and body. If the applicant explicitly names a role they're applying for (e.g. "applying for Cherry Picker", "interested in the forklift driver position"), match it to the closest role name from the list above and return that EXACT name. If they just say "any position", "warehouse work", or don't mention a role at all, return "unspecified".
+
+recruiter_agency rule: read the email (not the resume). If the email was clearly sent by a third-party recruiter or staffing agency on behalf of the candidate (the sender is NOT the candidate themselves -- they write things like "I have a candidate for you", "attached is the resume of [name] who I am representing", "our staffing firm is submitting", or have a recruiter/agency signature like "ABC Staffing"), return the agency name as best you can extract it from the signature, body, or sender domain (e.g. "ABC Staffing", "TalentBridge Recruiting", "Robert Half"). If you can identify the recruiter as a person but not the agency, return their name and title (e.g. "Sarah Chen, Independent Recruiter"). If the candidate is applying directly themselves (first-person language, no agency framing), return "N/A". Do NOT classify a candidate writing their own application as recruiter outreach just because they mention past recruiter work.
 
 Verifiability rule: a fit_level of "strong" or "excellent" requires the resume to provide at least one verifiable employer name AND a date range (e.g. "2022-2024 at ABC Logistics" or "Mar 2023 - Present, FastWarehouse Inc"). If experience claims have no employer name or no dates, cap fit_level at "borderline" for every role and set overall_decision to "needs_review", regardless of how plausible the claims sound. Vague resumes that just list years of experience without specifics are not enough.
 
@@ -161,6 +164,12 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         "no code fences):\n"
         "  {\"label\": \"RESUME|APPLICATION_NO_RESUME|QUESTION|MISC\", "
         "\"confidence\": <number 0.0-1.0>}\n\n"
+        "LANGUAGE\n"
+        "--------\n"
+        "The email may be written in any language. Apply the same rules and "
+        "the same labels regardless of language. The bot's replies are always "
+        "sent in English; your job is only to classify intent, not to match "
+        "language.\n\n"
         "CATEGORY DEFINITIONS\n"
         "--------------------\n"
         "RESUME = the sender is a job applicant AND has_attachment is yes. "
@@ -186,19 +195,25 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         "requires an actual question being asked.\n\n"
         "MISC = NOT candidate-related at all. Signals:\n"
         "  - Newsletter, marketing/sales pitch from a vendor\n"
-        "  - Recruiter/staffing agency outreach\n"
         "  - Automated notifications (no-reply@ addresses, platform mail)\n"
         "  - Internal company communications forwarded from a coworker\n"
         "  - Bounced-message reports, payroll service emails\n"
         "  - Body is almost entirely a copy of a job posting (sender is "
         "advertising the job, not applying to it)\n\n"
+        "RECRUITER NOTE -- third-party recruiters and staffing agencies "
+        "who attach a candidate's resume on their behalf are NOT misc. "
+        "They count as RESUME (when an attachment is present) or "
+        "APPLICATION_NO_RESUME (when there is no attachment). The bot "
+        "still scores the candidate normally; the agency relationship "
+        "is recorded separately in the scoring step, not here.\n\n"
         "DECISION ORDER -- check in order:\n"
         "1. no-reply / platform-domain sender -> MISC.\n"
         "2. Body reads as a copy of a job posting with no self-intro -> MISC.\n"
-        "3. has_attachment is yes AND the email indicates an application "
-        "-> RESUME.\n"
-        "4. Application intent (any APPLICATION_NO_RESUME signal) "
-        "-> APPLICATION_NO_RESUME.\n"
+        "3. has_attachment is yes AND the email is about a candidate "
+        "(self-intro OR recruiter pitching a candidate) -> RESUME.\n"
+        "4. Application intent without an attachment (any "
+        "APPLICATION_NO_RESUME signal, including recruiter outreach "
+        "without a resume) -> APPLICATION_NO_RESUME.\n"
         "5. Specific question being asked, not applying -> QUESTION.\n"
         "6. Otherwise default to QUESTION.\n\n"
         "CONFIDENCE GUIDE\n"
@@ -231,6 +246,18 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         "Example 7: subject 'Cherry Picker', attachment no, body 'Hi! "
         "I'm excited about this. I saw your post on Craigslist.' -> "
         "{\"label\":\"APPLICATION_NO_RESUME\",\"confidence\":0.85}\n\n"
+        "Example 8: subject 'Strong candidate for your Forklift role', "
+        "attachment yes (resume.pdf), body 'Hello, I'm a recruiter at XYZ "
+        "Staffing. I have a candidate, John Smith, who would be a great fit "
+        "for your warehouse opening. His resume is attached for your "
+        "review.' -> {\"label\":\"RESUME\",\"confidence\":0.95}\n\n"
+        "Example 9 (Spanish): subject 'Solicitud para Cherry Picker', "
+        "attachment yes (curriculum.pdf), body 'Hola, adjunto mi curriculum "
+        "para la posicion de Cherry Picker. Tengo 5 anos de experiencia. "
+        "Gracias.' -> {\"label\":\"RESUME\",\"confidence\":0.95}\n\n"
+        "Example 10 (Spanish, no attachment): subject 'Buen dia', "
+        "attachment no, body 'Hola, estoy interesado en una posicion en su "
+        "empresa.' -> {\"label\":\"APPLICATION_NO_RESUME\",\"confidence\":0.85}\n\n"
         "Return ONLY the JSON object. No prose."
     )
     try:
@@ -343,6 +370,7 @@ def _fallback(reason: str) -> dict[str, Any]:
         "candidate_email": "",
         "candidate_phone": "",
         "applied_for_role": "unspecified",
+        "recruiter_agency": "N/A",
     }
 
 
@@ -373,50 +401,84 @@ def _score_to_level(n: int) -> str:
     return "no_fit"
 
 
+_VALID_DECISIONS = {"qualified", "not_qualified", "needs_review", "not_a_resume"}
+_VALID_HOPPING = {"positive", "caution", "neutral"}
+
+
 def _normalize(r: dict[str, Any]) -> dict[str, Any]:
+    """Coerce the model's response into the shape main.py expects.
+
+    Defensive: missing/wrong fields fall back to safe defaults rather
+    than raising, so a bad response still produces a needs_review row
+    instead of crashing the run."""
+    out: dict[str, Any] = {}
+
+    # overall_decision
     decision = r.get("overall_decision")
-    if decision not in {"qualified", "not_qualified", "needs_review", "not_a_resume"}:
-        r["overall_decision"] = "needs_review"
+    if decision not in _VALID_DECISIONS:
+        decision = "needs_review"
+    out["overall_decision"] = decision
 
-    if r["overall_decision"] == "not_a_resume":
-        r["best_fit_roles"] = []
-        r["applied_for_role"] = "unspecified"
-        r["years_relevant_experience"] = 0
-        return r
-
-    cleaned = []
-    for item in r.get("best_fit_roles") or []:
-        if not isinstance(item, dict):
+    # best_fit_roles - list of {role, fit_level, reasoning}
+    raw_roles = r.get("best_fit_roles") or []
+    if not isinstance(raw_roles, list):
+        raw_roles = []
+    norm_roles = []
+    for entry in raw_roles:
+        if not isinstance(entry, dict):
             continue
-        role = str(item.get("role", "")).strip()
-        if not role:
+        role_name = str(entry.get("role", "") or "").strip()
+        if not role_name:
             continue
-        if "fit_level" in item:
-            level = _coerce_level(item.get("fit_level"))
-        else:
-            level = _coerce_level(item.get("fit_score"))
-        if level == "no_fit":
+        fit = _coerce_level(entry.get("fit_level"))
+        if fit == "no_fit":
+            # Per spec: omit no_fit roles from best_fit_roles
             continue
-        cleaned.append({
-            "role": role,
-            "fit_level": level,
-            "reasoning": str(item.get("reasoning", "")).strip(),
+        norm_roles.append({
+            "role": role_name,
+            "fit_level": fit,
+            "reasoning": str(entry.get("reasoning", "") or "").strip(),
         })
-    cleaned.sort(key=lambda x: _LEVEL_RANK[x["fit_level"]], reverse=True)
-    r["best_fit_roles"] = cleaned
+    # Sort by fit level descending (excellent > strong > borderline > weak)
+    norm_roles.sort(key=lambda x: _LEVEL_RANK.get(x["fit_level"], 0), reverse=True)
+    out["best_fit_roles"] = norm_roles
 
-    applied_for = str(r.get("applied_for_role", "") or "").strip()
-    if applied_for and applied_for.lower() != "unspecified":
-        applied_level = "no_fit"
-        for item in cleaned:
-            if item["role"].strip().lower() == applied_for.lower():
-                applied_level = item["fit_level"]
-                break
-        if applied_level in QUALIFIED_LEVELS:
-            r["overall_decision"] = "qualified"
-        elif applied_level == "borderline":
-            r["overall_decision"] = "needs_review"
-        else:
-            r["overall_decision"] = "not_qualified"
+    # years_relevant_experience
+    yre = r.get("years_relevant_experience", 0)
+    try:
+        out["years_relevant_experience"] = int(float(yre))
+    except (TypeError, ValueError):
+        out["years_relevant_experience"] = 0
 
-    return r
+    # job_hopping_flag
+    hop = str(r.get("job_hopping_flag", "neutral") or "neutral").strip().lower()
+    out["job_hopping_flag"] = hop if hop in _VALID_HOPPING else "neutral"
+
+    # reasoning
+    out["reasoning"] = str(r.get("reasoning", "") or "").strip()
+
+    # confidence (0.0 - 1.0)
+    try:
+        c = float(r.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        c = 0.0
+    out["confidence"] = max(0.0, min(1.0, c))
+
+    # candidate identity fields
+    out["candidate_name"] = str(r.get("candidate_name", "") or "").strip()
+    out["candidate_email"] = str(r.get("candidate_email", "") or "").strip()
+    out["candidate_phone"] = str(r.get("candidate_phone", "") or "").strip()
+
+    # applied_for_role
+    applied = str(r.get("applied_for_role", "unspecified") or "unspecified").strip()
+    if not applied:
+        applied = "unspecified"
+    out["applied_for_role"] = applied
+
+    # recruiter_agency: "N/A" or extracted agency / recruiter name
+    agency = str(r.get("recruiter_agency", "N/A") or "N/A").strip()
+    if not agency or agency.lower() in {"n/a", "na", "none", "null", "unknown"}:
+        agency = "N/A"
+    out["recruiter_agency"] = agency
+
+    return out
