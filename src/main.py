@@ -166,6 +166,15 @@ def run() -> int:
     log.info("Loaded %d known candidate email(s) for dup-reply suppression",
              len(known_emails))
 
+    # Threads already in the Needs Human queue (status Open/Investigating).
+    # Used to dedupe: a stuck conversation that loop-detection keeps
+    # flagging shouldn't add a fresh row every 10 minutes.
+    open_needs_human = sheets_client.load_open_needs_human_threads(
+        sheets, cfg.sheet_id, cfg.needs_human_tab,
+    )
+    log.info("Loaded %d open Needs Human thread(s) for dedup",
+             len(open_needs_human))
+
     # Loop detection: count messages per sender in the past N hours so we
     # can flag senders who have hit jobs@ 3+ times in 24h (likely stuck
     # conversation or spam) -> Needs Human queue.
@@ -224,6 +233,7 @@ def run() -> int:
                 active_role_names, paused_role_names, msg_id, label_id,
                 outcome_label_ids, seen_thread_ids, known_emails,
                 recent_sender_counts, in_business_hours,
+                open_needs_human_threads=open_needs_human,
             )
         except Exception as e:
             log.exception("Failed to handle message %s.", msg_id)
@@ -242,7 +252,8 @@ def run() -> int:
 def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg_id, label_id,
                 outcome_label_ids, seen_thread_ids, known_emails,
-                recent_sender_counts, in_business_hours) -> int:
+                recent_sender_counts, in_business_hours,
+                *, open_needs_human_threads: set | None = None) -> int:
     msg = gmail_client.fetch(gmail, cfg.gmail_user, msg_id)
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
@@ -282,28 +293,41 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if not cfg.shadow_mode:
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
 
-    def _flag_needs_human(reason: str, bot_guess: str = "",
-                          confidence: str = "",
+    def _flag_needs_human(reason: str, reason_type: str = "manual",
+                          bot_guess: str = "", confidence: str = "",
                           mark_done: bool = True):
         """Route to the Needs Human queue: Gmail label + sheet row +
         Inbox Log. If mark_done is True, also marks the email as
         processed so the bot doesn't pick it back up. Set False when
-        we want the next run to retry (e.g. waiting on business hours)."""
-        body_preview = (msg.body_text or "").replace("\n", " ")[:500]
-        sheets_client.append_needs_human(
-            sheets, cfg.sheet_id, cfg.needs_human_tab,
-            {
-                "sender": msg.sender,
-                "subject": msg.subject,
-                "body_preview": body_preview,
-                "has_attachment": msg.has_resume,
-                "reason": reason,
-                "bot_guess": bot_guess,
-                "confidence": confidence,
-                "gmail_link": msg.thread_link,
-            },
-        )
-        _log_inbox("needs_human", f"flagged for human ({reason})")
+        we want the next run to retry (e.g. waiting on business hours).
+
+        Dedup: if this msg's thread_id is already in the open Needs
+        Human queue (status Open/Investigating), we skip the new sheet
+        row and just log the duplicate to Inbox Log. The Gmail label
+        is still applied so the email stays visible to HR."""
+        if open_needs_human_threads and msg.thread_id in open_needs_human_threads:
+            log.info("  -> thread %s already in Needs Human queue; skipping duplicate row",
+                     msg.thread_id)
+            _log_inbox("needs_human", f"duplicate suppressed ({reason})")
+        else:
+            body_preview = (msg.body_text or "").replace("\n", " ")[:1500]
+            sheets_client.append_needs_human(
+                sheets, cfg.sheet_id, cfg.needs_human_tab,
+                {
+                    "sender": msg.sender,
+                    "subject": msg.subject,
+                    "body_preview": body_preview,
+                    "reason": reason,
+                    "reason_type": reason_type,
+                    "bot_guess": bot_guess,
+                    "confidence": confidence,
+                    "gmail_link": msg.thread_link,
+                },
+            )
+            _log_inbox("needs_human", f"flagged for human ({reason})")
+            if open_needs_human_threads is not None:
+                open_needs_human_threads.add(msg.thread_id)
+
         if cfg.shadow_mode:
             return
         nh_label = outcome_label_ids.get("needs_human", "")
@@ -381,6 +405,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                  sender_lc, sender_count, cfg.loop_window_hours, cfg.loop_threshold)
         _flag_needs_human(
             reason=f"loop suspected: {sender_count} emails in past {cfg.loop_window_hours}h",
+            reason_type="loop",
             bot_guess="",
             confidence="",
         )
@@ -438,6 +463,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                  cr.confidence, cfg.classifier_confidence_threshold)
         _flag_needs_human(
             reason=f"low confidence ({cr.confidence:.2f} < {cfg.classifier_confidence_threshold})",
+            reason_type="low_confidence",
             bot_guess=cr.label,
             confidence=f"{cr.confidence:.2f}",
         )
@@ -500,6 +526,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             log.info("  -> %s; flagging needs_human", reason)
             _flag_needs_human(
                 reason=reason,
+                reason_type="indeed_fetch",
                 bot_guess=email_type,
                 confidence=f"{cr.confidence:.2f}",
             )
