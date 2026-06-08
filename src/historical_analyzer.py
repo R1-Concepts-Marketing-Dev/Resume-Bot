@@ -72,17 +72,58 @@ one of these categories:
   APPLICATION_NO_RESUME   -- a candidate is applying but forgot the attachment
   QUESTION                -- someone is asking HR a question (pay, hours,
                              process) and wants a human reply
-  MISC                    -- newsletter, recruiter outreach, automated
-                             notification, internal forward, spam -- NOT
-                             a candidate at all
-  UNCLEAR                 -- genuinely ambiguous after seeing HR's behavior
+  MISC                    -- newsletter, automated notification, internal
+                             forward, sales pitch, vendor outreach, bounce
+                             report -- NOT a candidate at all
+  UNCLEAR                 -- genuinely ambiguous after seeing both the
+                             content and HR behavior
 
-You see (a) the original inbound email and (b) what HR did in response. \
-Use HR's behavior as ground truth: if HR replied substantively to a resume \
-attachment, it WAS a resume; if HR asked for the file, it WAS \
-application_no_resume; if HR answered a question with information, it WAS \
-a question; if HR archived without replying, it was probably misc (or a \
-question HR chose not to answer).
+You see (a) the original inbound email and (b) what HR did in response.
+
+GROUND TRUTH PRIORITY -- weigh these in order:
+
+1. CONTENT IS PRIMARY. Look at what the email actually IS before looking
+   at HR behavior. An attachment + a named role + first-person application
+   language ("I'm interested", "please consider me", "see my resume") +
+   real-looking sender domain is decisive evidence of RESUME or
+   APPLICATION_NO_RESUME -- regardless of whether HR replied.
+
+2. HR'S ACTIVE BEHAVIOR is a strong confirming signal:
+   - HR replied substantively about the candidate -> matches RESUME /
+     APPLICATION_NO_RESUME (whichever the email looked like).
+   - HR explicitly asked the sender to attach a file -> APPLICATION_NO_RESUME.
+   - HR answered a process question with information -> QUESTION.
+   - HR forwarded to a different team or explicitly marked as not-relevant
+     -> MISC.
+
+3. HR'S NON-RESPONSE is WEAK evidence and must NOT override clear content.
+   HR teams have backlogs, lose emails, and routinely skip applications
+   that look suspicious to them -- security-scanner-wrapped URLs like
+   avanan.click, Craigslist referrals, low-effort bodies, foreign-language
+   senders. None of that makes the email "misc"; it just means HR didn't
+   get to it. Specifically:
+
+   - Email has an attachment + role + first-person application language +
+     real-looking sender -> RESUME, even with no HR reply. Add the signal
+     "HR did not respond to apparent candidate" so we know HR may have
+     overlooked them. Do NOT label as misc just because HR ignored it.
+
+   - Email has no attachment but clear application intent (named role +
+     self-introduction) -> APPLICATION_NO_RESUME, even with no HR reply.
+
+   - Only classify as MISC when the CONTENT is unambiguously not a
+     candidate: newsletters, no-reply / automated senders, internal
+     forwards with no application framing, vendor sales pitches, bounce
+     reports, calendar invites.
+
+   - When content is genuinely ambiguous AND HR did not reply, return
+     UNCLEAR. Never default to MISC just because HR was silent.
+
+NOTE ON THIRD-PARTY RECRUITERS: an email from a staffing agency or
+external recruiter on behalf of a candidate counts as RESUME (if a
+resume is attached) or APPLICATION_NO_RESUME (if not). The bot scores
+the candidate normally and separately tracks the recruiter relationship.
+Do NOT label recruiter-forwarded candidate emails as MISC.
 
 Return JSON ONLY (no prose, no code fences). Exact schema:
 
@@ -94,11 +135,12 @@ Return JSON ONLY (no prose, no code fences). Exact schema:
   "notes": "<1-2 sentences explaining the case>"
 }
 
-useful_example=true ONLY when the case is a non-obvious edge case the \
-classifier would benefit from seeing as a few-shot example (recruiter \
-pretending to be applicant, vague short subject, link instead of \
-attachment, internal forward dressed as application, etc.). Routine \
-applications with a clear resume attachment should be false."""
+useful_example=true ONLY when the case is a non-obvious edge case the
+classifier would benefit from seeing as a few-shot example (recruiter
+pretending to be applicant, vague short subject, link instead of
+attachment, internal forward dressed as application, application HR
+overlooked, etc.). Routine applications with a clear resume attachment
+should be false."""
 
 
 # --------------------------- Gmail helpers ---------------------------------
