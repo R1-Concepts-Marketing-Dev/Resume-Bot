@@ -75,7 +75,7 @@ jobs:
           # picks it back up. Times are PT (with ~1h drift in winter).
           BUSINESS_HOURS_ONLY_REPLIES: ${{ vars.BUSINESS_HOURS_ONLY_REPLIES || 'true' }}
           BUSINESS_HOURS_START_PT: ${{ vars.BUSINESS_HOURS_START_PT || '8' }}
-          BUSINESS_HOURS_END_PT: ${{ vars.BUSINESS_HOURS_END_PT || '19' }}
+          BUSINESS_HOURS_END_PT: ${{ vars.BUSINESS_HOURS_END_PT || '17' }}
           # SHADOW_MODE: beta-testing flag.
           #   true  = observe only -- read + score + log to Sheet. No Gmail
           #           label changes, no archiving, no auto-replies, no Drive
