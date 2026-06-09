@@ -27,14 +27,17 @@ TERMINAL_TEMPLATE_KEYS = frozenset({"denied", "paused_match"})
 
 ALL_TEMPLATE_KEYS = frozenset({"no_resume", "question", "denied", "paused_match"})
 
+# Only headers that genuinely indicate an automated REPLY (RFC 3834-ish).
+# Removed list-unsubscribe / list-id / precedence:bulk -- those are also
+# set by legitimate transactional mailers like Indeed and Greenhouse, which
+# we MUST process as real candidate applications. Keep precedence:junk
+# (spam-ish) but drop bulk/list (used by every job board's notifications).
 _AUTO_REPLY_HEADER_SIGNALS = {
-    "auto-submitted":   ("auto-replied", "auto-generated", "auto-notified"),
-    "x-autoreply":      None,
-    "x-autorespond":    None,
-    "x-autoresponder":  None,
-    "precedence":       ("auto_reply", "bulk", "list", "junk"),
-    "list-unsubscribe": None,
-    "list-id":          None,
+    "auto-submitted":  ("auto-replied", "auto-generated", "auto-notified"),
+    "x-autoreply":     None,
+    "x-autorespond":   None,
+    "x-autoresponder": None,
+    "precedence":      ("auto_reply", "junk"),
 }
 
 # Subject-line OOO heuristic. Used as belt-and-suspenders alongside
