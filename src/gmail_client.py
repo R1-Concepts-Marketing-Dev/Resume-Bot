@@ -90,6 +90,7 @@ OUTCOME_LABELS = {
     "unreadable":      "Resume Bot/Unreadable",
     "not_a_resume":    "Resume Bot/Not A Resume",
     "needs_human":     "Resume Bot/Needs Human",
+    "closed":          "Resume Bot/Closed",
 }
 
 
