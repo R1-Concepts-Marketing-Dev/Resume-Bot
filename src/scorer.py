@@ -111,6 +111,8 @@ applied_for_role rule: read the email subject and body. If the applicant explici
 
 recruiter_agency rule: read the email (not the resume). If the email was clearly sent by a third-party recruiter or staffing agency on behalf of the candidate (the sender is NOT the candidate themselves -- they write things like "I have a candidate for you", "attached is the resume of [name] who I am representing", "our staffing firm is submitting", or have a recruiter/agency signature like "ABC Staffing"), return the agency name as best you can extract it from the signature, body, or sender domain (e.g. "ABC Staffing", "TalentBridge Recruiting", "Robert Half"). If you can identify the recruiter as a person but not the agency, return their name and title (e.g. "Sarah Chen, Independent Recruiter"). If the candidate is applying directly themselves (first-person language, no agency framing), return "N/A". Do NOT classify a candidate writing their own application as recruiter outreach just because they mention past recruiter work.
 
+candidate_email rule: extract the candidate's REAL email address. Look in this order: (1) the resume body itself, (2) the email body's structured contact fields (job boards like Indeed include a "Contact information" or "Email:" section), (3) the From: header. WARNING about job-board aliases: when an application is forwarded through Indeed, ZipRecruiter, or a similar job board, the From: header is an opaque alias like apply+abc123@indeed.com -- this is NOT the candidate's real email and should NEVER be returned here. If the email is clearly forwarded by a job board (sender domain is indeed.com, indeedemail.com, ziprecruiter.com, glassdoor.com, monster.com, careerbuilder.com, etc.) and you cannot find a real email in the resume or the body, return an empty string rather than the alias. Same rule for candidate_phone -- never return the job board's relay number.
+
 Verifiability rule: a fit_level of "strong" or "excellent" requires the resume to provide at least one verifiable employer name AND a date range (e.g. "2022-2024 at ABC Logistics" or "Mar 2023 - Present, FastWarehouse Inc"). If experience claims have no employer name or no dates, cap fit_level at "borderline" for every role and set overall_decision to "needs_review", regardless of how plausible the claims sound. Vague resumes that just list years of experience without specifics are not enough.
 
 Applied-for trump rule: if applied_for_role is NOT "unspecified", the overall_decision MUST be driven by the fit_level for THAT specific role:
@@ -136,6 +138,115 @@ _LABEL_NORMALIZE = {
     "QUESTION":              "question",
     "MISC":                  "misc",
 }
+
+
+@dataclass(frozen=True)
+class ClosureResult:
+    """Output of classify_conversation_closure: whether a candidate's reply
+    signals the conversation has ended. Used to silently archive replies
+    like 'thanks for letting me know' after a terminal template was sent,
+    so the bot stops engaging with closed threads."""
+    decision: str       # "closed" | "ongoing" | "unclear"
+    confidence: float   # 0.0 - 1.0
+    reasoning: str      # one short sentence
+
+
+_CLOSURE_MODEL = "claude-haiku-4-5-20251001"
+
+
+def classify_conversation_closure(*, api_key: str,
+                                  bot_templates_sent: list[str],
+                                  candidate_message_body: str,
+                                  subject: str) -> ClosureResult:
+    """Ask Claude whether the candidate's reply ends the conversation.
+
+    Should only be called when the thread has prior bot activity (the
+    bot has already sent at least one template). Returns ClosureResult.
+
+    Defaults to ('unclear', 0.5) on any error -- safest behavior because
+    main.py routes 'unclear' to Needs Human, so a transient API blip
+    won't accidentally close a live thread."""
+    if not candidate_message_body and not subject:
+        return ClosureResult(decision="unclear", confidence=0.5,
+                             reasoning="empty message body and subject")
+
+    templates_list = ", ".join(bot_templates_sent) if bot_templates_sent else "(none)"
+    user_msg = (
+        f"The bot previously sent these auto-reply template(s) to this "
+        f"candidate in the same email thread: {templates_list}.\n\n"
+        f"The candidate has now replied.\n"
+        f"Subject: {subject or '(none)'}\n\n"
+        f"Body:\n{(candidate_message_body or '(empty)')[:1500]}"
+    )
+    system = (
+        "You decide whether an inbound candidate email signals the natural "
+        "end of a hiring conversation. Return ONLY a JSON object with this "
+        "exact schema (no prose, no markdown, no code fences):\n"
+        "  {\"decision\": \"closed|ongoing|unclear\", "
+        "\"confidence\": <number 0.0-1.0>, "
+        "\"reasoning\": \"<one short sentence>\"}\n\n"
+        "WHAT COUNTS AS CLOSED\n"
+        "A brief acknowledgment with no new substantive content. The "
+        "candidate is signaling they have no further questions. Examples:\n"
+        "  - 'Thanks for letting me know'\n"
+        "  - 'Got it, appreciate the update'\n"
+        "  - 'Understood, thank you'\n"
+        "  - 'OK no problem, all the best'\n"
+        "  - 'Thanks, will keep in touch'\n"
+        "  - 'No worries, take care'\n\n"
+        "WHAT COUNTS AS ONGOING\n"
+        "The candidate is continuing the conversation in any substantive "
+        "way:\n"
+        "  - Asking a new or follow-up question\n"
+        "  - Pushing back or asking us to reconsider\n"
+        "  - Mentioning a different role they're now interested in\n"
+        "  - Attaching a new or updated resume\n"
+        "  - Providing additional context or qualifications\n"
+        "  - Saying 'actually I'd like to discuss further'\n"
+        "  - Anything that invites a substantive reply\n\n"
+        "WHEN TO MARK UNCLEAR\n"
+        "The reply is ambiguous -- partially closing but also asking "
+        "something, or so terse you cannot tell intent. Mark unclear and a "
+        "human will decide. When genuinely in doubt, prefer unclear over "
+        "closed -- false positives here drop real candidates.\n\n"
+        "Return ONLY the JSON object. No prose."
+    )
+
+    try:
+        import anthropic
+    except ImportError:
+        return ClosureResult(decision="unclear", confidence=0.5,
+                             reasoning="anthropic SDK unavailable")
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=_CLOSURE_MODEL,
+            max_tokens=200,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        text = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        ).strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+            text = re.sub(r"\n?```\s*$", "", text).strip()
+        data = json.loads(text)
+    except Exception as e:
+        log.warning("classify_conversation_closure failed: %s", e)
+        return ClosureResult(decision="unclear", confidence=0.5,
+                             reasoning=f"API error: {type(e).__name__}")
+
+    decision = str(data.get("decision", "unclear")).strip().lower()
+    if decision not in {"closed", "ongoing", "unclear"}:
+        decision = "unclear"
+    try:
+        conf = float(data.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+    reasoning = str(data.get("reasoning", "") or "").strip()[:300]
+    return ClosureResult(decision=decision, confidence=conf, reasoning=reasoning)
 
 
 def classify_inbound_email(*, api_key: str, subject: str, body: str,
