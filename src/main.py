@@ -373,35 +373,30 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- Pre-filter #4: internal-forward short-circuit -----
-    if _is_internal_sender(msg.sender_email, cfg.internal_domains):
-        log.info("  -> internal forward from %s; treating as forwarded resume",
+    # ----- Pre-filter #4: internal-forward handling -----
+    # Internal senders (HR forwarding candidate emails) used to short-circuit
+    # to Misc when no attachment was present. That dropped legitimate
+    # forwarded applications where the candidate info is in the body. Now
+    # we flag the internal-forward case and let the normal classifier run.
+    # The `internal_forward` flag is passed through so downstream logic can
+    # suppress auto-reply (we never want the bot replying TO HR).
+    internal_forward = _is_internal_sender(msg.sender_email, cfg.internal_domains)
+    if internal_forward:
+        log.info("  -> internal sender %s; will classify but suppress outbound reply",
                  msg.sender_email)
-        if not msg.has_resume:
-            sheets_client.append_misc(
-                sheets, cfg.sheet_id, cfg.misc_tab,
-                {
-                    "sender": msg.sender,
-                    "subject": msg.subject,
-                    "filename": "",
-                    "reasoning": "Internal sender, no attachment -- nothing to process.",
-                    "gmail_link": msg.thread_link,
-                },
+        if msg.has_resume:
+            # Attachment present: scan it directly via the resume pipeline.
+            scored = _process_resume_attachments(
+                cfg, gmail, drive, sheets, all_filters, templates,
+                active_role_names, paused_role_names, msg, msg_id, label_id,
+                outcome_label_ids, known_emails,
+                is_internal_forward=True,
+                in_business_hours=in_business_hours,
+                log_inbox=_log_inbox,
             )
-            _log_inbox("internal_no_resume",
-                       "internal sender, no attachment; logged to Misc")
-            if not cfg.shadow_mode:
-                gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
-            return 0
-        scored = _process_resume_attachments(
-            cfg, gmail, drive, sheets, all_filters, templates,
-            active_role_names, paused_role_names, msg, msg_id, label_id,
-            outcome_label_ids, known_emails,
-            is_internal_forward=True,
-            in_business_hours=in_business_hours,
-            log_inbox=_log_inbox,
-        )
-        return scored
+            return scored
+        # No attachment: fall through to the normal classifier path below.
+        # _can_send will suppress any reply because of the internal_forward flag.
 
     # ----- Pre-filter #5: loop detection -----
     sender_lc = (msg.sender_email or "").strip().lower()
@@ -434,6 +429,8 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     def _can_send(template_key: str) -> tuple[bool, str]:
         if not template_key:
             return False, "no template selected"
+        if internal_forward:
+            return False, "sender is internal; never reply to HR/internal addresses"
         if hr_manual:
             return False, "HR replied manually in this thread"
         sender = (msg.sender_email or "").strip().lower()
