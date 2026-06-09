@@ -346,6 +346,26 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         elif mark_done:
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
 
+    def _archive_as_closed(reasoning: str):
+        """Silent close: candidate's reply signals the conversation has
+        ended (e.g. 'thanks for letting me know' after a denied template).
+        Archive without reply, apply Resume Bot/Closed Gmail label, log
+        the action to Inbox Log."""
+        body_preview = (msg.body_text or "").replace("\n", " ")[:300]
+        _log_inbox("conversation_closed",
+                   f"silently closed by candidate reply ({reasoning[:120]})")
+        if cfg.shadow_mode:
+            return
+        closed_label = outcome_label_ids.get("closed", "")
+        if closed_label:
+            gmail_client.archive_with_outcome(
+                gmail, cfg.gmail_user, msg_id,
+                processed_label_id=label_id,
+                outcome_label_id=closed_label,
+            )
+        else:
+            gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+
     # ----- Pre-filter #1: blocklisted sender -----
     if _is_blocklisted_sender(msg.sender_email, cfg.blocklist_senders):
         log.info("  -> sender on blocklist; archiving as misc")
@@ -444,6 +464,35 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if cfg.business_hours_only_replies and not in_business_hours:
             return False, "outside business hours (queued for next biz-hour run)"
         return True, ""
+
+    # ----- Pre-filter #6.5: conversation closure detection -----
+    # If the bot has previously sent any template in this thread, ask Claude
+    # whether the candidate's new reply is a natural close ("thanks for
+    # letting me know"). Silent archive if closed, Needs Human if unclear,
+    # otherwise fall through to the normal classifier flow.
+    if sent_in_thread:
+        closure = scorer.classify_conversation_closure(
+            api_key=cfg.anthropic_api_key,
+            bot_templates_sent=sorted(sent_in_thread),
+            candidate_message_body=gmail_client.strip_quoted_text(msg.body_text),
+            subject=msg.subject,
+        )
+        log.info("  -> closure check: decision=%s confidence=%.2f reason=%r",
+                 closure.decision, closure.confidence, closure.reasoning[:80])
+        if closure.decision == "closed":
+            log.info("  -> conversation closed; silently archiving")
+            _archive_as_closed(closure.reasoning)
+            return 0
+        if closure.decision == "unclear":
+            log.info("  -> closure unclear; routing to Needs Human")
+            _flag_needs_human(
+                reason=f"closure unclear: {closure.reasoning}",
+                reason_type="manual",
+                bot_guess="conversation_closed?",
+                confidence=f"{closure.confidence:.2f}",
+            )
+            return 0
+        # closure.decision == "ongoing" -> fall through to classifier below
 
     # ----- Pre-filter #7: classifier -----
     classifier_body = gmail_client.strip_quoted_text(msg.body_text)
@@ -817,4 +866,56 @@ def _process_resume_attachments(
                  final_bucket)
         return scored
 
-    outcome_id
+    outcome_id = outcome_label_ids.get(final_bucket)
+    if outcome_id:
+        gmail_client.archive_with_outcome(
+            gmail, cfg.gmail_user, msg_id,
+            processed_label_id=label_id,
+            outcome_label_id=outcome_id,
+        )
+    else:
+        gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
+        log.warning("  -> no outcome label found for bucket=%r; email left in inbox",
+                    final_bucket)
+    log.info("  -> email outcome=%s, archived", final_bucket)
+    return scored
+
+
+_BUCKET_PRIORITY = ("qualified", "pending_paused", "needs_review",
+                    "not_qualified", "unreadable", "not_a_resume")
+
+
+def _better_bucket(current, new):
+    if current is None:
+        return new
+    if new is None:
+        return current
+    return min(current, new, key=lambda b: _BUCKET_PRIORITY.index(b)
+               if b in _BUCKET_PRIORITY else len(_BUCKET_PRIORITY))
+
+
+def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
+    vars_ = {"company_name": cfg.company_name, **vars_extra}
+    subject, body = sheets_client.render_template(template, vars_)
+    msg_full = gmail.users().messages().get(
+        userId=cfg.gmail_user, id=msg.id, format="metadata",
+        metadataHeaders=["Message-ID"],
+    ).execute()
+    in_reply_to = ""
+    for h in msg_full.get("payload", {}).get("headers", []):
+        if h["name"].lower() == "message-id":
+            in_reply_to = h["value"]
+            break
+    gmail_client.send_reply(
+        gmail, cfg.gmail_user,
+        to=msg.sender_email,
+        subject=subject,
+        body=body,
+        thread_id=msg.thread_id,
+        in_reply_to_msg_id=in_reply_to,
+        template_key=template.key,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(run())
