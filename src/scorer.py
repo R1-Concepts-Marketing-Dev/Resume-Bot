@@ -93,9 +93,11 @@ Include EVERY role in best_fit_roles where the candidate is at least "weak" -- i
 Fit-level rubric (apply to each role independently):
   excellent   Meets the minimum requirement AND has extra relevant experience, recent employment, and a stable tenure pattern. Top-of-funnel hire.
   strong      Meets the minimum requirement comfortably. Recent and verifiable. Would interview.
-  borderline  Meets the minimum but only just -- limited evidence, unclear tenure, or shaky recency. HR should decide.
-  weak        Close but does NOT meet the stated minimum. Some adjacent experience, not enough on the actual requirement.
-  no_fit      Clearly not a match for this role. Omit from best_fit_roles.
+  borderline  Demonstrably meets the stated minimum, but only just -- e.g. exactly meets the years-of-experience floor with no buffer, or tenure timing is murky on the resume. The minimum requirement IS satisfied; only the confidence level is shaky.
+  weak        Does NOT meet the stated minimum on a specific, measurable axis. Examples: role requires 1+ year cherry picker experience and the candidate has 6 months -> weak. Role requires forklift certification and the resume shows no cert -> weak. Role requires "warehouse experience" and the candidate's work history is retail, food service, or PC repair with no warehouse work -> weak. Adjacent or "implied" experience does NOT bridge an explicit minimum -- if the resume only says "general labor" or "logistics" when the requirement is "cherry picker", that is weak, not borderline. Maps to overall_decision = not_qualified.
+  no_fit      Clearly not a match for this role at all (wrong industry, no relevant skills). Omit from best_fit_roles.
+
+CRITICAL: requirements are requirements, not nice-to-haves. If the role spec says "1+ year cherry picker experience" and the resume shows 6 months, that is WEAK -- the candidate falls short of a stated minimum. Do not promote them to borderline because their warehouse experience "looks close." Adjacent skills are not a substitute for the specific requirement listed.
 
 overall_decision rules:
   qualified       - at least one role is "excellent" or "strong"
