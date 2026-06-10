@@ -419,18 +419,27 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         # _can_send will suppress any reply because of the internal_forward flag.
 
     # ----- Pre-filter #5: loop detection -----
+    # Skip loop detection for job-board aliases (Indeed conversation-*@indeed.com,
+    # ZipRecruiter, etc.). Those are per-candidate aliases by platform design --
+    # Indeed routinely sends multiple emails per application thread (apply, viewed,
+    # message, etc.) which would trip the loop threshold even though each comes
+    # from a unique candidate. Loop detection is for catching genuine spam/stuck
+    # threads from a single human sender, not platform notification multiplicity.
     sender_lc = (msg.sender_email or "").strip().lower()
-    sender_count = recent_sender_counts.get(sender_lc, 0)
-    if sender_count >= cfg.loop_threshold:
-        log.info("  -> sender %s has %d emails in past %dh (>=%d); flagging needs_human",
-                 sender_lc, sender_count, cfg.loop_window_hours, cfg.loop_threshold)
-        _flag_needs_human(
-            reason=f"loop suspected: {sender_count} emails in past {cfg.loop_window_hours}h",
-            reason_type="loop",
-            bot_guess="",
-            confidence="",
-        )
-        return 0
+    if not _is_job_board_alias(msg.sender_email):
+        sender_count = recent_sender_counts.get(sender_lc, 0)
+        if sender_count >= cfg.loop_threshold:
+            log.info("  -> sender %s has %d emails in past %dh (>=%d); flagging needs_human",
+                     sender_lc, sender_count, cfg.loop_window_hours, cfg.loop_threshold)
+            _flag_needs_human(
+                reason=f"loop suspected: {sender_count} emails in past {cfg.loop_window_hours}h",
+                reason_type="loop",
+                bot_guess="",
+                confidence="",
+            )
+            return 0
+    else:
+        log.info("  -> sender %s is a job-board alias; skipping loop check", sender_lc)
 
     # ----- Pre-filter #6: thread-history introspection -----
     if cfg.shadow_mode:
@@ -882,26 +891,4 @@ def _better_bucket(current, new):
 
 def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
     vars_ = {"company_name": cfg.company_name, **vars_extra}
-    subject, body = sheets_client.render_template(template, vars_)
-    msg_full = gmail.users().messages().get(
-        userId=cfg.gmail_user, id=msg.id, format="metadata",
-        metadataHeaders=["Message-ID"],
-    ).execute()
-    in_reply_to = ""
-    for h in msg_full.get("payload", {}).get("headers", []):
-        if h["name"].lower() == "message-id":
-            in_reply_to = h["value"]
-            break
-    gmail_client.send_reply(
-        gmail, cfg.gmail_user,
-        to=msg.sender_email,
-        subject=subject,
-        body=body,
-        thread_id=msg.thread_id,
-        in_reply_to_msg_id=in_reply_to,
-        template_key=template.key,
-    )
-
-
-if __name__ == "__main__":
-    sys.exit(run())
+    subject, body = sheet
