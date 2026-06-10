@@ -891,4 +891,26 @@ def _better_bucket(current, new):
 
 def _send_template(gmail, cfg, template, msg, *, vars_extra: dict) -> None:
     vars_ = {"company_name": cfg.company_name, **vars_extra}
-    subject, body = sheet
+    subject, body = sheets_client.render_template(template, vars_)
+    msg_full = gmail.users().messages().get(
+        userId=cfg.gmail_user, id=msg.id, format="metadata",
+        metadataHeaders=["Message-ID"],
+    ).execute()
+    in_reply_to = ""
+    for h in msg_full.get("payload", {}).get("headers", []):
+        if h["name"].lower() == "message-id":
+            in_reply_to = h["value"]
+            break
+    gmail_client.send_reply(
+        gmail, cfg.gmail_user,
+        to=msg.sender_email,
+        subject=subject,
+        body=body,
+        thread_id=msg.thread_id,
+        in_reply_to_msg_id=in_reply_to,
+        template_key=template.key,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(run())
