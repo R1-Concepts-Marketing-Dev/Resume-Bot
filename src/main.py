@@ -494,6 +494,38 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             return 0
         # closure.decision == "ongoing" -> fall through to classifier below
 
+    # ----- Pre-filter #6.7: Indeed Quick Apply auto-fetch -----
+    # Indeed sends candidate applications without a PDF attachment -- just a
+    # "View resume" link in the body. The classifier reading the Indeed-aliased
+    # sender + templated body tends to misclassify these as MISC. Detect the
+    # Quick Apply pattern HERE, fetch the resume PDF from Indeed's public link,
+    # and attach it BEFORE the classifier runs. That gives the classifier a
+    # real attachment to anchor on and the email routes to RESUME normally.
+    if not msg.has_resume and _is_job_board_alias(msg.sender_email):
+        view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
+        if view_url:
+            log.info("  -> Indeed Quick Apply detected (pre-classifier); fetching resume PDF")
+            pdf_bytes = indeed_fetcher.fetch_resume_pdf(view_url)
+            if pdf_bytes:
+                log.info("  -> Indeed fetch succeeded (%d bytes); attached to msg", len(pdf_bytes))
+                msg.attachments.append(gmail_client.Attachment(
+                    filename="indeed_quick_apply_resume.pdf",
+                    mime_type="application/pdf",
+                    data=pdf_bytes,
+                ))
+                # msg.has_resume is now True via the property; classifier
+                # will route this to RESUME and the resume branch handles it.
+            else:
+                log.warning("  -> Indeed fetch failed; routing to Needs Human")
+                _flag_needs_human(
+                    reason="Indeed Quick Apply: auto-fetch failed",
+                    reason_type="indeed_fetch",
+                    bot_guess="resume",
+                    confidence="0.95",
+                )
+                return 0
+        # If no view_url: not a candidate application (admin notification, etc.) -- let classifier decide.
+
     # ----- Pre-filter #7: classifier -----
     classifier_body = gmail_client.strip_quoted_text(msg.body_text)
     if classifier_body != msg.body_text:
@@ -533,57 +565,11 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- Indeed Quick Apply: try to fetch resume from public link -----
-    # When a candidate applies via Indeed without uploading a PDF themselves,
-    # Indeed forwards an email containing only a "View resume" link. We follow
-    # that link's tokenized id to Indeed's public download endpoint, fetch the
-    # PDF, and drop it into msg.attachments so the resume branch picks it up
-    # like any other applicant attachment. Fall-through on any failure -- we
-    # route to Needs Human below instead of sending the misleading no_resume
-    # template that would tell the candidate to re-attach a resume they
-    # already submitted on Indeed.
-    indeed_fetch_attempted = False
-    indeed_fetch_failed = False
-    if not msg.has_resume and _is_job_board_alias(msg.sender_email):
-        view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
-        if view_url:
-            indeed_fetch_attempted = True
-            log.info("  -> Indeed Quick Apply detected; attempting to fetch resume from Indeed link")
-            pdf_bytes = indeed_fetcher.fetch_resume_pdf(view_url)
-            if pdf_bytes:
-                log.info("  -> Indeed fetch succeeded (%d bytes); promoting to resume branch", len(pdf_bytes))
-                msg.attachments.append(gmail_client.Attachment(
-                    filename="indeed_quick_apply_resume.pdf",
-                    mime_type="application/pdf",
-                    data=pdf_bytes,
-                ))
-            else:
-                indeed_fetch_failed = True
-                log.warning("  -> Indeed fetch failed; will route to Needs Human")
-        else:
-            # Job-board sender with no recognizable View resume link --
-            # either Indeed changed the email format or this isn't a
-            # candidate application at all. Route to human review.
-            indeed_fetch_failed = True
-            log.info("  -> Job-board sender with no resume link; will route to Needs Human")
-
     # ----- No-attachment branches -----
+    # Indeed Quick Apply emails are handled by Pre-filter #6.7 above (before
+    # the classifier), so by this point any job-board candidate email either
+    # has the fetched PDF attached or has already been routed to Needs Human.
     if not msg.has_resume:
-        if indeed_fetch_failed:
-            reason = (
-                "Indeed Quick Apply: auto-fetch from Indeed link failed"
-                if indeed_fetch_attempted
-                else "Indeed-style sender but no resume link in email"
-            )
-            log.info("  -> %s; flagging needs_human", reason)
-            _flag_needs_human(
-                reason=reason,
-                reason_type="indeed_fetch",
-                bot_guess=email_type,
-                confidence=f"{cr.confidence:.2f}",
-            )
-            return 0
-
         if email_type == "question":
             template_key = "question"
             log_type = "question"
