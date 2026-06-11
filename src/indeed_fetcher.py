@@ -13,6 +13,12 @@ the email's 'View resume' link is the same token used by the download
 endpoint, so we extract it from the email and rebuild the download URL
 ourselves rather than scraping the HTML viewer page.
 
+R1 Concepts uses Avanan (Check Point) email security, which rewrites
+every URL in incoming mail to url.avanan.click/v2/... for malware
+scanning. The original Indeed URL is no longer directly visible in the
+email body. We detect the Avanan wrapper, follow the redirect to
+recover the real Indeed URL, then proceed normally.
+
 If Indeed ever changes this contract -- adds auth, expires tokens
 sooner, moves the endpoint -- the fetch fails and main.py falls
 through to the Needs Human queue. No data is lost, HR just clicks
@@ -34,6 +40,15 @@ log = logging.getLogger(__name__)
 #   https://employers.indeed.com/candidates/resume?refUid=...&id=<TOKEN>&ctx=...
 _VIEW_URL_PATTERN = re.compile(
     r"https?://employers\.indeed\.com/candidates/resume\?[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+
+# Avanan/Check Point URL rewrite. R1 Concepts has this enabled, so the
+# real Indeed URL is wrapped: https://url.avanan.click/v2/<segments>...
+# Following the wrapped URL with redirect-following returns the real
+# Indeed URL, which we then use to extract the resume id token.
+_AVANAN_URL_PATTERN = re.compile(
+    r"https?://url\.avanan\.click/v2/[^\s\"'<>]+",
     re.IGNORECASE,
 )
 
@@ -60,20 +75,88 @@ _MAX_PDF_BYTES = 15 * 1024 * 1024  # 15 MB
 
 def extract_view_resume_url(email_body: str) -> str | None:
     """Find the 'View resume' link in an Indeed Quick Apply email body.
+
     Returns the first matching URL or None if no candidate link is
-    found. Indeed-templated emails contain exactly one such link."""
+    found. Tries the direct Indeed URL pattern first, then falls back
+    to detecting Avanan-wrapped URLs near 'View resume' anchor text.
+    """
     if not email_body:
         return None
+    # Direct Indeed URL (passes through when no URL rewriting is in
+    # play, e.g., personal Gmail accounts with no email gateway).
     match = _VIEW_URL_PATTERN.search(email_body)
-    return match.group(0) if match else None
+    if match:
+        return match.group(0)
+    # Avanan-wrapped URL fallback. The email body has many Avanan URLs
+    # (every link gets wrapped), so we need to pick the one that points
+    # to the 'View resume' link rather than 'See full application',
+    # 'Reply to candidate', etc. Strategy: find 'View resume' text in
+    # the body, then grab the nearest Avanan URL within a window after
+    # it. Falls back to first Avanan URL after 'view resume' is
+    # mentioned anywhere.
+    lower_body = email_body.lower()
+    anchor_idx = lower_body.find("view resume")
+    if anchor_idx < 0:
+        return None
+    # Search a 2000-char window starting from the anchor text. Indeed's
+    # template puts the URL right after or above the link text.
+    window_end = min(len(email_body), anchor_idx + 2000)
+    window = email_body[anchor_idx:window_end]
+    av_match = _AVANAN_URL_PATTERN.search(window)
+    if av_match:
+        return av_match.group(0)
+    # Some plain-text Indeed templates put the URL BEFORE the "View
+    # resume" label rather than after. Look backward as a fallback.
+    look_back_start = max(0, anchor_idx - 1500)
+    back_window = email_body[look_back_start:anchor_idx]
+    # Take the LAST avanan URL in the back-window (closest to anchor).
+    back_matches = _AVANAN_URL_PATTERN.findall(back_window)
+    if back_matches:
+        return back_matches[-1]
+    return None
+
+
+def _unwrap_avanan(url: str) -> str | None:
+    """If url is an Avanan-wrapped URL, follow the redirect chain to
+    the real destination and return that. Returns the original URL if
+    it isn't an Avanan wrapper, or None on fetch failure."""
+    if "url.avanan.click" not in url.lower():
+        return url
+    try:
+        # HEAD doesn't always trigger Avanan's redirect (some scanners
+        # only respond to GET). Use GET but stream=True so we don't
+        # download the resume body just to see the final URL.
+        resp = requests.get(
+            url,
+            headers={"User-Agent": _USER_AGENT},
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            allow_redirects=True,
+            stream=True,
+        )
+        final_url = resp.url
+        resp.close()  # don't drain the body
+    except requests.RequestException as e:
+        log.warning("indeed_fetcher: avanan unwrap failed: %s", type(e).__name__)
+        return None
+    if "employers.indeed.com" not in (final_url or "").lower():
+        log.warning(
+            "indeed_fetcher: avanan redirect did not land on Indeed (host=%s)",
+            urlparse(final_url or "").hostname,
+        )
+        return None
+    return final_url
 
 
 def build_download_url(view_resume_url: str) -> str | None:
     """Given the 'View resume' URL from the email, build the public PDF
     download URL. The view URL has ?id=<token>; the download endpoint
-    takes the same token. Returns None if the URL lacks an id param."""
+    takes the same token. Returns None if the URL lacks an id param.
+    Transparently unwraps Avanan-wrapped URLs first."""
+    real_url = _unwrap_avanan(view_resume_url)
+    if not real_url:
+        return None
     try:
-        parsed = urlparse(view_resume_url)
+        parsed = urlparse(real_url)
         params = parse_qs(parsed.query)
     except Exception:
         return None
