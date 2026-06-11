@@ -31,7 +31,7 @@ DASHBOARD_HEADERS = [
     "Applied For", "Cross-Fit Match", "Cross-Fit Flag", "Decision",
     "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
     "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
-    "Recruiter/Agency",
+    "Recruiter/Agency", "Indeed", "Indeed Action Done",
 ]
 
 
@@ -47,29 +47,37 @@ INBOX_LOG_HEADERS = [
 ]
 
 
-# Queue for emails the bot routed to human review (low classifier
-# confidence, loop detection, etc.). HR works this queue manually --
-# bot does NOT auto-reply or archive these messages.
-# NEW SCHEMA (2026-06): added Status + Reason Type, dropped Has Attachment.
-# Migration script (scripts/migrate_needs_human.py) rewrites existing rows
-# into this shape and dedupes by thread_id.
 NEEDS_HUMAN_HEADERS = [
-    "Timestamp",     # A - human-readable PT timestamp e.g. "2026-06-04 15:56 PT"
-    "Status",        # B - dropdown: Open / Investigating / Resolved / Ignored
-    "Reason Type",   # C - dropdown: loop / low_confidence / indeed_fetch / manual
-    "Why Flagged",   # D - full reason text
-    "Sender",        # E
-    "Subject",       # F
-    "Body Preview",  # G - quoted text stripped, capped at 150 chars
-    "Bot Guess",     # H - classifier label or empty
-    "Confidence",    # I - 0.0-1.0 or empty
-    "Gmail Thread",  # J - HYPERLINK
+    "Timestamp", "Status", "Reason Type", "Why Flagged", "Sender",
+    "Subject", "Body Preview", "Bot Guess", "Confidence", "Gmail Thread",
 ]
 
-# Status dropdown options. "Open" is the default for new flags.
 NEEDS_HUMAN_STATUSES = ["Open", "Investigating", "Resolved", "Ignored"]
 NEEDS_HUMAN_REASON_TYPES = ["loop", "low_confidence", "indeed_fetch", "manual"]
 NEEDS_HUMAN_OPEN_STATUSES = {"Open", "Investigating", ""}
+
+
+# Compact action worklist for Indeed candidates. The bot dual-writes
+# every Indeed candidate into both Candidates (full record) and this
+# tab (just what HR needs to action it inside Indeed's own dashboard).
+# HR ticks the "Indeed Application Closed" checkbox once they've moved
+# the candidate in Indeed; a filter view hides closed rows.
+# HR Status column is a VLOOKUP into Candidates by Timestamp so any HR
+# Status edits on Candidates flow through automatically.
+INDEED_QUEUE_HEADERS = [
+    "Candidate Name", "Position", "Fit Quality", "HR Status",
+    "Indeed Application Closed", "Timestamp",
+]
+
+
+# Decision -> human-readable Fit Quality used on the Indeed Queue.
+_INDEED_FIT_QUALITY = {
+    "qualified":      "Strong",
+    "needs_review":   "Needs review",
+    "not_qualified":  "Not a fit",
+    "pending_paused": "Hold - role paused",
+    "unreadable":     "Unreadable resume",
+}
 
 
 SEED_TEMPLATES: list[Template] = [
@@ -227,14 +235,7 @@ def render_template(tmpl, vars):
 
 
 def ensure_dashboard_headers(svc, sheet_id, tab):
-    """Ensure the Candidates dashboard has the full header row.
-
-    On first run: writes all headers into A1:R1. On subsequent runs:
-    checks whether the existing header row already covers every column we
-    know about (DASHBOARD_HEADERS) and, if it's short, extends just the
-    missing trailing cells. This means adding a new column (e.g.
-    Recruiter/Agency) to an existing sheet is a no-op header refresh --
-    existing data rows stay put, the new column appears at the end."""
+    """Idempotently set/extend the Candidates header row to DASHBOARD_HEADERS."""
     rng = f"{tab}!1:1"
     try:
         resp = svc.spreadsheets().values().get(
@@ -245,7 +246,6 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
         return
     existing = (resp.get("values") or [[]])[0]
     if not existing:
-        # Empty sheet -- write the full header row.
         end_col = _col_letter(len(DASHBOARD_HEADERS))
         write_rng = f"{tab}!A1:{end_col}1"
         svc.spreadsheets().values().update(
@@ -254,10 +254,7 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
         ).execute()
         return
     if len(existing) >= len(DASHBOARD_HEADERS):
-        # Already at or beyond expected width -- nothing to do.
         return
-    # Existing sheet but missing trailing columns (likely a fresh deploy
-    # that added new columns). Extend just the missing tail.
     start_col = _col_letter(len(existing) + 1)
     end_col = _col_letter(len(DASHBOARD_HEADERS))
     write_rng = f"{tab}!{start_col}1:{end_col}1"
@@ -273,8 +270,6 @@ def ensure_dashboard_headers(svc, sheet_id, tab):
 
 
 def _col_letter(n: int) -> str:
-    """1 -> A, 26 -> Z, 27 -> AA. We only need single-letter range for
-    the foreseeable future but handle two-letter just in case."""
     out = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
@@ -283,8 +278,6 @@ def _col_letter(n: int) -> str:
 
 
 def _ensure_tab_exists(svc, sheet_id, tab) -> bool:
-    """Create the tab if it's missing. Returns True if the tab exists (or
-    was just created), False if creation failed."""
     try:
         meta = svc.spreadsheets().get(
             spreadsheetId=sheet_id,
@@ -309,8 +302,6 @@ def _ensure_tab_exists(svc, sheet_id, tab) -> bool:
 
 
 def ensure_misc_headers(svc, sheet_id, tab):
-    """Idempotently write headers to the Archive - Misc tab. Tolerates a
-    missing tab -- swallows the API error so the run doesn't crash."""
     rng = f"{tab}!A1:F1"
     try:
         resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
@@ -346,9 +337,7 @@ def ensure_inbox_log_headers(svc, sheet_id, tab):
         log.warning("Could not write %s headers: %s", tab, e)
 
 
-def _get_sheet_id_for_tab(svc, spreadsheet_id, tab_name) -> int | None:
-    """Return the integer sheetId (NOT the spreadsheet id) for a tab name.
-    Needed for batchUpdate formatting requests which work on sheetId."""
+def _get_sheet_id_for_tab(svc, spreadsheet_id, tab_name):
     try:
         meta = svc.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
@@ -365,16 +354,8 @@ def _get_sheet_id_for_tab(svc, spreadsheet_id, tab_name) -> int | None:
 
 
 def ensure_needs_human_headers(svc, sheet_id, tab):
-    """Idempotently set up the Needs Human queue tab: create if missing,
-    write headers, apply formatting (column widths, freeze row 1, Status
-    dropdown, conditional formatting).
-
-    Safe to call on every run -- only writes headers if blank, and the
-    formatting batchUpdate is naturally idempotent (replaces dimension
-    properties, refreshes validation, etc.)."""
     if not _ensure_tab_exists(svc, sheet_id, tab):
         return
-    # 1. Headers
     rng = f"{tab}!A1:J1"
     try:
         resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
@@ -392,18 +373,12 @@ def ensure_needs_human_headers(svc, sheet_id, tab):
             log.warning("Could not write %s headers: %s", tab, e)
             return
     elif existing_headers != NEEDS_HUMAN_HEADERS:
-        # Old schema detected. Leave it alone -- the migration script handles
-        # this case. Log a hint so the operator knows what's up.
         log.info(
             "%s headers don't match new schema -- run scripts/migrate_needs_human.py "
             "before relying on dedup. Existing headers: %s",
             tab, existing_headers,
         )
-        # Don't apply formatting either; the migration script will set it up
-        # cleanly after rewriting the data.
         return
-
-    # 2. Formatting (only if headers were written or already correct)
     inner_id = _get_sheet_id_for_tab(svc, sheet_id, tab)
     if inner_id is None:
         return
@@ -417,29 +392,14 @@ def ensure_needs_human_headers(svc, sheet_id, tab):
             log.warning("Could not apply %s formatting: %s", tab, e)
 
 
-# Pixel widths for each Needs Human column. Tuned so the most-important
-# columns (Reason Type, Why Flagged, Sender, Subject) are readable at a
-# glance and the auxiliary columns (Bot Guess, Confidence) stay narrow.
 _NEEDS_HUMAN_COL_WIDTHS = {
-    0: 140,   # A Timestamp
-    1: 120,   # B Status
-    2: 110,   # C Reason Type
-    3: 280,   # D Why Flagged
-    4: 220,   # E Sender
-    5: 200,   # F Subject
-    6: 360,   # G Body Preview
-    7: 160,   # H Bot Guess
-    8: 90,    # I Confidence
-    9: 80,    # J Gmail Thread
+    0: 140, 1: 120, 2: 110, 3: 280, 4: 220,
+    5: 200, 6: 360, 7: 160, 8: 90, 9: 80,
 }
 
 
-def _build_needs_human_format_requests(inner_id: int) -> list:
-    """Build the batchUpdate requests that style the Needs Human tab.
-    Run on every ensure_* call so re-running heals any drift."""
+def _build_needs_human_format_requests(inner_id):
     requests = []
-
-    # Freeze row 1 (headers)
     requests.append({
         "updateSheetProperties": {
             "properties": {
@@ -449,8 +409,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             "fields": "gridProperties.frozenRowCount",
         }
     })
-
-    # Bold + background for header row
     requests.append({
         "repeatCell": {
             "range": {
@@ -468,8 +426,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
         }
     })
-
-    # Column widths
     for col_index, width in _NEEDS_HUMAN_COL_WIDTHS.items():
         requests.append({
             "updateDimensionProperties": {
@@ -481,9 +437,7 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
                 "fields": "pixelSize",
             }
         })
-
-    # Wrap text in Why Flagged + Body Preview columns
-    for col_index in (3, 6):  # D Why Flagged, G Body Preview
+    for col_index in (3, 6):
         requests.append({
             "repeatCell": {
                 "range": {
@@ -495,8 +449,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
                 "fields": "userEnteredFormat.wrapStrategy",
             }
         })
-
-    # Status column (B) -- dropdown validation
     requests.append({
         "setDataValidation": {
             "range": {
@@ -514,8 +466,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             },
         }
     })
-
-    # Reason Type column (C) -- dropdown validation
     requests.append({
         "setDataValidation": {
             "range": {
@@ -533,8 +483,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             },
         }
     })
-
-    # Conditional formatting: Resolved rows -> light grey, italic
     requests.append({
         "addConditionalFormatRule": {
             "rule": {
@@ -557,8 +505,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             "index": 0,
         }
     })
-
-    # Conditional formatting: Ignored -> very faint grey
     requests.append({
         "addConditionalFormatRule": {
             "rule": {
@@ -581,7 +527,6 @@ def _build_needs_human_format_requests(inner_id: int) -> list:
             "index": 0,
         }
     })
-
     return requests
 
 
@@ -628,62 +573,48 @@ def append_misc(svc, sheet_id, tab, row):
         log.warning("Failed to log to %s tab: %s", tab, e)
 
 
-def _format_pt_timestamp(iso_or_dt=None) -> str:
-    """Format a UTC ISO string or datetime as 'YYYY-MM-DD HH:MM PT'.
-    Accepts None (uses current time). PT here is UTC-7 with ~1h winter
-    drift (PST), which is fine for human-readable display."""
+def _format_pt_timestamp(iso_or_dt=None):
     if iso_or_dt is None:
         dt = datetime.now(timezone.utc)
     elif isinstance(iso_or_dt, str):
         try:
             dt = datetime.fromisoformat(iso_or_dt.replace("Z", "+00:00"))
         except ValueError:
-            return iso_or_dt  # give up gracefully
+            return iso_or_dt
     else:
         dt = iso_or_dt
     pt = dt - timedelta(hours=7)
     return pt.strftime("%Y-%m-%d %H:%M PT")
 
 
-# Body previews are stored on the queue purely for at-a-glance triage --
-# the full message is one click away via the Gmail Thread link.
 _BODY_PREVIEW_MAX_CHARS = 150
 
 
-def _clean_body_preview(body: str) -> str:
-    """Strip quoted reply chains, collapse whitespace, cap length."""
+def _clean_body_preview(body):
     if not body:
         return ""
     try:
-        # Reuse the bot's existing quote-stripper if available
         from . import gmail_client
         cleaned = gmail_client.strip_quoted_text(body)
     except Exception:
         cleaned = body
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > _BODY_PREVIEW_MAX_CHARS:
-        cleaned = cleaned[:_BODY_PREVIEW_MAX_CHARS - 1].rstrip() + "\u2026"
+        cleaned = cleaned[:_BODY_PREVIEW_MAX_CHARS - 1].rstrip() + "…"
     return cleaned
 
 
-# Match Gmail thread URLs in HYPERLINK formulas:
-#   =HYPERLINK("https://mail.google.com/mail/u/0/#inbox/<id>", "Link")
 _THREAD_ID_PATTERN = re.compile(r"#inbox/([A-Za-z0-9_-]+)")
 
 
-def _thread_id_from_link(cell_value: str) -> str | None:
-    """Extract the Gmail thread_id from a HYPERLINK formula cell."""
+def _thread_id_from_link(cell_value):
     if not cell_value:
         return None
     m = _THREAD_ID_PATTERN.search(str(cell_value))
     return m.group(1) if m else None
 
 
-def load_open_needs_human_threads(svc, sheet_id, tab) -> set[str]:
-    """Return Gmail thread_ids currently sitting in the Needs Human queue
-    with an open-ish status (Open / Investigating / blank). Used by
-    main.py to suppress duplicate flag-attempts so a stuck conversation
-    doesn't accumulate 30 identical rows."""
+def load_open_needs_human_threads(svc, sheet_id, tab):
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -694,11 +625,8 @@ def load_open_needs_human_threads(svc, sheet_id, tab) -> set[str]:
         log.warning("Could not load open Needs Human threads: %s", e)
         return set()
     rows = resp.get("values", []) or []
-    threads: set[str] = set()
+    threads = set()
     for row in rows:
-        # row indexes are relative to B2:J -- so col B = row[0] (Status),
-        # col J = row[8] (Gmail Thread). Some rows may be short if
-        # trailing columns are blank.
         status = (row[0] if len(row) > 0 else "").strip()
         if status and status not in NEEDS_HUMAN_OPEN_STATUSES:
             continue
@@ -710,13 +638,6 @@ def load_open_needs_human_threads(svc, sheet_id, tab) -> set[str]:
 
 
 def append_needs_human(svc, sheet_id, tab, row):
-    """Append a row to the Needs Human queue using the new schema:
-    Timestamp | Status | Reason Type | Why Flagged | Sender | Subject |
-    Body Preview | Bot Guess | Confidence | Gmail Thread.
-
-    Caller is expected to have already checked dedup via
-    load_open_needs_human_threads(). Swallows its own exceptions so a
-    missing tab can't break the run."""
     try:
         reason_type = (row.get("reason_type") or "manual").strip().lower()
         if reason_type not in NEEDS_HUMAN_REASON_TYPES:
@@ -724,7 +645,7 @@ def append_needs_human(svc, sheet_id, tab, row):
         timestamp = row.get("timestamp")
         values = [
             _format_pt_timestamp(timestamp),
-            "Open",  # default status -- HR can change via dropdown
+            "Open",
             reason_type,
             _safe(row.get("reason", "")),
             _safe(row.get("sender", "")),
@@ -745,9 +666,7 @@ def append_needs_human(svc, sheet_id, tab, row):
         log.warning("Failed to log to %s tab: %s", tab, e)
 
 
-def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
-    """Set of emails already on the Candidates dashboard. Used to suppress
-    auto-replies to candidates HR is already engaged with."""
+def load_known_candidate_emails(svc, sheet_id, tab):
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -756,7 +675,7 @@ def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
     except Exception as e:
         log.warning("Could not load known candidate emails: %s", e)
         return set()
-    out: set[str] = set()
+    out = set()
     for row in resp.get("values", []):
         if not row:
             continue
@@ -768,14 +687,7 @@ def load_known_candidate_emails(svc, sheet_id, tab) -> set[str]:
     return out
 
 
-def load_recent_inbox_senders(svc, sheet_id, tab,
-                               hours_back: int = 24) -> dict:
-    """Count messages per sender in the Inbox Log within the past N hours.
-    Used by main.py to detect loops (same sender 3+ times in 24h ->
-    escalate to Needs Human queue).
-
-    Returns dict of {lower-cased sender email: count}. Tolerant: returns
-    empty dict if the tab can't be read."""
+def load_recent_inbox_senders(svc, sheet_id, tab, hours_back=24):
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -785,7 +697,7 @@ def load_recent_inbox_senders(svc, sheet_id, tab,
         log.warning("Could not load Inbox Log for loop detection: %s", e)
         return {}
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
-    counts: dict[str, int] = {}
+    counts = {}
     for r in resp.get("values", []):
         if len(r) < 2:
             continue
@@ -801,8 +713,6 @@ def load_recent_inbox_senders(svc, sheet_id, tab,
         sender = str(sender_raw).strip().lower()
         if sender.startswith("'"):
             sender = sender[1:]
-        # Extract just the email address from "Name <email@domain>".
-        import re
         m = re.search(r"[\w.+-]+@[\w.-]+", sender)
         if m:
             sender = m.group(0)
@@ -811,8 +721,7 @@ def load_recent_inbox_senders(svc, sheet_id, tab,
     return counts
 
 
-def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
-    import re
+def load_processed_thread_ids(svc, sheet_id, tab):
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -821,7 +730,7 @@ def load_processed_thread_ids(svc, sheet_id, tab) -> set[str]:
         ).execute()
     except Exception:
         return set()
-    ids: set[str] = set()
+    ids = set()
     for row in resp.get("values", []):
         if not row:
             continue
@@ -856,12 +765,16 @@ def append_error(svc, sheet_id, tab, row):
 
 
 def append_candidate(svc, sheet_id, tab, row):
-    """Append a candidate row to the Candidates dashboard.
+    """Append a candidate row to the Candidates dashboard (columns A:T).
 
-    Recruiter/Agency column (column R): if row['recruiter_agency'] is
-    missing or empty, defaults to "N/A". When the scorer detects the
-    email came from a third-party recruiter on the candidate's behalf,
-    it populates this field with the agency or recruiter name."""
+    Indeed column (S): "Yes" if the candidate came in via a job-board
+    alias (Indeed conversation-*@indeed.com etc.), else "No". Used by the
+    Indeed Queue tab as a filter signal.
+
+    Indeed Action Done (T): HR-managed; bot writes empty. Once HR has
+    moved/declined the candidate inside Indeed's dashboard they tick
+    this; the Indeed Queue's filter view then hides the row.
+    """
     recruiter_agency = (row.get("recruiter_agency") or "N/A").strip() or "N/A"
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -882,11 +795,52 @@ def append_candidate(svc, sheet_id, tab, row):
         "",  # HR Status (HR fills in)
         "",  # HR Notes (HR fills in)
         _safe(recruiter_agency),
+        "Yes" if row.get("indeed") else "No",
+        "",  # Indeed Action Done (HR fills in)
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A:R",
+        range=f"{tab}!A:T",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
+
+
+def append_indeed_queue(svc, sheet_id, tab, row):
+    """Append a row to the Indeed Queue tab. Bot calls this for each
+    Indeed candidate in addition to the regular Candidates write.
+
+    Columns: Candidate Name | Position | Fit Quality | HR Status
+    (formula) | Closed (checkbox FALSE default) | Timestamp (join key).
+
+    HR Status column gets a per-row VLOOKUP formula that pulls the HR
+    Status cell from the matching Candidates row by timestamp. Edits to
+    HR Status on Candidates therefore propagate here automatically with
+    no further bot intervention.
+    """
+    timestamp = row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    candidate_name = _safe(row.get("candidate_name") or "")
+    position = _safe(row.get("applied_for") or "")
+    fit_quality = _INDEED_FIT_QUALITY.get(
+        row.get("decision", ""), row.get("decision", "")
+    )
+    # VLOOKUP by timestamp -> HR Status column on Candidates.
+    # Candidates layout: A=Timestamp ... P=HR Status (column 16 in A:P).
+    hr_status_formula = (
+        f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:P,16,FALSE),"")'
+    )
+    values = [
+        candidate_name, position, _safe(fit_quality),
+        hr_status_formula, False, timestamp,
+    ]
+    try:
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:F",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to append to %s tab: %s", tab, e)
