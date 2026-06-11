@@ -14,12 +14,13 @@ endpoint, so we extract it from the email and rebuild the download URL
 ourselves rather than scraping the HTML viewer page.
 
 R1 Concepts uses Avanan (Check Point) email security, which rewrites
-every URL in incoming mail to url.avanan.click/v2/... for malware
-scanning. We detect the Avanan wrapper, follow the redirect to recover
-the real Indeed URL, then proceed normally. The Avanan redirect may
-land on cts.indeed.com (Indeed's click-tracking service) which is an
-intermediate hop that requests doesn't auto-follow; we recover the real
-URL or id token directly from the CTS query params in that case.
+every URL in incoming mail to url.avanan.click/v2/<random>/___<dest>___.<sig>
+for malware scanning. The Avanan v2 format embeds the real destination
+URL INLINE between '___' separators, so we extract it without any HTTP
+fetch. The destination is typically a cts.indeed.com click-tracking URL
+which itself encodes the final employers.indeed.com URL as a
+gzip-base64-JSON blob in its path. We decode that blob locally too;
+no HTTP redirect-following needed.
 
 If Indeed ever changes this contract -- adds auth, expires tokens
 sooner, moves the endpoint -- the fetch fails and main.py falls
@@ -30,8 +31,11 @@ through manually as a fallback.
 from __future__ import annotations
 
 import base64
+import gzip
+import json
 import logging
 import re
+from html import unescape
 from urllib.parse import urlparse, parse_qs, urlencode, unquote
 
 import requests
@@ -52,6 +56,10 @@ _AVANAN_URL_PATTERN = re.compile(
     r"https?://url\.avanan\.click/v2/[^\s\"'<>]+",
     re.IGNORECASE,
 )
+
+# Avanan v2 wraps the destination URL between two ___ separators in the
+# path, e.g. https://url.avanan.click/v2/r01/___<dest>___.<base64-sig>
+_AVANAN_INLINE_DEST_PATTERN = re.compile(r"___(.*?)___", re.DOTALL)
 
 # Indeed's public PDF endpoint. Path includes /public/ which strongly
 # signals Indeed designed this for un-auth'd sharing.
@@ -101,37 +109,75 @@ def extract_view_resume_url(email_body: str) -> str | None:
     return None
 
 
+def _unwrap_avanan_inline(url: str) -> str | None:
+    """Avanan v2 URLs embed the real destination URL inline between two
+    '___' separators in the path. Extract it without any HTTP call.
+    Returns the destination URL, or None if the wrapper doesn't match
+    the inline format (in which case the caller can fall back to
+    HTTP redirect-following)."""
+    if "url.avanan.click" not in url.lower():
+        return None
+    m = _AVANAN_INLINE_DEST_PATTERN.search(url)
+    if not m:
+        return None
+    dest = unescape(m.group(1)).strip()
+    # The path may contain '&amp;' from HTML email encoding, and may
+    # have URL-encoding from the email body's char set. Try to clean.
+    if dest.startswith("http"):
+        return dest
+    return None
+
+
 def _unwrap_avanan(url: str) -> str | None:
-    """If url is an Avanan-wrapped URL, follow the redirect chain to the
-    real destination. Returns the original URL if not Avanan-wrapped,
-    or None on fetch failure. Handles the cts.indeed.com intermediate
-    hop (Indeed click-tracking) which requests may not auto-follow."""
+    """If url is an Avanan-wrapped URL, recover the real destination.
+    First tries the inline extraction (no HTTP). Falls back to following
+    the redirect chain via requests if the inline format doesn't match.
+    Handles the cts.indeed.com hop by decoding its gzip-base64-JSON
+    path blob locally."""
     if "url.avanan.click" not in url.lower():
         return url
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": _USER_AGENT},
-            timeout=_FETCH_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            stream=True,
-        )
-        final_url = resp.url
-        resp.close()
-    except requests.RequestException as e:
-        log.warning("indeed_fetcher: avanan unwrap failed: %s", type(e).__name__)
-        return None
-    host = (urlparse(final_url or "").hostname or "").lower()
+    # Inline extraction: no HTTP call needed.
+    inline = _unwrap_avanan_inline(url)
+    candidate_url = inline
+    if not candidate_url:
+        # Fall back to HTTP redirect-following.
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": _USER_AGENT},
+                timeout=_FETCH_TIMEOUT_SECONDS,
+                allow_redirects=True,
+                stream=True,
+            )
+            candidate_url = resp.url
+            resp.close()
+        except requests.RequestException as e:
+            log.warning("indeed_fetcher: avanan unwrap failed: %s", type(e).__name__)
+            return None
+    host = (urlparse(candidate_url or "").hostname or "").lower()
     if "employers.indeed.com" in host:
-        return final_url
+        return candidate_url
     if host.endswith("indeed.com"):
-        # Indeed click-tracking subdomain (cts.indeed.com etc).
-        unwrapped = _recover_indeed_url_from_cts(final_url)
+        # cts.indeed.com or another click-tracking subdomain. The real
+        # destination URL is encoded in the path; decode locally.
+        unwrapped = _recover_indeed_url_from_cts(candidate_url)
         if unwrapped:
             return unwrapped
-        log.warning(
-            "indeed_fetcher: avanan -> %s but couldn't recover real URL", host,
-        )
+        # Diagnostic: log path segments and first ~80 chars of the
+        # path blob so we can see why recovery failed. (URL itself is
+        # not PII -- it just contains an Indeed token.)
+        try:
+            _path_segs = [s for s in urlparse(candidate_url).path.split("/") if s]
+            _blob_preview = (_path_segs[1][:80] if len(_path_segs) >= 2 else "")
+            log.warning(
+                "indeed_fetcher: avanan -> %s recovery failed; path_segs=%d "
+                "blob_preview=%r",
+                host, len(_path_segs), _blob_preview,
+            )
+        except Exception:
+            log.warning(
+                "indeed_fetcher: avanan -> %s but couldn't recover real URL", host,
+            )
         return None
     log.warning(
         "indeed_fetcher: avanan redirect did not land on Indeed (host=%s)", host,
@@ -141,38 +187,75 @@ def _unwrap_avanan(url: str) -> str | None:
 
 def _recover_indeed_url_from_cts(cts_url: str) -> str | None:
     """Given a cts.indeed.com URL, recover the real employers.indeed.com
-    URL. CTS typically embeds the destination URL as a query param
-    ('p', 'rdr', 'redirectUrl', 'url', 'r', 'target', 'to'). The value
-    may be URL-encoded once or twice, or base64-encoded.
+    URL. Indeed's CTS v1 encodes the destination URL as a JSON blob in
+    the path: https://cts.indeed.com/v1/<gzip-base64-json>/<signature>.
+    The first path segment after /v1/ is gzip-compressed JSON (URL-safe
+    base64 encoded) with a 'u' field containing the destination URL.
 
-    Falls back to extracting just the id token directly from the CTS
-    query params if no embedded URL is found -- the download endpoint
-    only needs the id, not the full original URL."""
+    Falls back to query-param extraction for older or alternative CTS
+    formats."""
     try:
         parsed = urlparse(cts_url)
-        params = parse_qs(parsed.query)
     except Exception:
         return None
+    # Path-blob decode (current CTS v1 format).
+    if parsed.path.startswith("/v1/"):
+        segments = [s for s in parsed.path.split("/") if s]
+        # segments[0] = 'v1', segments[1] = gzip-base64-blob
+        if len(segments) >= 2:
+            blob = segments[1]
+            decoded = _try_gzip_b64_json(blob)
+            if decoded and "employers.indeed.com" in decoded:
+                # HTML-entity-decode in case the JSON had &amp;
+                return unescape(decoded)
+    # Query-param fallback for older CTS variants.
+    try:
+        params = parse_qs(parsed.query)
+    except Exception:
+        params = {}
     candidate_keys = ("p", "rdr", "redirectUrl", "url", "r", "target", "to")
     for key in candidate_keys:
         for raw_val in params.get(key, []):
             for decoded in (raw_val, unquote(raw_val), unquote(unquote(raw_val))):
                 if "employers.indeed.com" in decoded:
-                    return decoded
+                    return unescape(decoded)
             try:
                 b64 = base64.urlsafe_b64decode(raw_val + "==").decode(
                     "utf-8", errors="ignore"
                 )
                 if "employers.indeed.com" in b64:
-                    return b64.split()[0]
+                    return unescape(b64.split()[0])
             except Exception:
                 pass
-    # Fallback: CTS URL may have the resume id token directly. Build a
-    # synthetic employers URL containing it -- build_download_url only
-    # needs the id.
+    # Last-ditch: cts URL may have id= directly.
     for raw_val in params.get("id", []):
         if raw_val:
             return f"https://employers.indeed.com/candidates/resume?id={raw_val}"
+    return None
+
+
+def _try_gzip_b64_json(blob: str) -> str | None:
+    """Decode a URL-safe base64-encoded gzip-compressed JSON blob and
+    return the 'u' field if it points to an Indeed URL. Returns None
+    if any step fails."""
+    if not blob:
+        return None
+    try:
+        # URL-safe base64 may be missing padding; add up to 3 '='.
+        padded = blob + "=" * (-len(blob) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        if not raw.startswith(b"\x1f\x8b"):
+            return None  # not gzip magic
+        json_bytes = gzip.decompress(raw)
+        obj = json.loads(json_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if isinstance(obj, dict):
+        # Indeed CTS v1 uses 'u' for the destination URL.
+        for key in ("u", "url", "target", "rdr"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
     return None
 
 
