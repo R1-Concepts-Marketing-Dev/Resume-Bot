@@ -15,9 +15,11 @@ ourselves rather than scraping the HTML viewer page.
 
 R1 Concepts uses Avanan (Check Point) email security, which rewrites
 every URL in incoming mail to url.avanan.click/v2/... for malware
-scanning. The original Indeed URL is no longer directly visible in the
-email body. We detect the Avanan wrapper, follow the redirect to
-recover the real Indeed URL, then proceed normally.
+scanning. We detect the Avanan wrapper, follow the redirect to recover
+the real Indeed URL, then proceed normally. The Avanan redirect may
+land on cts.indeed.com (Indeed's click-tracking service) which is an
+intermediate hop that requests doesn't auto-follow; we recover the real
+URL or id token directly from the CTS query params in that case.
 
 If Indeed ever changes this contract -- adds auth, expires tokens
 sooner, moves the endpoint -- the fetch fails and main.py falls
@@ -27,9 +29,10 @@ through manually as a fallback.
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, unquote
 
 import requests
 
@@ -45,8 +48,6 @@ _VIEW_URL_PATTERN = re.compile(
 
 # Avanan/Check Point URL rewrite. R1 Concepts has this enabled, so the
 # real Indeed URL is wrapped: https://url.avanan.click/v2/<segments>...
-# Following the wrapped URL with redirect-following returns the real
-# Indeed URL, which we then use to extract the resume id token.
 _AVANAN_URL_PATTERN = re.compile(
     r"https?://url\.avanan\.click/v2/[^\s\"'<>]+",
     re.IGNORECASE,
@@ -75,41 +76,25 @@ _MAX_PDF_BYTES = 15 * 1024 * 1024  # 15 MB
 
 def extract_view_resume_url(email_body: str) -> str | None:
     """Find the 'View resume' link in an Indeed Quick Apply email body.
-
     Returns the first matching URL or None if no candidate link is
-    found. Tries the direct Indeed URL pattern first, then falls back
-    to detecting Avanan-wrapped URLs near 'View resume' anchor text.
-    """
+    found. Tries direct Indeed URL first, then Avanan-wrapped fallback."""
     if not email_body:
         return None
-    # Direct Indeed URL (passes through when no URL rewriting is in
-    # play, e.g., personal Gmail accounts with no email gateway).
     match = _VIEW_URL_PATTERN.search(email_body)
     if match:
         return match.group(0)
-    # Avanan-wrapped URL fallback. The email body has many Avanan URLs
-    # (every link gets wrapped), so we need to pick the one that points
-    # to the 'View resume' link rather than 'See full application',
-    # 'Reply to candidate', etc. Strategy: find 'View resume' text in
-    # the body, then grab the nearest Avanan URL within a window after
-    # it. Falls back to first Avanan URL after 'view resume' is
-    # mentioned anywhere.
+    # Avanan-wrapped URL fallback. Find Avanan URL near 'View resume' text.
     lower_body = email_body.lower()
     anchor_idx = lower_body.find("view resume")
     if anchor_idx < 0:
         return None
-    # Search a 2000-char window starting from the anchor text. Indeed's
-    # template puts the URL right after or above the link text.
     window_end = min(len(email_body), anchor_idx + 2000)
     window = email_body[anchor_idx:window_end]
     av_match = _AVANAN_URL_PATTERN.search(window)
     if av_match:
         return av_match.group(0)
-    # Some plain-text Indeed templates put the URL BEFORE the "View
-    # resume" label rather than after. Look backward as a fallback.
     look_back_start = max(0, anchor_idx - 1500)
     back_window = email_body[look_back_start:anchor_idx]
-    # Take the LAST avanan URL in the back-window (closest to anchor).
     back_matches = _AVANAN_URL_PATTERN.findall(back_window)
     if back_matches:
         return back_matches[-1]
@@ -117,15 +102,13 @@ def extract_view_resume_url(email_body: str) -> str | None:
 
 
 def _unwrap_avanan(url: str) -> str | None:
-    """If url is an Avanan-wrapped URL, follow the redirect chain to
-    the real destination and return that. Returns the original URL if
-    it isn't an Avanan wrapper, or None on fetch failure."""
+    """If url is an Avanan-wrapped URL, follow the redirect chain to the
+    real destination. Returns the original URL if not Avanan-wrapped,
+    or None on fetch failure. Handles the cts.indeed.com intermediate
+    hop (Indeed click-tracking) which requests may not auto-follow."""
     if "url.avanan.click" not in url.lower():
         return url
     try:
-        # HEAD doesn't always trigger Avanan's redirect (some scanners
-        # only respond to GET). Use GET but stream=True so we don't
-        # download the resume body just to see the final URL.
         resp = requests.get(
             url,
             headers={"User-Agent": _USER_AGENT},
@@ -134,17 +117,63 @@ def _unwrap_avanan(url: str) -> str | None:
             stream=True,
         )
         final_url = resp.url
-        resp.close()  # don't drain the body
+        resp.close()
     except requests.RequestException as e:
         log.warning("indeed_fetcher: avanan unwrap failed: %s", type(e).__name__)
         return None
-    if "employers.indeed.com" not in (final_url or "").lower():
+    host = (urlparse(final_url or "").hostname or "").lower()
+    if "employers.indeed.com" in host:
+        return final_url
+    if host.endswith("indeed.com"):
+        # Indeed click-tracking subdomain (cts.indeed.com etc).
+        unwrapped = _recover_indeed_url_from_cts(final_url)
+        if unwrapped:
+            return unwrapped
         log.warning(
-            "indeed_fetcher: avanan redirect did not land on Indeed (host=%s)",
-            urlparse(final_url or "").hostname,
+            "indeed_fetcher: avanan -> %s but couldn't recover real URL", host,
         )
         return None
-    return final_url
+    log.warning(
+        "indeed_fetcher: avanan redirect did not land on Indeed (host=%s)", host,
+    )
+    return None
+
+
+def _recover_indeed_url_from_cts(cts_url: str) -> str | None:
+    """Given a cts.indeed.com URL, recover the real employers.indeed.com
+    URL. CTS typically embeds the destination URL as a query param
+    ('p', 'rdr', 'redirectUrl', 'url', 'r', 'target', 'to'). The value
+    may be URL-encoded once or twice, or base64-encoded.
+
+    Falls back to extracting just the id token directly from the CTS
+    query params if no embedded URL is found -- the download endpoint
+    only needs the id, not the full original URL."""
+    try:
+        parsed = urlparse(cts_url)
+        params = parse_qs(parsed.query)
+    except Exception:
+        return None
+    candidate_keys = ("p", "rdr", "redirectUrl", "url", "r", "target", "to")
+    for key in candidate_keys:
+        for raw_val in params.get(key, []):
+            for decoded in (raw_val, unquote(raw_val), unquote(unquote(raw_val))):
+                if "employers.indeed.com" in decoded:
+                    return decoded
+            try:
+                b64 = base64.urlsafe_b64decode(raw_val + "==").decode(
+                    "utf-8", errors="ignore"
+                )
+                if "employers.indeed.com" in b64:
+                    return b64.split()[0]
+            except Exception:
+                pass
+    # Fallback: CTS URL may have the resume id token directly. Build a
+    # synthetic employers URL containing it -- build_download_url only
+    # needs the id.
+    for raw_val in params.get("id", []):
+        if raw_val:
+            return f"https://employers.indeed.com/candidates/resume?id={raw_val}"
+    return None
 
 
 def build_download_url(view_resume_url: str) -> str | None:
@@ -163,9 +192,6 @@ def build_download_url(view_resume_url: str) -> str | None:
     resume_id = (params.get("id") or [""])[0]
     if not resume_id:
         return None
-    # publicResumeTk is JS-populated client-side; in the public-link
-    # context the literal string 'undefined' is what the browser sends,
-    # and the endpoint accepts it.
     query = urlencode({"id": resume_id, "publicResumeTk": "undefined"})
     return f"{_DOWNLOAD_ENDPOINT}?{query}"
 
@@ -202,8 +228,6 @@ def fetch_resume_pdf(view_resume_url: str) -> bytes | None:
         return None
     content_type = (resp.headers.get("content-type") or "").lower()
     if "pdf" not in content_type:
-        # Could be an HTML error page, JSON error, redirect to login,
-        # etc. -- not a real PDF, so don't try to score it.
         log.warning(
             "indeed_fetcher: unexpected content-type=%r (expected pdf)",
             content_type,
@@ -214,9 +238,6 @@ def fetch_resume_pdf(view_resume_url: str) -> bytes | None:
         log.warning("indeed_fetcher: empty response body")
         return None
     if not body.startswith(b"%PDF"):
-        # Defense-in-depth: even with a pdf content-type, verify the
-        # magic bytes. An HTML interstitial pretending to be a PDF
-        # would not match.
         log.warning(
             "indeed_fetcher: response body is not a PDF (first bytes=%r)",
             body[:8],
