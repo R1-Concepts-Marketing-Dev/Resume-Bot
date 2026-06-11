@@ -241,6 +241,34 @@ def _decode_body(part: dict) -> str:
         return ""
 
 
+_ANCHOR_TAG_RE = re.compile(
+    r"""<a\b[^>]*?\bhref\s*=\s*['"]([^'"]+)['"][^>]*?>(.*?)</a>""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _html_to_text(html: str) -> str:
+    """Convert an HTML email body to readable text while PRESERVING
+    href URLs inside anchor tags. A naive `re.sub("<[^>]+>", " ", ...)`
+    drops the href attribute along with the tag, so any link whose text
+    differs from its URL (e.g., a 'View resume' button) loses the URL.
+    This matters when the bot needs to detect the Indeed Quick Apply
+    URL or any other action link in the body. We inline each anchor as
+    'TEXT URL' before stripping the remaining tags."""
+    if not html:
+        return ""
+    def inline(match):
+        href = (match.group(1) or "").strip()
+        text = re.sub(r"<[^>]+>", " ", match.group(2) or "").strip()
+        if href and text and href != text:
+            return f"{text} {href}"
+        return href or text
+    inlined = _ANCHOR_TAG_RE.sub(inline, html)
+    stripped = re.sub(r"<[^>]+>", " ", inlined)
+    # Collapse runs of whitespace so URLs land cleanly on their own.
+    return re.sub(r"[ \t]+", " ", stripped).strip()
+
+
 def _extract_body_text(payload: dict) -> str:
     plain_chunks: list[str] = []
     html_chunks: list[str] = []
@@ -250,11 +278,16 @@ def _extract_body_text(payload: dict) -> str:
             plain_chunks.append(_decode_body(part))
         elif mime.startswith("text/html"):
             html_chunks.append(_decode_body(part))
+    # Always combine plain + HTML-with-anchors-inlined so URL-only
+    # content (e.g., Avanan-wrapped 'View resume' links) is visible to
+    # downstream extractors even when the plain part omits URLs. Plain
+    # wins for readability ordering; HTML appends for URL coverage.
+    parts: list[str] = []
     if plain_chunks:
-        return "\n".join(plain_chunks).strip()
+        parts.append("\n".join(plain_chunks).strip())
     if html_chunks:
-        return re.sub(r"<[^>]+>", " ", "\n".join(html_chunks)).strip()
-    return ""
+        parts.append(_html_to_text("\n".join(html_chunks)))
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def _has_calendar_invite(payload: dict) -> bool:
