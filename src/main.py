@@ -508,8 +508,12 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     # "View resume" link in the body. The classifier reading the Indeed-aliased
     # sender + templated body tends to misclassify these as MISC. Detect the
     # Quick Apply pattern HERE, fetch the resume PDF from Indeed's public link,
-    # and attach it BEFORE the classifier runs. That gives the classifier a
-    # real attachment to anchor on and the email routes to RESUME normally.
+    # and attach it BEFORE the classifier runs. If the fetch succeeds we
+    # bypass the classifier entirely -- we already know it's a resume, the
+    # candidate came in through a known application channel and we have a
+    # valid PDF in hand. Skipping the classifier avoids the templated-body
+    # MISC misclassification that previously dropped Indeed candidates.
+    indeed_quick_apply_attached = False
     if not msg.has_resume and _is_job_board_alias(msg.sender_email):
         view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
         if view_url:
@@ -522,8 +526,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                     mime_type="application/pdf",
                     data=pdf_bytes,
                 ))
-                # msg.has_resume is now True via the property; classifier
-                # will route this to RESUME and the resume branch handles it.
+                indeed_quick_apply_attached = True
             else:
                 log.warning("  -> Indeed fetch failed; routing to Needs Human")
                 _flag_needs_human(
@@ -536,17 +539,26 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         # If no view_url: not a candidate application (admin notification, etc.) -- let classifier decide.
 
     # ----- Pre-filter #7: classifier -----
-    classifier_body = gmail_client.strip_quoted_text(msg.body_text)
-    if classifier_body != msg.body_text:
-        log.info("  -> stripped quoted text for classifier (%d -> %d chars)",
-                 len(msg.body_text), len(classifier_body))
-    cr = scorer.classify_inbound_email(
-        api_key=cfg.anthropic_api_key,
-        subject=msg.subject,
-        body=classifier_body,
-        sender_email=msg.sender_email,
-        has_attachment=msg.has_resume,
-    )
+    # Bypass the classifier entirely if Indeed Quick Apply already fetched
+    # and attached a resume PDF. We know it's a resume: sender is an Indeed
+    # candidate alias and the public resume download endpoint returned a
+    # real PDF. Running the classifier on the templated "New application"
+    # body would call it MISC and drop the candidate, even with the PDF.
+    if indeed_quick_apply_attached:
+        log.info("  -> classifier skipped: Indeed Quick Apply PDF attached, routing to RESUME")
+        cr = scorer.ClassifierResult(label="resume", confidence=0.99)
+    else:
+        classifier_body = gmail_client.strip_quoted_text(msg.body_text)
+        if classifier_body != msg.body_text:
+            log.info("  -> stripped quoted text for classifier (%d -> %d chars)",
+                     len(msg.body_text), len(classifier_body))
+        cr = scorer.classify_inbound_email(
+            api_key=cfg.anthropic_api_key,
+            subject=msg.subject,
+            body=classifier_body,
+            sender_email=msg.sender_email,
+            has_attachment=msg.has_resume,
+        )
     log.info("  -> classifier: label=%s confidence=%.2f has_attachment=%s",
              cr.label, cr.confidence, msg.has_resume)
 
