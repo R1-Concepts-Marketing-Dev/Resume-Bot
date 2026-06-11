@@ -458,6 +458,15 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     def _can_send(template_key: str) -> tuple[bool, str]:
         if not template_key:
             return False, "no template selected"
+        if _is_job_board_alias(msg.sender_email):
+            # Indeed (and other job-board) candidates are managed through
+            # the platform's own UI. Replying to the conversation alias
+            # lands the message inside Indeed's messaging thread, but
+            # employers run that workflow from Indeed's dashboard (Move
+            # stage, Send message, Not a fit). The bot scores them and
+            # adds them to the Indeed Queue tab; HR actions them in
+            # Indeed manually. No outbound auto-reply.
+            return False, "job-board candidate; HR engages via platform UI"
         if internal_forward:
             return False, "sender is internal; never reply to HR/internal addresses"
         if hr_manual:
@@ -795,9 +804,12 @@ def _process_resume_attachments(
         else:
             cross_fit_match = ""
 
+        is_indeed_candidate = _is_job_board_alias(msg.sender_email)
+        candidate_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
             {
+                "timestamp": candidate_timestamp,
                 "candidate_name": result["candidate_name"],
                 "email": _pick_candidate_email(result["candidate_email"], msg.sender_email),
                 "phone": result["candidate_phone"],
@@ -813,8 +825,23 @@ def _process_resume_attachments(
                 "drive_link": drive_link,
                 "gmail_link": msg.thread_link,
                 "recruiter_agency": result.get("recruiter_agency", "N/A"),
+                "indeed": is_indeed_candidate,
             },
         )
+        # Dual-write to the Indeed Queue tab: HR's focused worklist for
+        # candidates that need to be actioned inside Indeed's own
+        # dashboard. Same timestamp ties the row to the Candidates row
+        # so the VLOOKUP-based HR Status column auto-syncs.
+        if is_indeed_candidate:
+            sheets_client.append_indeed_queue(
+                sheets, cfg.sheet_id, "Indeed Queue",
+                {
+                    "timestamp": candidate_timestamp,
+                    "candidate_name": result["candidate_name"],
+                    "applied_for": applied_for,
+                    "decision": bucket,
+                },
+            )
 
         if cfg.shadow_mode:
             would_have_sent = template_key if template_key in templates else None
@@ -874,6 +901,12 @@ def _process_resume_attachments(
         return scored
 
     outcome_id = outcome_label_ids.get(final_bucket)
+    if outcome_id:
+        gmail_client.archive_with_outcome(
+            gmail, cfg.gmail_user, msg_id,
+            processed_label_id=label_id,
+            outcome_label_id=outcome_id,
+        )
     if outcome_id:
         gmail_client.archive_with_outcome(
             gmail, cfg.gmail_user, msg_id,
