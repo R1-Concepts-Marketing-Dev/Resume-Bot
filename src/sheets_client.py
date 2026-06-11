@@ -65,8 +65,8 @@ NEEDS_HUMAN_OPEN_STATUSES = {"Open", "Investigating", ""}
 # HR Status column is a VLOOKUP into Candidates by Timestamp so any HR
 # Status edits on Candidates flow through automatically.
 INDEED_QUEUE_HEADERS = [
-    "Candidate Name", "Position", "Fit Quality", "HR Status",
-    "Indeed Application Closed", "Timestamp",
+    "Candidate Name", "Position", "Fit Quality", "AI Recommendation",
+    "HR Status", "Indeed Application Closed", "Timestamp",
 ]
 
 
@@ -77,6 +77,17 @@ _INDEED_FIT_QUALITY = {
     "not_qualified":  "Not a fit",
     "pending_paused": "Hold - role paused",
     "unreadable":     "Unreadable resume",
+}
+
+
+# Decision -> recommended Indeed-platform action. HR uses this to decide
+# what to click inside Indeed's employer dashboard for each candidate.
+_INDEED_AI_RECOMMENDATION = {
+    "qualified":      "Move to interview stage",
+    "needs_review":   "Review resume + decide",
+    "not_qualified":  "Decline / Not a fit",
+    "pending_paused": "Hold - role paused",
+    "unreadable":     "Review manually",
 }
 
 
@@ -811,8 +822,9 @@ def append_indeed_queue(svc, sheet_id, tab, row):
     """Append a row to the Indeed Queue tab. Bot calls this for each
     Indeed candidate in addition to the regular Candidates write.
 
-    Columns: Candidate Name | Position | Fit Quality | HR Status
-    (formula) | Closed (checkbox FALSE default) | Timestamp (join key).
+    Columns: Candidate Name | Position | Fit Quality | AI Recommendation |
+    HR Status (formula) | Closed (checkbox FALSE default) | Timestamp
+    (join key).
 
     HR Status column gets a per-row VLOOKUP formula that pulls the HR
     Status cell from the matching Candidates row by timestamp. Edits to
@@ -822,22 +834,22 @@ def append_indeed_queue(svc, sheet_id, tab, row):
     timestamp = row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds")
     candidate_name = _safe(row.get("candidate_name") or "")
     position = _safe(row.get("applied_for") or "")
-    fit_quality = _INDEED_FIT_QUALITY.get(
-        row.get("decision", ""), row.get("decision", "")
-    )
+    decision = row.get("decision", "")
+    fit_quality = _INDEED_FIT_QUALITY.get(decision, decision)
+    ai_rec = _INDEED_AI_RECOMMENDATION.get(decision, "Review manually")
     # VLOOKUP by timestamp -> HR Status column on Candidates.
     # Candidates layout: A=Timestamp ... P=HR Status (column 16 in A:P).
     hr_status_formula = (
         f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:P,16,FALSE),"")'
     )
     values = [
-        candidate_name, position, _safe(fit_quality),
+        candidate_name, position, _safe(fit_quality), _safe(ai_rec),
         hr_status_formula, False, timestamp,
     ]
     try:
         svc.spreadsheets().values().append(
             spreadsheetId=sheet_id,
-            range=f"{tab}!A:F",
+            range=f"{tab}!A:G",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [values]},
