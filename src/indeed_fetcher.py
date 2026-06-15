@@ -112,7 +112,8 @@ def _unwrap_avanan(url: str) -> str | None:
             candidate_url = resp.url
             resp.close()
         except requests.RequestException as e:
-            log.warning("indeed_fetcher: avanan unwrap failed: %s", type(e).__name__)
+            log.warning("indeed_fetcher: avanan unwrap failed: %s url=%r",
+                        type(e).__name__, url[:200])
             return None
     host = (urlparse(candidate_url or "").hostname or "").lower()
     if "employers.indeed.com" in host:
@@ -121,19 +122,20 @@ def _unwrap_avanan(url: str) -> str | None:
         unwrapped = _recover_indeed_url_from_cts(candidate_url)
         if unwrapped:
             return unwrapped
-        # Diagnostic: log first path segment so we can see why decode failed.
+        # Diagnostic: log first path segment AND the source url so we can see why decode failed.
         try:
             _segs = [s for s in urlparse(candidate_url).path.split("/") if s]
             _blob = _segs[1][:80] if len(_segs) >= 2 else ""
             log.warning(
-                "indeed_fetcher: avanan -> %s recovery failed; segs=%d blob_head=%r",
-                host, len(_segs), _blob,
+                "indeed_fetcher: avanan -> %s recovery failed; segs=%d blob_head=%r cts_url=%r src=%r",
+                host, len(_segs), _blob, (candidate_url or "")[:200], url[:200],
             )
         except Exception:
-            log.warning("indeed_fetcher: avanan -> %s recovery failed", host)
+            log.warning("indeed_fetcher: avanan -> %s recovery failed src=%r", host, url[:200])
         return None
     log.warning(
-        "indeed_fetcher: avanan redirect did not land on Indeed (host=%s)", host,
+        "indeed_fetcher: avanan redirect did not land on Indeed (host=%s) candidate=%r src=%r",
+        host, (candidate_url or "")[:200], url[:200],
     )
     return None
 
@@ -222,7 +224,8 @@ def build_download_url(view_resume_url: str) -> str | None:
 def fetch_resume_pdf(view_resume_url: str) -> bytes | None:
     download_url = build_download_url(view_resume_url)
     if not download_url:
-        log.warning("indeed_fetcher: could not build download URL from view URL")
+        log.warning("indeed_fetcher: could not build download URL from view URL=%r",
+                    (view_resume_url or "")[:200])
         return None
     try:
         resp = requests.get(
@@ -235,21 +238,25 @@ def fetch_resume_pdf(view_resume_url: str) -> bytes | None:
             allow_redirects=True,
         )
     except requests.RequestException as e:
-        log.warning("indeed_fetcher: request failed: %s", type(e).__name__)
+        log.warning("indeed_fetcher: request failed: %s download_url=%r",
+                    type(e).__name__, download_url)
         return None
     if resp.status_code != 200:
-        log.warning("indeed_fetcher: HTTP %d from Indeed", resp.status_code)
+        log.warning("indeed_fetcher: HTTP %d from Indeed download_url=%r body_head=%r",
+                    resp.status_code, download_url, (resp.text or "")[:300])
         return None
     content_type = (resp.headers.get("content-type") or "").lower()
     if "pdf" not in content_type:
-        log.warning("indeed_fetcher: unexpected content-type=%r", content_type)
+        log.warning("indeed_fetcher: unexpected content-type=%r download_url=%r body_head=%r",
+                    content_type, download_url, (resp.text or "")[:300])
         return None
     body = resp.content
     if not body:
-        log.warning("indeed_fetcher: empty response body")
+        log.warning("indeed_fetcher: empty response body download_url=%r", download_url)
         return None
     if not body.startswith(b"%PDF"):
-        log.warning("indeed_fetcher: response body is not a PDF (first=%r)", body[:8])
+        log.warning("indeed_fetcher: response body is not a PDF (first=%r) download_url=%r",
+                    body[:8], download_url)
         return None
     if len(body) > _MAX_PDF_BYTES:
         log.warning("indeed_fetcher: PDF too large (%d bytes)", len(body))
