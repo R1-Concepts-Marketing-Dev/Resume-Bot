@@ -126,14 +126,22 @@ def migrate_candidates(svc, sheet_id):
         log.info("Migration already complete. Skipping Candidates restructure.")
         return
 
-    idx_r = headers.index("Recruiter/Agency") if "Recruiter/Agency" in headers else None
-    idx_s = headers.index("Indeed") if "Indeed" in headers else None
-    idx_u = headers.index("Application Submitted") if "Application Submitted" in headers else None
-    log.info("Found old indexes: R=%s S=%s U=%s", idx_r, idx_s, idx_u)
+    # Headers in the live sheet have drifted (extra spaces, junk cells from
+    # stale filter-range hints, etc.). Use POSITIONAL indexes from the
+    # documented old layout instead of header lookup:
+    #   R=col 18 (0-idx 17) = Recruiter/Agency
+    #   S=col 19 (0-idx 18) = Indeed
+    #   T=col 20 (0-idx 19) = Indeed Action Done
+    #   U=col 21 (0-idx 20) = Application Submitted (added recently)
+    idx_r = 17 if len(headers) > 17 else None
+    idx_s = 18 if len(headers) > 18 else None
+    idx_u = 20 if len(headers) > 20 else None
+    log.info("Using positional indexes: R=%s S=%s U=%s (headers had %s cols)",
+             idx_r, idx_s, idx_u, len(headers))
 
-    if idx_r is None or idx_s is None:
+    if idx_r is None:
         raise RuntimeError(
-            f"Expected old headers Recruiter/Agency and Indeed missing. Got: {headers}"
+            f"Candidates only has {len(headers)} cols; expected >=18. Got: {headers}"
         )
 
     # Compute Application Submitted values for every row.
