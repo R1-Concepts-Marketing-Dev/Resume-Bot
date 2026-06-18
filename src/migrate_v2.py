@@ -1411,6 +1411,77 @@ def dump_all_tabs_state(svc, sheet_id):
             audited,
         ])
 
+    # Compute Candidates-specific deep stats for the report
+    candidates_stats_rows = [
+        ["", "", "", "", "", "", "", ""],
+        ["CANDIDATES DEEP STATS", "", "", "", "", "", "", ""],
+    ]
+    try:
+        c_resp2 = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=f"{CANDIDATES_TAB}!A2:R",
+        ).execute()
+        c_rows2 = c_resp2.get("values", []) or []
+        non_empty2 = [r for r in c_rows2 if r and str(r[0]).strip()]
+        candidates_stats_rows.append(["Total data rows (incl. hidden)", str(len(non_empty2)),
+                                       "", "", "", "", "", ""])
+
+        from collections import Counter as _C
+        appsub_c = _C()
+        hr_c = _C()
+        terminal_n = 0
+        terminal_set = {"Hired","Rejected","Not a fit","Closed","Withdrawn",
+                        "Declined","Move forward","Interviewing","Offer Extended"}
+        for r in non_empty2:
+            r = (r + [""]*18)[:18]
+            appsub_c[r[4] or "(blank)"] += 1
+            hr_c[r[16] or "(blank)"] += 1
+            if (r[16] or "").strip() in terminal_set:
+                terminal_n += 1
+
+        candidates_stats_rows.append(["Terminal HR Status (should be hidden)",
+                                       str(terminal_n), "", "", "", "", "", ""])
+        candidates_stats_rows.append(["", "", "", "", "", "", "", ""])
+        candidates_stats_rows.append(["Application Submitted breakdown:",
+                                       "", "", "", "", "", "", ""])
+        for k, v in appsub_c.most_common():
+            candidates_stats_rows.append(["  " + str(k), str(v),
+                                          "", "", "", "", "", ""])
+        candidates_stats_rows.append(["", "", "", "", "", "", "", ""])
+        candidates_stats_rows.append(["HR Status breakdown:",
+                                       "", "", "", "", "", "", ""])
+        for k, v in hr_c.most_common():
+            candidates_stats_rows.append(["  " + str(k), str(v),
+                                          "", "", "", "", "", ""])
+
+        # Count rows actually hidden via metadata
+        try:
+            meta_resp2 = svc.spreadsheets().get(
+                spreadsheetId=sheet_id,
+                ranges=[f"{CANDIDATES_TAB}!A:A"],
+                fields="sheets(properties.title,data.rowMetadata.hiddenByUser)",
+            ).execute()
+            hidden_total = 0
+            for sh in meta_resp2.get("sheets", []):
+                if (sh.get("properties") or {}).get("title") != CANDIDATES_TAB:
+                    continue
+                for blk in sh.get("data") or []:
+                    for rm in blk.get("rowMetadata") or []:
+                        if rm.get("hiddenByUser"):
+                            hidden_total += 1
+            candidates_stats_rows.append(["", "", "", "", "", "", "", ""])
+            candidates_stats_rows.append(["Rows hidden by user (metadata count)",
+                                          str(hidden_total),
+                                          "", "", "", "", "", ""])
+        except Exception as e:
+            candidates_stats_rows.append(["(hidden count failed)", str(e)[:60],
+                                          "", "", "", "", "", ""])
+
+    except Exception as e:
+        candidates_stats_rows.append(["(stats failed)", str(e)[:80],
+                                      "", "", "", "", "", ""])
+
+    report_rows.extend(candidates_stats_rows)
+
     try:
         # Clear the tab then write the report
         svc.spreadsheets().values().clear(
