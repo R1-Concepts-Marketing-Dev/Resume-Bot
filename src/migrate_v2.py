@@ -278,14 +278,32 @@ def fix_indeed_queue_formulas(svc, sheet_id):
 
 
 def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
-    """The Cross-Match tab uses a QUERY against Candidates that references
-    columns by position. After the restructure the column positions
-    shifted, so we re-write the QUERY formula in A2 to use the new
-    positions. The QUERY surfaces rows where Cross-Fit Flag (col I,
-    not_qualified) was set to the rocket-light emoji.
+    """Rewrite the Cross-Match QUERY in A2 to match the user's existing
+    row 1 headers exactly:
 
-    Idempotent: if there's no Cross-Match tab or the cell already has a
-    well-formed query, this is a no-op."""
+      A Timestamp | B Applied For | C Better Match | D Candidate N |
+      E Email | F Phone | G Confidence | H AI Reasoning |
+      I Drive | J Gmail | K HR Status | L HR Notes
+
+    Mapping (Cross-Match col -> Candidates col):
+      A Timestamp     <- Candidates!A
+      B Applied For   <- Candidates!G
+      C Better Match  <- Candidates!H (Cross-Fit Match)
+      D Candidate N   <- Candidates!B
+      E Email         <- Candidates!C
+      F Phone         <- Candidates!D
+      G Confidence    <- Candidates!M
+      H AI Reasoning  <- Candidates!N
+      I Drive         <- Candidates!O
+      J Gmail         <- Candidates!P
+      K HR Status     <- Candidates!Q
+      L HR Notes      <- Candidates!R
+
+    Filter: rows where Cross-Fit Flag (Candidates!I) is the rocket emoji
+    AND HR Status (Candidates!Q) is empty (HR hasn't actioned yet).
+    Ordered by Timestamp DESC. Uses header_count=0 so QUERY does NOT
+    inject its own header row -- the user's row 1 manual headers are
+    the only headers."""
     try:
         meta = svc.spreadsheets().get(
             spreadsheetId=sheet_id,
@@ -300,30 +318,16 @@ def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
         log.info("No %s tab; skipping cross-match QUERY fix.", tab)
         return
 
-    # Read what's currently in A2 (the QUERY entry point).
-    try:
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=f"{tab}!A2",
-            valueRenderOption="FORMULA",
-        ).execute()
-    except Exception as e:
-        log.warning("Could not read %s!A2: %s", tab, e)
-        return
-    current = ((resp.get("values") or [[]])[0] or [""])[0] if resp.get("values") else ""
-    log.info("%s!A2 current: %s", tab, str(current)[:200])
-
-    # New layout columns we want surfaced (rocket cross-fit flag = col I,
-    # name = B, applied for = G, drive link = O, HR status = Q, etc.).
-    # We surface: Timestamp, Name, Applied For, Cross-Fit Match, Cross-Fit Flag,
-    # Decision, HR Status, Drive Link, Gmail Link.
+    # Build QUERY that maps Candidates cols A,G,H,B,C,D,M,N,O,P,Q,R
+    # in the order that matches the user's 12-col Cross-Match header row.
+    # header_count=0 -- no extra header row added by QUERY.
+    rocket = "\U0001F6A8"  # 🚨
     new_query = (
-        '=QUERY(Candidates!A1:R, '
-        '"SELECT A,B,G,H,I,J,Q,O,P WHERE I = \'\U0001F6A8\' '
+        '=QUERY(Candidates!A2:R, '
+        '"SELECT A, G, H, B, C, D, M, N, O, P, Q, R '
+        'WHERE I = \'' + rocket + '\' '
         'AND (Q IS NULL OR Q = \'\') '
-        'ORDER BY A DESC LABEL A \'Timestamp\', B \'Candidate\', '
-        'G \'Applied For\', H \'Cross-Fit Match\', I \'Cross-Fit Flag\', '
-        'J \'Bot Decision\', Q \'HR Status\', O \'Drive\', P \'Gmail\'", 1)'
+        'ORDER BY A DESC", 0)'
     )
 
     svc.spreadsheets().values().update(
@@ -332,24 +336,7 @@ def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
         valueInputOption="USER_ENTERED",
         body={"values": [[new_query]]},
     ).execute()
-    log.info("%s!A2 QUERY rewritten for new layout.", tab)
-
-
-# Decision -> Fit Quality / AI Recommendation (mirror sheets_client.py)
-_FIT_QUALITY = {
-    "qualified":      "Strong",
-    "needs_review":   "Needs review",
-    "not_qualified":  "Not a fit",
-    "pending_paused": "Hold - role paused",
-    "unreadable":     "Unreadable resume",
-}
-_AI_RECOMMENDATION = {
-    "qualified":      "Move to interview stage",
-    "needs_review":   "Review resume + decide",
-    "not_qualified":  "Decline / Not a fit",
-    "pending_paused": "Hold - role paused",
-    "unreadable":     "Review manually",
-}
+    log.info("%s!A2 QUERY rewritten -- 12 columns matching user headers.", tab)
 
 
 def _is_indeed_candidate(row):
