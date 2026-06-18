@@ -1,0 +1,46 @@
+name: Resume bot - weekly audit
+
+on:
+  schedule:
+    # Every Monday at 14:00 UTC (7:00 AM PT) -- after the weekend so the
+    # past 7 days' HR actions are fully reflected before the audit reads them.
+    - cron: "0 14 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run weekly audit
+        env:
+          SHEET_ID:              ${{ secrets.SHEET_ID }}
+          OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN:   ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER:            ${{ secrets.GMAIL_USER }}
+          # Audit window: how far back to look at HR actions.
+          AUDIT_WINDOW_DAYS:     "7"
+          LEARNING_LOG_TAB:      "Bot Learning Log"
+        run: python -m src.audit
