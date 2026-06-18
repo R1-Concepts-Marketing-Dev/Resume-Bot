@@ -861,6 +861,8 @@ def backfill_emails(svc, sheet_id, drive_svc, anthropic_key="",
             no_drive_link += 1
             if len(sample_empty_no_drive) < 5:
                 sample_empty_no_drive.append(i)
+            updates.append({"range": f"{tab}!C{i}",
+                            "values": [["Email not included"]]})
             continue
         extracted = _extract_email_from_drive(drive_svc, drive_link, anthropic_api_key=anthropic_key)
         if extracted:
@@ -875,6 +877,8 @@ def backfill_emails(svc, sheet_id, drive_svc, anthropic_key="",
             no_email_in_pdf += 1
             if len(sample_no_email) < 5:
                 sample_no_email.append(i)
+            updates.append({"range": f"{tab}!C{i}",
+                            "values": [["Email not included"]]})
 
     if updates:
         svc.spreadsheets().values().batchUpdate(
