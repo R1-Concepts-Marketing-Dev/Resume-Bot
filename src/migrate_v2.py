@@ -1123,6 +1123,94 @@ def audit_all_tabs(svc, sheet_id):
         log.info("No fatal refs to deleted cols found.")
 
 
+def dump_all_tabs_state(svc, sheet_id):
+    """Walk every tab and log its header row + first data row + total
+    row count + formula count. Used as a sanity check after migrations.
+    Anything anomalous (empty headers, broken formulas, fewer cols than
+    expected) will be obvious in the report."""
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load sheet metadata: %s", e)
+        return
+
+    log.info("======== TAB STATE DUMP ========")
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        title = props.get("title", "")
+        grid = props.get("gridProperties") or {}
+        row_count = grid.get("rowCount", 0)
+        col_count = grid.get("columnCount", 0)
+
+        log.info("--- Tab: %s  (grid: %d rows x %d cols) ---",
+                 title, row_count, col_count)
+
+        # Header row + first data row, values
+        try:
+            v_resp = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"\'{title}\'!A1:Z2",
+            ).execute()
+            v_rows = v_resp.get("values", []) or []
+            header = v_rows[0] if v_rows else []
+            data1  = v_rows[1] if len(v_rows) > 1 else []
+            log.info("  Header row (%d cols): %s", len(header), header)
+            log.info("  First data row    : %s",
+                     [str(c)[:60] for c in data1])
+        except Exception as e:
+            log.warning("  Could not read values: %s", e)
+            continue
+
+        # Formula scan on first 100 rows
+        try:
+            f_resp = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"\'{title}\'!A1:Z100",
+                valueRenderOption="FORMULA",
+            ).execute()
+            f_rows = f_resp.get("values", []) or []
+            formulas = []
+            for ri, row in enumerate(f_rows, start=1):
+                for ci, cell in enumerate(row):
+                    cv = str(cell or "")
+                    if cv.startswith("="):
+                        formulas.append((ri, ci, cv))
+            log.info("  Formulas in first 100 rows: %d", len(formulas))
+            # Log first 5 unique formula patterns
+            seen = set()
+            for ri, ci, cv in formulas:
+                pattern = cv[:120]
+                if pattern in seen:
+                    continue
+                seen.add(pattern)
+                log.info("    sample: %s%d -> %s",
+                         _col_letter(ci+1), ri, pattern)
+                if len(seen) >= 5:
+                    break
+            # Flag stale references
+            for ri, ci, cv in formulas:
+                low = cv.lower()
+                # References to old HR Status position
+                if "candidates!a:p" in low and ",16" in low.replace(" ", ""):
+                    log.warning("    STALE A:P,16 reference at %s%d: %s",
+                                _col_letter(ci+1), ri, cv[:120])
+                # References to deleted cols (anything Candidates!R/S/T
+                # past row 1, since those cols are gone -- exclude pattern
+                # like "Candidates!R" used as "Candidates!R{row}" though
+                # that's also a deleted ref now).
+                m = _re.search(r"Candidates(?:\'?)!([RST])(\d|:|$)", cv)
+                if m and not _re.search(r"Candidates(?:\'?)!R(?![A-Z])\b", cv):
+                    log.warning("    REF TO DELETED COL at %s%d: %s",
+                                _col_letter(ci+1), ri, cv[:120])
+        except Exception as e:
+            log.warning("  Could not read formulas: %s", e)
+
+    log.info("======== END TAB STATE DUMP ========")
+
+
 def run() -> int:
     cfg = config.load()
     log.info("Migration starting. Sheet=%s", cfg.sheet_id)
@@ -1161,6 +1249,9 @@ def run() -> int:
 
     log.info("STEP 8: Audit all other tabs + auto-fix formulas pointing at old layout")
     audit_all_tabs(svc, cfg.sheet_id)
+
+    log.info("STEP 9: Final state dump of every tab")
+    dump_all_tabs_state(svc, cfg.sheet_id)
 
     log.info("Migration complete.")
     return 0
