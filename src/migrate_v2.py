@@ -894,6 +894,159 @@ def inspect_row(svc, sheet_id, tab, row_number):
         log.info("  %s: %r", h, val)
 
 
+def audit_all_tabs(svc, sheet_id):
+    """Walk every tab in the spreadsheet and scan all formulas for
+    references to Candidates columns. Identifies and auto-fixes ones
+    that point at the OLD (pre-restructure) layout:
+
+      A:P, 16              -> A:Q, 17     (HR Status moved)
+      A:R range            -> A:R         (no change; new layout ends at R)
+      Candidates!E:E       -> Candidates!F:F (old Filename was E; now F)
+      Candidates!F:F       -> Candidates!G:G (old Applied For)
+      ... etc. for every old col that shifted right by 1
+
+    Skips: the Candidates tab itself (its own header row), any tab that
+    has no formulas, Apps Script-bound triggers (those are server-side).
+
+    Reports all formula touches and any patterns it couldn't auto-fix.
+    """
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load sheet metadata for audit: %s", e)
+        return
+
+    # The shift map for columns that moved right by 1 after the insert at E.
+    # Old letter -> new letter. (Letters of cols that don't shift, like A-D,
+    # are not in the map.) Old R/S/T were deleted, so any reference to them
+    # is FATAL -- we report it but cannot auto-fix.
+    shift_map = {
+        "E": "F",  # Filename
+        "F": "G",  # Applied For
+        "G": "H",  # Cross-Fit Match
+        "H": "I",  # Cross-Fit Flag
+        "I": "J",  # Decision
+        "J": "K",  # Years Exp
+        "K": "L",  # Job Hopping
+        "L": "M",  # Confidence
+        "M": "N",  # AI Reasoning
+        "N": "O",  # Drive Link
+        "O": "P",  # Gmail Link
+        "P": "Q",  # HR Status
+        "Q": "R",  # HR Notes
+    }
+    deleted_letters = {"R", "S", "T", "U"}  # old Recruiter/Indeed/IndeedActionDone/AppSub
+
+    fix_summary = {
+        "tabs_scanned": 0,
+        "formulas_seen": 0,
+        "patched": 0,
+        "patched_examples": [],
+        "fatal_refs": [],  # references to deleted cols R/S/T/U
+    }
+
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        title = props.get("title", "")
+        if not title or title in ("Candidates", "Inbox Log",
+                                  "Archive - Misc", "Bot Errors",
+                                  "Bot Learning Log", "Templates"):
+            # Tabs the bot owns end-to-end -- their own writes are correct,
+            # no user formulas to worry about.
+            continue
+        fix_summary["tabs_scanned"] += 1
+        log.info("--- Auditing tab: %s ---", title)
+
+        try:
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"\'{title}\'!A1:Z1000",  # scan first 1000 rows, 26 cols
+                valueRenderOption="FORMULA",
+            ).execute()
+        except Exception as e:
+            log.warning("Could not read tab %s: %s", title, e)
+            continue
+
+        rows = resp.get("values", []) or []
+        updates = []
+        for ri, row in enumerate(rows, start=1):
+            for ci, cell in enumerate(row):
+                cv = str(cell or "")
+                if not cv.startswith("="):
+                    continue
+                fix_summary["formulas_seen"] += 1
+                if "Candidates!" not in cv and "Candidates'!" not in cv:
+                    continue
+                # Look for fatal refs to deleted cols
+                for dl in deleted_letters:
+                    pat = _re.search(
+                        rf"Candidates(?:\'!|!)({dl}\d*:?{dl}?\d*|{dl}\d*\b)", cv)
+                    if pat:
+                        fix_summary["fatal_refs"].append(
+                            f"{title}!{_col_letter(ci+1)}{ri}: {cv[:120]}")
+                        break
+                # Apply known fixes
+                fixed = cv
+                # 1. A:P, 16 -> A:Q, 17 (HR Status VLOOKUP idiom)
+                fixed = _re.sub(
+                    r"Candidates(\'?)!A:P,\s*16",
+                    r"Candidates\1!A:Q,17",
+                    fixed)
+                # 2. Single-letter col references in Candidates!X:X or
+                #    Candidates!X## form -- ONLY for columns that exist
+                #    in the new layout (skip deleted letters).
+                def shift_ref(match):
+                    prefix = match.group(1)
+                    letter = match.group(2)
+                    rest = match.group(3) or ""
+                    if letter in shift_map:
+                        return f"Candidates{prefix}!{shift_map[letter]}{rest}"
+                    return match.group(0)
+                fixed = _re.sub(
+                    r"Candidates(\'?)!([A-Z])(\d*|:[A-Z]\d*)",
+                    shift_ref,
+                    fixed)
+                if fixed != cv:
+                    cell_addr = f"{_col_letter(ci+1)}{ri}"
+                    updates.append({
+                        "range": f"\'{title}\'!{cell_addr}",
+                        "values": [[fixed]]
+                    })
+                    fix_summary["patched"] += 1
+                    if len(fix_summary["patched_examples"]) < 10:
+                        fix_summary["patched_examples"].append(
+                            f"{title}!{cell_addr}: {cv[:80]} -> {fixed[:80]}")
+
+        if updates:
+            try:
+                svc.spreadsheets().values().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={"data": updates,
+                          "valueInputOption": "USER_ENTERED"},
+                ).execute()
+                log.info("Patched %d formula(s) on tab %s", len(updates), title)
+            except Exception as e:
+                log.warning("Could not write patches on %s: %s", title, e)
+
+    log.info("--- AUDIT SUMMARY ---")
+    log.info("Tabs scanned: %d", fix_summary["tabs_scanned"])
+    log.info("Formulas seen: %d", fix_summary["formulas_seen"])
+    log.info("Formulas patched: %d", fix_summary["patched"])
+    for ex in fix_summary["patched_examples"]:
+        log.info("  patched: %s", ex)
+    if fix_summary["fatal_refs"]:
+        log.warning("FATAL refs to deleted cols R/S/T/U (need manual review):")
+        for ref in fix_summary["fatal_refs"][:20]:
+            log.warning("  %s", ref)
+        if len(fix_summary["fatal_refs"]) > 20:
+            log.warning("  ... and %d more", len(fix_summary["fatal_refs"]) - 20)
+    else:
+        log.info("No fatal refs to deleted cols found.")
+
+
 def run() -> int:
     cfg = config.load()
     log.info("Migration starting. Sheet=%s", cfg.sheet_id)
@@ -928,6 +1081,9 @@ def run() -> int:
 
     log.info("STEP 7: Hide rows with terminal HR Status (replacement for Apps Script onEdit)")
     hide_terminal_rows(svc, cfg.sheet_id)
+
+    log.info("STEP 8: Audit all other tabs + auto-fix formulas pointing at old layout")
+    audit_all_tabs(svc, cfg.sheet_id)
 
     log.info("Migration complete.")
     return 0
