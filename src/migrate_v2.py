@@ -441,6 +441,24 @@ def enrich_indeed_from_gmail(svc, sheet_id, gmail_svc, gmail_user,
              examined, upgraded, failed)
 
 
+# Decision -> Fit Quality and AI Recommendation lookups.
+# Used by backfill_indeed_queue and backfill_indeed_queue_columns.
+_FIT_QUALITY = {
+    "qualified":      "Strong",
+    "needs_review":   "Needs review",
+    "not_qualified":  "Not a fit",
+    "pending_paused": "Hold - role paused",
+    "unreadable":     "Unreadable resume",
+}
+_AI_RECOMMENDATION = {
+    "qualified":      "Move to interview stage",
+    "needs_review":   "Review resume + decide",
+    "not_qualified":  "Decline / Not a fit",
+    "pending_paused": "Hold - role paused",
+    "unreadable":     "Review manually",
+}
+
+
 def backfill_indeed_queue(svc, sheet_id):
     """Step 3: walk Candidates after migration, and for every row that
     looks like an Indeed candidate (per _is_indeed_candidate -- uses
