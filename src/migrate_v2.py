@@ -684,6 +684,37 @@ def _is_job_board_email(addr: str) -> bool:
     return any(domain == d or domain.endswith("." + d) for d in _JOB_BOARD_DOMAINS)
 
 
+_EMAIL_PROVIDERS = (
+    "gmail", "yahoo", "hotmail", "outlook", "aol", "icloud", "live",
+    "msn", "protonmail", "ymail", "comcast", "verizon", "att",
+    "sbcglobal", "cox", "charter", "earthlink", "mac", "qq",
+)
+_INDEED_ALIAS_TLDS = ("com", "net", "org", "co", "edu", "us")
+_INDEED_ALIAS_RE = _re.compile(
+    r"^(?P<local>.+?)(?P<prov>" + "|".join(_EMAIL_PROVIDERS) + r")"
+    r"(?P<tld>" + "|".join(_INDEED_ALIAS_TLDS) + r")"
+    r"(?:[_0-9a-z-]+)?@indeedemail\.com$",
+    _re.IGNORECASE,
+)
+
+
+def _decode_indeed_alias(addr):
+    """Indeed encodes the candidate's real email in the local part of
+    its @indeedemail.com relay aliases:
+        whitedaytona1988yahoocom9_nqm@indeedemail.com
+        -> whitedaytona1988@yahoo.com
+    Returns the decoded address or empty string on no match."""
+    if not addr or "@indeedemail.com" not in addr.lower():
+        return ""
+    m = _INDEED_ALIAS_RE.match(addr.strip().lower())
+    if not m:
+        return ""
+    local = m.group("local").rstrip("._-")
+    if not local:
+        return ""
+    return local + "@" + m.group("prov") + "." + m.group("tld")
+
+
 def _extract_email_from_drive(drive_svc, drive_cell: str, anthropic_api_key: str = "") -> str:
     """Pull the candidate email out of the resume PDF stored on Drive.
 
@@ -717,6 +748,9 @@ def _extract_email_from_drive(drive_svc, drive_cell: str, anthropic_api_key: str
     if text:
         for match in _EMAIL_REGEX.findall(text):
             addr = match.strip().rstrip(".,;:")
+            decoded = _decode_indeed_alias(addr)
+            if decoded:
+                return decoded
             if not _is_job_board_email(addr):
                 return addr
 
@@ -752,7 +786,7 @@ def _ask_claude_for_email(api_key: str, pdf_bytes: bytes) -> str:
         "(jobs@, hr@, info@), or job-board relay aliases (anything "
         "@indeed.com, @indeedemail.com, @ziprecruiter.com, @glassdoor.com, "
         "@monster.com, @careerbuilder.com, @snagajob.com). Return ONLY "
-        "the candidate's personal email. No prose, no code fences."
+        "the candidate's real email. CRITICAL: if the resume header shows an @indeedemail.com address like 'johnsmithgmailcom_xyz@indeedemail.com', that IS the candidate's email -- Indeed encoded it. Decode pattern: <localpart><provider><tld><suffix>@indeedemail.com where @ and . were stripped. Example: whitedaytona1988yahoocom9_nqm@indeedemail.com -> whitedaytona1988@yahoo.com. Common providers: gmail, yahoo, hotmail, outlook, aol, icloud. Common TLDs: com, net, org. Return the DECODED address, never the @indeedemail.com one. No prose, no code fences."
     )
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
