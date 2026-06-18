@@ -1714,10 +1714,11 @@ def run() -> int:
     fix_pending_query(svc, cfg.sheet_id)
     backfill_indeed_queue_columns(svc, cfg.sheet_id)
 
-    log.info("STEP 3: Indeed Queue rebuild (Gmail enrichment then full wipe + repopulate)")
+    log.info("STEP 3: Indeed Queue rebuild (Gmail enrichment then full wipe + repopulate + final orphan sweep)")
     gmail_svc = google_auth.gmail(creds)
     enrich_indeed_from_gmail(svc, cfg.sheet_id, gmail_svc, cfg.gmail_user)
     rebuild_indeed_queue(svc, cfg.sheet_id)
+    clean_indeed_queue_orphans(svc, cfg.sheet_id)
 
     log.info("STEP 4: Gmail link backfill (authuser=jobs@)")
     backfill_gmail_links(svc, cfg.sheet_id)
