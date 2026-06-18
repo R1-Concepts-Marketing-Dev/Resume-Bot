@@ -957,14 +957,24 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
 
 
 def clean_indeed_queue_orphans(svc, sheet_id):
-    """Indeed Queue rows where Timestamp is set but Candidate Name is
-    empty would block backfill_indeed_queue from appending fresh rows
-    (the dedupe-by-timestamp check would see those timestamps and skip
-    the corresponding Candidates row).
+    """Indeed Queue cleanup. Removes two kinds of garbage:
 
-    This step finds such orphan rows and CLEARS their Timestamp cell
-    (col G), freeing the backfill to re-add the row from Candidates.
-    Idempotent."""
+    (a) Orphan rows where Timestamp is set but Name is empty -- these
+        block backfill's dedupe-by-timestamp check from re-adding the
+        candidate. We clear the timestamp so the backfill is free to
+        re-add the row.
+
+    (b) Duplicate empty-timestamp rows where Name is set but Timestamp
+        is empty. These are the leftover OLD copies after a previous
+        backfill produced new rows. We delete these rows entirely (use
+        deleteDimension on the row range, batched in reverse order so
+        indexes stay stable).
+
+    Idempotent: subsequent runs find nothing to do."""
+    inner_id = _get_sheet_id(svc, sheet_id, INDEED_QUEUE_TAB)
+    if inner_id is None:
+        log.warning("Could not find Indeed Queue sheet id")
+        return
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
@@ -974,25 +984,49 @@ def clean_indeed_queue_orphans(svc, sheet_id):
         log.warning("Could not read Indeed Queue: %s", e)
         return
     rows = resp.get("values", []) or []
-    cleared = []
+
+    cleared = []                 # value updates: clear G on (no-name, ts)
+    rows_to_delete = []          # row numbers to delete (no-ts, has-name)
     for i, r in enumerate(rows, start=2):
         r = (r + [""] * 7)[:7]
         name = str(r[0]).strip()
         ts = str(r[6]).strip()
         if (not name) and ts:
-            # Orphan: timestamp without name -> clear the timestamp.
             cleared.append({"range": f"{INDEED_QUEUE_TAB}!G{i}",
                             "values": [[""]]})
+        elif name and (not ts):
+            rows_to_delete.append(i)
 
     if cleared:
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
             body={"data": cleared, "valueInputOption": "USER_ENTERED"},
         ).execute()
-        log.info("Cleared timestamp on %d orphan Indeed Queue rows (now backfill can re-add).",
+        log.info("Cleared timestamp on %d (no-name, ts) rows.",
                  len(cleared))
-    else:
-        log.info("No orphan Indeed Queue rows found.")
+
+    if rows_to_delete:
+        # Delete in DESCENDING order so prior indices stay valid.
+        delete_requests = []
+        for row_num in sorted(rows_to_delete, reverse=True):
+            delete_requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": inner_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_num - 1,
+                        "endIndex": row_num,
+                    }
+                }
+            })
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": delete_requests},
+        ).execute()
+        log.info("Deleted %d empty-timestamp duplicate rows: %s",
+                 len(rows_to_delete), rows_to_delete)
+    if not cleared and not rows_to_delete:
+        log.info("Indeed Queue has no orphans or dup-empty-ts rows.")
 
 
 def backfill_indeed_queue_columns(svc, sheet_id):
