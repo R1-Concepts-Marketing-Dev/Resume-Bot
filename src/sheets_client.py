@@ -27,12 +27,12 @@ class Template:
 
 
 DASHBOARD_HEADERS = [
-    "Timestamp", "Candidate Name", "Email", "Phone", "Original Filename",
+    "Timestamp", "Candidate Name", "Email", "Phone",
+    "Application Submitted",  # E -- Email / Indeed / Craigslist / "Recruiter/Agency - {name}"
+    "Original Filename",
     "Applied For", "Cross-Fit Match", "Cross-Fit Flag", "Decision",
     "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
     "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
-    "Recruiter/Agency", "Indeed", "Indeed Action Done",
-    "Application Submitted",
 ]
 
 
@@ -734,10 +734,12 @@ def load_recent_inbox_senders(svc, sheet_id, tab, hours_back=24):
 
 
 def load_processed_thread_ids(svc, sheet_id, tab):
+    # Gmail Thread Link lives in column P (was column O before the
+    # 2026-06-18 restructure that added Application Submitted at E).
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range=f"{tab}!O2:O",
+            range=f"{tab}!P2:P",
             valueRenderOption="FORMULA",
         ).execute()
     except Exception:
@@ -777,29 +779,29 @@ def append_error(svc, sheet_id, tab, row):
 
 
 def append_candidate(svc, sheet_id, tab, row):
-    """Append a candidate row to the Candidates dashboard (columns A:U).
+    """Append a candidate row to the Candidates dashboard (columns A:R).
 
-    Indeed column (S): "Yes" if the candidate came in via a job-board
-    alias (Indeed conversation-*@indeed.com etc.), else "No". Used by the
-    Indeed Queue tab as a filter signal.
+    Application Submitted (E): Where the application came from. One of
+    "Email", "Indeed", "Craigslist", or "Recruiter/Agency - {name}"
+    (with the actual agency name extracted by the scorer when known).
+    Computed in main.py from sender + scorer recruiter_agency signal +
+    body keyword match for Craigslist.
 
-    Indeed Action Done (T): HR-managed; bot writes empty. Once HR has
-    moved/declined the candidate inside Indeed's dashboard they tick
-    this; the Indeed Queue's filter view then hides the row.
-
-    Application Submitted (U): Where the application came from --
-    one of Email / Indeed / Recruiter-Agency / Craigslist. Bot
-    computes this from sender + recruiter_agency scorer signal +
-    body keyword match for Craigslist. Defaults to Email when no
-    other signal triggers.
+    The Recruiter/Agency column, Indeed boolean, and Indeed Action Done
+    columns from the prior layout were collapsed into this single
+    Application Submitted column on 2026-06-18 -- the per-source detail
+    they carried is now either in Application Submitted itself (recruiter
+    name) or available via filter on Application Submitted=Indeed
+    (Indeed Queue tab) so the dedicated boolean/checkbox columns were
+    redundant.
     """
-    recruiter_agency = (row.get("recruiter_agency") or "N/A").strip() or "N/A"
     application_submitted = (row.get("application_submitted") or "Email").strip() or "Email"
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         _safe(row.get("candidate_name", "")),
         _safe(row.get("email", "")),
         _safe(row.get("phone", "")),
+        _safe(application_submitted),  # E: Application Submitted
         _safe(row.get("filename", "")),
         _safe(row.get("applied_for", "")),
         _safe(row.get("cross_fit_match", "")),
@@ -811,16 +813,12 @@ def append_candidate(svc, sheet_id, tab, row):
         _safe(row.get("reasoning", "")),
         _hyperlink(row.get("drive_link", "")),
         _hyperlink(row.get("gmail_link", "")),
-        "",  # HR Status (HR fills in)
-        "",  # HR Notes (HR fills in)
-        _safe(recruiter_agency),
-        "Yes" if row.get("indeed") else "No",
-        "",  # Indeed Action Done (HR fills in)
-        _safe(application_submitted),  # Application Submitted (Email/Indeed/Recruiter-Agency/Craigslist)
+        "",  # Q: HR Status (HR fills in)
+        "",  # R: HR Notes (HR fills in)
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A:U",
+        range=f"{tab}!A:R",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
@@ -847,9 +845,10 @@ def append_indeed_queue(svc, sheet_id, tab, row):
     fit_quality = _INDEED_FIT_QUALITY.get(decision, decision)
     ai_rec = _INDEED_AI_RECOMMENDATION.get(decision, "Review manually")
     # VLOOKUP by timestamp -> HR Status column on Candidates.
-    # Candidates layout: A=Timestamp ... P=HR Status (column 16 in A:P).
+    # Candidates layout (post 2026-06-18 restructure):
+    # A=Timestamp ... Q=HR Status (column 17 in A:Q).
     hr_status_formula = (
-        f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:P,16,FALSE),"")'
+        f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:Q,17,FALSE),"")'
     )
     values = [
         candidate_name, position, _safe(fit_quality), _safe(ai_rec),
@@ -865,3 +864,165 @@ def append_indeed_queue(svc, sheet_id, tab, row):
         ).execute()
     except Exception as e:
         log.warning("Failed to append to %s tab: %s", tab, e)
+
+
+# ============================================================
+# Bot Learning Log -- audit feedback for scorer few-shot context
+# ============================================================
+#
+# Weekly audit (src/audit.py) writes rows here when the scorer's
+# decision disagrees with HR's eventual outcome (and HR left notes
+# explaining why). Each bot run loads the most recent N approved
+# rows from this tab and passes them to scorer.score() so the model
+# can see real corrections from HR. HR can flip "Approve as Training"
+# to FALSE on any row to remove it from the few-shot context.
+
+LEARNING_LOG_HEADERS = [
+    "Audit Date", "Approve as Training", "Candidate Name", "Position",
+    "Bot Decision", "HR Outcome", "HR Notes", "AI Reasoning",
+    "Resume Excerpt", "Gmail Thread Link", "Original Timestamp",
+]
+
+
+def ensure_learning_log_headers(svc, sheet_id, tab):
+    """Idempotently create the Bot Learning Log tab + header row."""
+    if not _ensure_tab_exists(svc, sheet_id, tab):
+        return
+    rng = f"{tab}!A1:K1"
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=rng,
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read %s headers: %s", tab, e)
+        return
+    if resp.get("values"):
+        return
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=rng, valueInputOption="RAW",
+            body={"values": [LEARNING_LOG_HEADERS]},
+        ).execute()
+    except Exception as e:
+        log.warning("Could not write %s headers: %s", tab, e)
+
+
+def append_learning_entry(svc, sheet_id, tab, row):
+    """Append a learning entry (one row of bot/HR disagreement)."""
+    try:
+        values = [
+            row.get("audit_date") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            True,  # Approve as Training -- default on; HR un-checks to exclude.
+            _safe(row.get("candidate_name", "")),
+            _safe(row.get("position", "")),
+            _safe(row.get("bot_decision", "")),
+            _safe(row.get("hr_outcome", "")),
+            _safe(row.get("hr_notes", "")),
+            _safe(row.get("ai_reasoning", "")),
+            _safe(row.get("resume_excerpt", "")),
+            _hyperlink(row.get("gmail_link", "")),
+            _safe(row.get("original_timestamp", "")),
+        ]
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A:K",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to append to %s tab: %s", tab, e)
+
+
+def load_learning_examples(svc, sheet_id, tab, max_examples=8):
+    """Read approved learning entries from the Bot Learning Log.
+
+    Returns a list of dicts (most-recent first) with keys:
+    position, bot_decision, hr_outcome, hr_notes, resume_excerpt,
+    ai_reasoning. Quietly returns [] if the tab doesn't exist or
+    has nothing approved -- the bot then runs without few-shot
+    context (its current behavior pre-audit-shipment).
+    """
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A2:K",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load %s tab (may not exist yet): %s", tab, e)
+        return []
+    rows = resp.get("values", []) or []
+    out = []
+    # Walk newest-first (rows arrive in insertion order; reverse).
+    for r in reversed(rows):
+        r = (r + [""] * 11)[:11]
+        approve_raw = str(r[1]).strip().lower()
+        if approve_raw not in {"true", "yes", "y", "1", "x"}:
+            continue
+        out.append({
+            "position": r[3],
+            "bot_decision": r[4],
+            "hr_outcome": r[5],
+            "hr_notes": r[6],
+            "ai_reasoning": r[7],
+            "resume_excerpt": r[8],
+        })
+        if len(out) >= max_examples:
+            break
+    return out
+
+
+def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
+                                  terminal_statuses=None):
+    """Audit helper: read all Candidates rows whose Timestamp is in the
+    past N days AND whose HR Status is a terminal value (Hired, Rejected,
+    etc. -- caller supplies the set). Used by audit.py to find recently
+    actioned candidates.
+
+    Returns a list of dicts with keys matching the Candidates layout
+    fields the audit cares about: timestamp, candidate_name,
+    application_submitted, applied_for, decision, ai_reasoning,
+    gmail_link, hr_status, hr_notes.
+    """
+    if terminal_statuses is None:
+        terminal_statuses = {"Hired", "Rejected", "Not a fit",
+                             "Closed", "Withdrawn", "Declined"}
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A2:R",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load %s for audit: %s", tab, e)
+        return []
+    rows = resp.get("values", []) or []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+    out = []
+    for r in rows:
+        r = (r + [""] * 18)[:18]
+        ts_str = r[0]
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts < cutoff:
+            continue
+        hr_status = (r[16] or "").strip()
+        if hr_status not in terminal_statuses:
+            continue
+        out.append({
+            "timestamp": ts_str,
+            "candidate_name": r[1],
+            "application_submitted": r[4],
+            "filename": r[5],
+            "applied_for": r[6],
+            "decision": r[9],
+            "confidence": r[12],
+            "ai_reasoning": r[13],
+            "gmail_link": r[15],
+            "hr_status": hr_status,
+            "hr_notes": (r[17] or "").strip(),
+        })
+    return out

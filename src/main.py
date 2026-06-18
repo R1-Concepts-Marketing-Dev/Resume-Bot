@@ -191,6 +191,16 @@ def run() -> int:
     log.info("Loaded loop-detection counts for %d sender(s) in past %dh",
              len(recent_sender_counts), cfg.loop_window_hours)
 
+    # Audit feedback: load HR-corrected examples to pass into the scorer
+    # as few-shot context. Quietly degrades to an empty list if the
+    # Bot Learning Log tab doesn't exist yet (pre-audit deployments).
+    learning_examples = sheets_client.load_learning_examples(
+        sheets, cfg.sheet_id, getattr(cfg, "learning_log_tab", "Bot Learning Log"),
+        max_examples=getattr(cfg, "learning_examples_max", 8),
+    )
+    log.info("Loaded %d learning example(s) for scorer few-shot",
+             len(learning_examples))
+
     now_utc = datetime.now(timezone.utc)
     in_business_hours = _is_business_hours(
         now_utc, cfg.business_hours_start_pt, cfg.business_hours_end_pt,
@@ -239,6 +249,7 @@ def run() -> int:
                 active_role_names, paused_role_names, msg_id, label_id,
                 outcome_label_ids, seen_thread_ids, known_emails,
                 recent_sender_counts, in_business_hours,
+                learning_examples=learning_examples,
                 open_needs_human_threads=open_needs_human,
             )
         except Exception as e:
@@ -259,7 +270,8 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg_id, label_id,
                 outcome_label_ids, seen_thread_ids, known_emails,
                 recent_sender_counts, in_business_hours,
-                *, open_needs_human_threads: set | None = None) -> int:
+                *, learning_examples: list | None = None,
+                open_needs_human_threads: set | None = None) -> int:
     msg = gmail_client.fetch(gmail, cfg.gmail_user, msg_id)
     log.info("msg=%s subj=%r from=%s attachments=%d",
              msg_id, msg.subject[:60], msg.sender_email, len(msg.attachments))
@@ -303,14 +315,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                           bot_guess: str = "", confidence: str = "",
                           mark_done: bool = True):
         """Route to the Needs Human queue: Gmail label + sheet row +
-        Inbox Log. If mark_done is True, also marks the email as
-        processed so the bot doesn't pick it back up. Set False when
-        we want the next run to retry (e.g. waiting on business hours).
-
-        Dedup: if this msg's thread_id is already in the open Needs
-        Human queue (status Open/Investigating), we skip the new sheet
-        row and just log the duplicate to Inbox Log. The Gmail label
-        is still applied so the email stays visible to HR."""
+        Inbox Log."""
         if open_needs_human_threads and msg.thread_id in open_needs_human_threads:
             log.info("  -> thread %s already in Needs Human queue; skipping duplicate row",
                      msg.thread_id)
@@ -347,10 +352,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
 
     def _archive_as_closed(reasoning: str):
-        """Silent close: candidate's reply signals the conversation has
-        ended (e.g. 'thanks for letting me know' after a denied template).
-        Archive without reply, apply Resume Bot/Closed Gmail label, log
-        the action to Inbox Log."""
         body_preview = (msg.body_text or "").replace("\n", " ")[:300]
         _log_inbox("conversation_closed",
                    f"silently closed by candidate reply ({reasoning[:120]})")
@@ -394,18 +395,11 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return 0
 
     # ----- Pre-filter #4: internal-forward handling -----
-    # Internal senders (HR forwarding candidate emails) used to short-circuit
-    # to Misc when no attachment was present. That dropped legitimate
-    # forwarded applications where the candidate info is in the body. Now
-    # we flag the internal-forward case and let the normal classifier run.
-    # The `internal_forward` flag is passed through so downstream logic can
-    # suppress auto-reply (we never want the bot replying TO HR).
     internal_forward = _is_internal_sender(msg.sender_email, cfg.internal_domains)
     if internal_forward:
         log.info("  -> internal sender %s; will classify but suppress outbound reply",
                  msg.sender_email)
         if msg.has_resume:
-            # Attachment present: scan it directly via the resume pipeline.
             scored = _process_resume_attachments(
                 cfg, gmail, drive, sheets, all_filters, templates,
                 active_role_names, paused_role_names, msg, msg_id, label_id,
@@ -413,18 +407,11 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 is_internal_forward=True,
                 in_business_hours=in_business_hours,
                 log_inbox=_log_inbox,
+                learning_examples=learning_examples,
             )
             return scored
-        # No attachment: fall through to the normal classifier path below.
-        # _can_send will suppress any reply because of the internal_forward flag.
 
     # ----- Pre-filter #5: loop detection -----
-    # Skip loop detection for job-board aliases (Indeed conversation-*@indeed.com,
-    # ZipRecruiter, etc.). Those are per-candidate aliases by platform design --
-    # Indeed routinely sends multiple emails per application thread (apply, viewed,
-    # message, etc.) which would trip the loop threshold even though each comes
-    # from a unique candidate. Loop detection is for catching genuine spam/stuck
-    # threads from a single human sender, not platform notification multiplicity.
     sender_lc = (msg.sender_email or "").strip().lower()
     if not _is_job_board_alias(msg.sender_email):
         sender_count = recent_sender_counts.get(sender_lc, 0)
@@ -459,13 +446,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if not template_key:
             return False, "no template selected"
         if _is_job_board_alias(msg.sender_email):
-            # Indeed (and other job-board) candidates are managed through
-            # the platform's own UI. Replying to the conversation alias
-            # lands the message inside Indeed's messaging thread, but
-            # employers run that workflow from Indeed's dashboard (Move
-            # stage, Send message, Not a fit). The bot scores them and
-            # adds them to the Indeed Queue tab; HR actions them in
-            # Indeed manually. No outbound auto-reply.
             return False, "job-board candidate; HR engages via platform UI"
         if internal_forward:
             return False, "sender is internal; never reply to HR/internal addresses"
@@ -484,10 +464,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         return True, ""
 
     # ----- Pre-filter #6.5: conversation closure detection -----
-    # If the bot has previously sent any template in this thread, ask Claude
-    # whether the candidate's new reply is a natural close ("thanks for
-    # letting me know"). Silent archive if closed, Needs Human if unclear,
-    # otherwise fall through to the normal classifier flow.
     if sent_in_thread:
         closure = scorer.classify_conversation_closure(
             api_key=cfg.anthropic_api_key,
@@ -510,18 +486,8 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 confidence=f"{closure.confidence:.2f}",
             )
             return 0
-        # closure.decision == "ongoing" -> fall through to classifier below
 
     # ----- Pre-filter #6.7: Indeed Quick Apply auto-fetch -----
-    # Indeed sends candidate applications without a PDF attachment -- just a
-    # "View resume" link in the body. The classifier reading the Indeed-aliased
-    # sender + templated body tends to misclassify these as MISC. Detect the
-    # Quick Apply pattern HERE, fetch the resume PDF from Indeed's public link,
-    # and attach it BEFORE the classifier runs. If the fetch succeeds we
-    # bypass the classifier entirely -- we already know it's a resume, the
-    # candidate came in through a known application channel and we have a
-    # valid PDF in hand. Skipping the classifier avoids the templated-body
-    # MISC misclassification that previously dropped Indeed candidates.
     indeed_quick_apply_attached = False
     if not msg.has_resume and _is_job_board_alias(msg.sender_email):
         view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
@@ -545,14 +511,8 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                     confidence="0.95",
                 )
                 return 0
-        # If no view_url: not a candidate application (admin notification, etc.) -- let classifier decide.
 
     # ----- Pre-filter #7: classifier -----
-    # Bypass the classifier entirely if Indeed Quick Apply already fetched
-    # and attached a resume PDF. We know it's a resume: sender is an Indeed
-    # candidate alias and the public resume download endpoint returned a
-    # real PDF. Running the classifier on the templated "New application"
-    # body would call it MISC and drop the candidate, even with the PDF.
     if indeed_quick_apply_attached:
         log.info("  -> classifier skipped: Indeed Quick Apply PDF attached, routing to RESUME")
         cr = scorer.ClassifierResult(label="resume", confidence=0.99)
@@ -571,7 +531,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     log.info("  -> classifier: label=%s confidence=%.2f has_attachment=%s",
              cr.label, cr.confidence, msg.has_resume)
 
-    # ----- Low-confidence -> Needs Human -----
     if cr.confidence < cfg.classifier_confidence_threshold:
         log.info("  -> confidence %.2f < threshold %.2f; flagging needs_human",
                  cr.confidence, cfg.classifier_confidence_threshold)
@@ -585,7 +544,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
 
     email_type = cr.label
 
-    # ----- Misc branch -----
     if email_type == "misc":
         log.info("  -> misc (not candidate-related); logging to %s and skipping",
                  cfg.misc_tab)
@@ -595,10 +553,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- No-attachment branches -----
-    # Indeed Quick Apply emails are handled by Pre-filter #6.7 above (before
-    # the classifier), so by this point any job-board candidate email either
-    # has the fetched PDF attached or has already been routed to Needs Human.
     if not msg.has_resume:
         if email_type == "question":
             template_key = "question"
@@ -618,8 +572,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if not allowed:
             log.info("  -> %s suppressed: %s", template_key, block_reason)
             _log_inbox(log_type, f"suppressed ({block_reason})")
-            # Business-hours queueing: don't mark processed so the next
-            # biz-hour run picks the email back up and tries again.
             if "outside business hours" in block_reason:
                 log.info("  -> leaving unprocessed for retry next biz-hour run")
                 return 0
@@ -639,7 +591,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         return 0
 
-    # ----- Resume branch -----
     return _process_resume_attachments(
         cfg, gmail, drive, sheets, all_filters, templates,
         active_role_names, paused_role_names, msg, msg_id, label_id,
@@ -649,6 +600,7 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         log_inbox=_log_inbox,
         sent_in_thread=sent_in_thread,
         can_send=_can_send,
+        learning_examples=learning_examples,
     )
 
 
@@ -661,6 +613,7 @@ def _process_resume_attachments(
     log_inbox,
     sent_in_thread: set = None,
     can_send=None,
+    learning_examples: list | None = None,
 ) -> int:
     if sent_in_thread is None:
         sent_in_thread = set()
@@ -699,6 +652,7 @@ def _process_resume_attachments(
             email_subject=msg.subject,
             email_body=msg.body_text,
             used_ocr=used_ocr,
+            learning_examples=learning_examples,
         )
 
         try:
@@ -776,13 +730,6 @@ def _process_resume_attachments(
             template_key = None
 
         # ----- Recruiter / agency suppression -----
-        # When the scorer flags the application as coming from a
-        # recruiter/agency (rather than the candidate themselves), the
-        # bot never auto-replies. Replying to a recruiter goes back to
-        # the recruiter, not the candidate -- HR wants to handle that
-        # outreach manually because the recruiter expects a direct
-        # conversation. The row still lands in Candidates so HR can
-        # see the candidate and decide; we only suppress the reply.
         recruiter_agency_value = (result.get("recruiter_agency") or "N/A").strip() or "N/A"
         is_recruiter_submission = recruiter_agency_value.lower() not in {
             "n/a", "na", "none", "null", "unknown", "",
@@ -823,19 +770,18 @@ def _process_resume_attachments(
 
         is_indeed_candidate = _is_job_board_alias(msg.sender_email)
 
-        # ----- Application source classification -----
-        # Drives the new "Application Submitted" column on the
-        # Candidates dashboard. Precedence: recruiter beats Indeed
-        # (a recruiter forwarding through Indeed is still routed via a
-        # recruiter), Indeed beats Craigslist body match, everything
-        # else defaults to Email. Craigslist detection is sender-OR-body
-        # because Craigslist relays through randomized reply aliases
-        # (something@reply.craigslist.org) but the body text consistently
-        # mentions "craigslist".
+        # ----- Application source classification (column E) -----
+        # Single source-of-truth column on Candidates. Precedence:
+        # recruiter beats Indeed (a recruiter forwarding through Indeed
+        # is still routed via a recruiter), Indeed beats Craigslist body
+        # match, everything else defaults to Email. For recruiter, the
+        # agency name is embedded inline so HR sees who sent it without
+        # a dedicated column. Craigslist detection is sender-OR-body
+        # because Craigslist relays through randomized reply aliases.
         _sender_lc = (msg.sender_email or "").lower()
         _body_lc = (msg.body_text or "").lower()
         if is_recruiter_submission:
-            application_submitted = "Recruiter/Agency"
+            application_submitted = f"Recruiter/Agency - {recruiter_agency_value}"
         elif is_indeed_candidate:
             application_submitted = "Indeed"
         elif "craigslist" in _sender_lc or "craigslist.org" in _body_lc:
@@ -862,15 +808,9 @@ def _process_resume_attachments(
                 "reasoning": result["reasoning"],
                 "drive_link": drive_link,
                 "gmail_link": msg.thread_link,
-                "recruiter_agency": recruiter_agency_value,
-                "indeed": is_indeed_candidate,
                 "application_submitted": application_submitted,
             },
         )
-        # Dual-write to the Indeed Queue tab: HR's focused worklist for
-        # candidates that need to be actioned inside Indeed's own
-        # dashboard. Same timestamp ties the row to the Candidates row
-        # so the VLOOKUP-based HR Status column auto-syncs.
         if is_indeed_candidate:
             sheets_client.append_indeed_queue(
                 sheets, cfg.sheet_id, "Indeed Queue",
@@ -930,10 +870,6 @@ def _process_resume_attachments(
         log.info("  -> email outcome=%s, shadow mode (no Gmail label changes)", final_bucket)
         return scored
 
-    # Business-hours queueing: if we had a reply we couldn't send because
-    # it's off-hours, DON'T mark processed -- leave the email in the
-    # inbox so the next biz-hour run picks it back up. Drive upload and
-    # Sheets row already happened, so the work isn't lost.
     if reply_queued_for_biz_hours:
         log.info("  -> outcome=%s, leaving unprocessed for biz-hour reply retry",
                  final_bucket)
