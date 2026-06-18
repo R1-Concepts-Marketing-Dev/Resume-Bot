@@ -881,6 +881,63 @@ def inspect_row(svc, sheet_id, tab, row_number):
         log.info("  %s: %r", h, val)
 
 
+def fix_pending_query(svc, sheet_id, tab="Pending"):
+    """Add/repair the Pending tab auto-populating QUERY.
+
+    Pending tab headers (11 cols):
+      A Days Pending | B Applied | C Name | D Email | E Phone |
+      F Role | G Score | H AI Reasoning | I Drive | J HR Status |
+      K HR Notes
+
+    A: =ARRAYFORMULA(...) computing days since Applied timestamp.
+    B: =QUERY(Candidates...) pulling pending_paused rows.
+
+    Idempotent."""
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id, fields="sheets.properties.title",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load metadata: %s", e)
+        return
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])
+              if s.get("properties")]
+    if tab not in titles:
+        log.info("No %s tab; skipping.", tab)
+        return
+
+    # B2: QUERY pulls Applied (Timestamp), Name, Email, Phone, Role
+    # (Applied For), Score (Confidence), AI Reasoning, Drive, HR Status,
+    # HR Notes from Candidates where Decision=pending_paused.
+    query_b = (
+        '=QUERY(Candidates!A2:R, '
+        '"SELECT A, B, C, D, G, M, N, O, Q, R '
+        'WHERE J = \'pending_paused\' '
+        'AND (Q IS NULL OR Q = \'\') '
+        'ORDER BY A ASC", 0)'
+    )
+    # A2: Days Pending = today - applied date. ARRAYFORMULA spills
+    # alongside the QUERY.
+    formula_a = (
+        '=ARRAYFORMULA(IF(B2:B="", "", '
+        'IFERROR(DATEDIF(DATEVALUE(LEFT(B2:B,10)), TODAY(), "D"), "")))'
+    )
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[formula_a]]},
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!B2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[query_b]]},
+    ).execute()
+    log.info("%s!A2 (ARRAYFORMULA days) + B2 (QUERY pending_paused) written.", tab)
+
+
 def backfill_indeed_queue_columns(svc, sheet_id):
     """Fill in missing B (Position), C (Fit Quality), D (AI Recommendation)
     on existing Indeed Queue rows by looking up the matching Candidates
@@ -1322,9 +1379,10 @@ def run() -> int:
     log.info("STEP 1: Candidates tab restructure")
     migrate_candidates(svc, cfg.sheet_id)
 
-    log.info("STEP 2: Indeed Queue formula update + Cross-Match QUERY fix + col backfill")
+    log.info("STEP 2: Indeed Queue formula update + Cross-Match QUERY fix + Pending QUERY fix + col backfill")
     fix_indeed_queue_formulas(svc, cfg.sheet_id)
     fix_cross_match_query(svc, cfg.sheet_id)
+    fix_pending_query(svc, cfg.sheet_id)
     backfill_indeed_queue_columns(svc, cfg.sheet_id)
 
     log.info("STEP 3: Indeed Queue backfill (with Gmail sender enrichment)")
