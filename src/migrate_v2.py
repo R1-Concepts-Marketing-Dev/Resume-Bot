@@ -288,12 +288,38 @@ _AI_RECOMMENDATION = {
 }
 
 
+def _is_indeed_candidate(row):
+    """Detect whether a Candidates row came from Indeed using multiple
+    signals (the old Indeed column was unreliable -- many rows had it
+    blank). Signals (any one is enough):
+      * E (Application Submitted) starts with "Indeed"
+      * F (filename) contains "indeed" (e.g. indeed_quick_apply_resume.pdf)
+      * N (AI Reasoning) mentions an indeed.com sender
+      * P (Gmail Thread Link) -- can't introspect URL alone
+    """
+    appsub = str(row[4]).strip().lower() if len(row) > 4 else ""
+    filename = str(row[5]).strip().lower() if len(row) > 5 else ""
+    reasoning = str(row[13]).lower() if len(row) > 13 else ""
+
+    if appsub.startswith("indeed"):
+        return True
+    if "indeed" in filename:
+        return True
+    # Reasoning sometimes mentions the sender; e.g. "applied via indeed.com"
+    if "indeed.com" in reasoning or "indeed quick apply" in reasoning:
+        return True
+    return False
+
+
 def backfill_indeed_queue(svc, sheet_id):
-    """Step 3: walk Candidates after migration, and for every row
-    where E (Application Submitted) starts with 'Indeed' and no
-    matching timestamp exists in Indeed Queue, append a row."""
-    # Read Candidates (post-migration layout): A=timestamp, B=name,
-    # E=appsub, G=applied, J=decision.
+    """Step 3: walk Candidates after migration, and for every row that
+    looks like an Indeed candidate (per _is_indeed_candidate -- uses
+    multiple signals because the old Indeed column was unreliable) and
+    no matching timestamp exists in Indeed Queue, append a row.
+
+    Also upgrades the Candidates Application Submitted cell to "Indeed"
+    if we detected Indeed via signal other than appsub (the field was
+    stale at migration time)."""
     cand_resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id,
         range=f"{CANDIDATES_TAB}!A2:R",
@@ -315,14 +341,20 @@ def backfill_indeed_queue(svc, sheet_id):
     log.info("Existing Indeed Queue timestamps: %d", len(existing_ts))
 
     to_append = []
-    for r in cand_rows:
+    appsub_upgrades = []  # (row_number, new_value)
+    for i, r in enumerate(cand_rows, start=2):  # row 1 is header, data starts at 2
         r = (r + [""] * 18)[:18]
         ts = str(r[0]).strip()
         if not ts:
             continue
-        app_sub = str(r[4]).strip()
-        if not app_sub.lower().startswith("indeed"):
+        if not _is_indeed_candidate(r):
             continue
+
+        # Upgrade Application Submitted if it was previously misclassified.
+        current_appsub = str(r[4]).strip()
+        if not current_appsub.lower().startswith("indeed"):
+            appsub_upgrades.append((i, "Indeed"))
+
         if ts in existing_ts:
             continue
 
@@ -336,8 +368,23 @@ def backfill_indeed_queue(svc, sheet_id):
         )
         to_append.append([name, applied, fit, rec, hr_formula, False, ts])
 
+    # Apply Application Submitted upgrades in one batchUpdate.
+    if appsub_upgrades:
+        update_data = [
+            {"range": f"{CANDIDATES_TAB}!E{row_num}",
+             "values": [[val]]}
+            for row_num, val in appsub_upgrades
+        ]
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": update_data, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+        log.info("Upgraded Application Submitted to Indeed for %d rows.",
+                 len(appsub_upgrades))
+
     if not to_append:
-        log.info("Indeed Queue backfill: nothing to add.")
+        log.info("Indeed Queue backfill: nothing to add (%d rows examined).",
+                 len(cand_rows))
         return
 
     svc.spreadsheets().values().append(
@@ -348,6 +395,207 @@ def backfill_indeed_queue(svc, sheet_id):
         body={"values": to_append},
     ).execute()
     log.info("Backfilled %d rows into Indeed Queue.", len(to_append))
+
+
+# ============================================================
+# Email backfill: extract from resume PDFs on Drive for rows
+# where the Email column is blank.
+# ============================================================
+#
+# When the bot landed rows where the scorer couldn't extract a
+# candidate email and the sender was a job-board alias, column C ended
+# up empty. For those rows we still have the resume PDF on Drive.
+# This backfill walks each blank-email row, downloads the PDF, extracts
+# text, regex-matches an email, and writes it back if found. Pure regex
+# (no LLM cost) -- a real email in the resume body is almost always
+# easy to spot once we have the text.
+
+import re as _re
+
+_EMAIL_REGEX = _re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_JOB_BOARD_DOMAINS = (
+    "indeed.com", "indeedemail.com", "ziprecruiter.com",
+    "glassdoor.com", "monster.com", "careerbuilder.com", "snagajob.com",
+    "r1concepts.com",  # don't suggest internal addrs
+)
+
+
+def _is_job_board_email(addr: str) -> bool:
+    addr = (addr or "").lower()
+    if "@" not in addr:
+        return False
+    domain = addr.rsplit("@", 1)[-1]
+    return any(domain == d or domain.endswith("." + d) for d in _JOB_BOARD_DOMAINS)
+
+
+def _extract_email_from_drive(drive_svc, drive_cell: str) -> str:
+    """drive_cell is the formula =HYPERLINK("https://drive.google.com/.../file_id/...","Link").
+    Returns the first non-job-board email found in the PDF, or "" on
+    any failure. Quietly degrades on errors so one bad row doesn't kill
+    the whole backfill pass."""
+    if not drive_cell:
+        return ""
+    m = _re.search(r"/d/([A-Za-z0-9_-]{20,})", drive_cell)
+    if not m:
+        return ""
+    file_id = m.group(1)
+    try:
+        meta = drive_svc.files().get(fileId=file_id, fields="mimeType").execute()
+        mime = meta.get("mimeType", "")
+        data = drive_svc.files().get_media(fileId=file_id).execute()
+    except Exception as e:
+        log.warning("Drive read failed for %s: %s", file_id, e)
+        return ""
+    try:
+        from . import resume_parser
+        text, _ = resume_parser.extract("resume", mime, data)
+    except Exception as e:
+        log.warning("resume_parser.extract failed: %s", e)
+        return ""
+    if not text:
+        return ""
+    for match in _EMAIL_REGEX.findall(text):
+        addr = match.strip().rstrip(".,;:")
+        if not _is_job_board_email(addr):
+            return addr
+    return ""
+
+
+def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
+                    max_rows: int = 500):
+    """Walk Candidates, find rows with blank col C (Email), try to
+    extract the candidate's email from the resume PDF on Drive (col O).
+    Writes back to col C only if a non-job-board email was found.
+
+    max_rows caps how many empty rows we attempt (each one is a Drive
+    + parser call -- the cap keeps a single audit run from taking 30+
+    minutes on a 1000-row sheet)."""
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A2:R",
+        valueRenderOption="FORMULA",
+    ).execute()
+    rows = resp.get("values", []) or []
+    log.info("Email backfill: %d Candidates rows", len(rows))
+
+    attempted = 0
+    found = 0
+    updates = []
+    for i, r in enumerate(rows, start=2):
+        r = (r + [""] * 18)[:18]
+        email = str(r[2]).strip()
+        if email:
+            continue  # already has email
+        if attempted >= max_rows:
+            log.info("Hit max_rows cap (%d); stopping early.", max_rows)
+            break
+        attempted += 1
+        drive_link = str(r[14]).strip()  # col O = Drive File Link
+        if not drive_link:
+            continue
+        extracted = _extract_email_from_drive(drive_svc, drive_link)
+        if extracted:
+            found += 1
+            updates.append({"range": f"{tab}!C{i}",
+                            "values": [[extracted]]})
+            log.info("Row %d: extracted %s", i, extracted)
+
+    if updates:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": updates, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+    log.info("Email backfill complete: attempted=%d found=%d wrote=%d",
+             attempted, found, len(updates))
+
+
+# ============================================================
+# Gmail thread-link backfill (authuser=)
+# ============================================================
+#
+# Prior to commit d1c8c97 (2026-06-18) the bot wrote Gmail thread links as
+#   https://mail.google.com/mail/u/0/#inbox/<id>
+# That URL routes the click under whichever account the user is signed
+# in to FIRST (authuser=0), which for HR users is their work mailbox --
+# the thread doesn't exist there, so they hit an empty Gmail page. New
+# rows now use ?authuser=jobs@r1concepts.com to force routing to the
+# jobs@ mailbox. This step rewrites every old-format link on the
+# Candidates tab to the new format so HR clicks work retroactively.
+
+_OLD_LINK_PATTERN = "https://mail.google.com/mail/u/0/#inbox/"
+_NEW_LINK_PREFIX = "https://mail.google.com/mail/?authuser=jobs@r1concepts.com#inbox/"
+
+
+def backfill_gmail_links(svc, sheet_id, tab=CANDIDATES_TAB, col_letter="P"):
+    """Rewrite =HYPERLINK("<old-url>","Link") formulas in column P to
+    use the new authuser-pinned URL. Idempotent: skips formulas already
+    on the new format."""
+    rng = f"{tab}!{col_letter}2:{col_letter}"
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=rng,
+            valueRenderOption="FORMULA",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read %s Gmail links: %s", tab, e)
+        return
+    rows = resp.get("values", []) or []
+    if not rows:
+        log.info("%s: no Gmail link rows to backfill.", tab)
+        return
+
+    updated = 0
+    skipped = 0
+    new_rows = []
+    for r in rows:
+        cell = (r[0] if r else "") or ""
+        if not cell:
+            new_rows.append([cell])
+            continue
+        if _OLD_LINK_PATTERN in cell:
+            new_cell = cell.replace(_OLD_LINK_PATTERN, _NEW_LINK_PREFIX)
+            new_rows.append([new_cell])
+            updated += 1
+        else:
+            skipped += 1
+            new_rows.append([cell])
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!{col_letter}2:{col_letter}{1 + len(new_rows)}",
+        valueInputOption="USER_ENTERED",
+        body={"values": new_rows},
+    ).execute()
+    log.info("Gmail link backfill on %s col %s: updated=%d unchanged=%d",
+             tab, col_letter, updated, skipped)
+
+
+def inspect_row(svc, sheet_id, tab, row_number):
+    """Dump one Candidates row's contents to the log for diagnosis.
+    row_number is 1-indexed including the header row (so row 13 in the
+    sheet = row_number=13)."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A{row_number}:R{row_number}",
+            valueRenderOption="FORMULA",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read row %d: %s", row_number, e)
+        return
+    row = (resp.get("values") or [[]])[0]
+    headers = ["A_Timestamp","B_Name","C_Email","D_Phone","E_AppSub",
+               "F_Filename","G_AppliedFor","H_CrossFitMatch","I_CrossFitFlag",
+               "J_Decision","K_YearsExp","L_JobHopping","M_Confidence",
+               "N_AIReasoning","O_DriveLink","P_GmailLink","Q_HRStatus","R_HRNotes"]
+    log.info("--- Candidates row %d dump ---", row_number)
+    for i, h in enumerate(headers):
+        val = row[i] if i < len(row) else ""
+        # Truncate AI Reasoning so logs stay readable.
+        if h == "N_AIReasoning" and len(str(val)) > 200:
+            val = str(val)[:200] + "..."
+        log.info("  %s: %r", h, val)
 
 
 def run() -> int:
@@ -366,6 +614,17 @@ def run() -> int:
 
     log.info("STEP 3: Indeed Queue backfill")
     backfill_indeed_queue(svc, cfg.sheet_id)
+
+    log.info("STEP 4: Gmail link backfill (authuser=jobs@)")
+    backfill_gmail_links(svc, cfg.sheet_id)
+
+    log.info("STEP 5: Email backfill (extract from resume PDFs on Drive)")
+    drive_svc = google_auth.drive(creds)
+    backfill_emails(svc, cfg.sheet_id, drive_svc)
+
+    log.info("STEP 6: Diagnostic dump of rows 13 and 26 for review")
+    inspect_row(svc, cfg.sheet_id, CANDIDATES_TAB, 13)
+    inspect_row(svc, cfg.sheet_id, CANDIDATES_TAB, 26)
 
     log.info("Migration complete.")
     return 0
