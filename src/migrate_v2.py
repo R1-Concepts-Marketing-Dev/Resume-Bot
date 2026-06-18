@@ -459,6 +459,114 @@ _AI_RECOMMENDATION = {
 }
 
 
+def rebuild_indeed_queue(svc, sheet_id):
+    """Nuclear rebuild of the Indeed Queue tab. Schema-drift has put
+    wrong-shaped data in B/C, blank headers in B/F, and a bunch of
+    duplicate (name, empty-timestamp) rows that the previous backfill
+    couldn't clean up correctly.
+
+    This wipes all data rows (keeping row 1 only), rewrites the canonical
+    7-column header, then re-appends one row per Indeed candidate from
+    the Candidates tab.
+
+    Canonical schema (col A through G):
+      A Candidate Name | B Position | C Fit Quality |
+      D AI Recommendation | E HR Status (VLOOKUP) |
+      F Indeed Application Closed (FALSE checkbox) |
+      G Timestamp (join key)
+
+    HR's edits to the Indeed Application Closed checkbox are wiped --
+    if any rows were checked, they'll go back to FALSE. That column
+    is HR's working state; we're trading one-time loss for a clean
+    schema."""
+    inner_id = _get_sheet_id(svc, sheet_id, INDEED_QUEUE_TAB)
+    if inner_id is None:
+        log.warning("Indeed Queue tab not found")
+        return
+
+    # 1. Read Candidates to figure out what rows to write.
+    cand_resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{CANDIDATES_TAB}!A2:R",
+    ).execute()
+    cand_rows = cand_resp.get("values", []) or []
+    indeed_rows = []
+    for r in cand_rows:
+        r = (r + [""] * 18)[:18]
+        ts = str(r[0]).strip()
+        if not ts:
+            continue
+        if not _is_indeed_candidate(r):
+            continue
+        name = str(r[1]).strip()
+        applied = str(r[6]).strip()
+        decision = str(r[9]).strip()
+        fit = _FIT_QUALITY.get(decision, decision)
+        rec = _AI_RECOMMENDATION.get(decision, "Review manually")
+        hr_formula = (
+            f'=IFERROR(VLOOKUP("{ts}",Candidates!A:Q,17,FALSE),"")'
+        )
+        indeed_rows.append([name, applied, fit, rec, hr_formula, False, ts])
+    log.info("Rebuild plan: %d Indeed candidates from Candidates",
+             len(indeed_rows))
+
+    # 2. Clear all data rows on Indeed Queue (keep row 1 for header).
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sheet_id, range=f"{INDEED_QUEUE_TAB}!A2:Z",
+    ).execute()
+    log.info("Cleared Indeed Queue data rows.")
+
+    # 3. Rewrite the canonical 7-column header.
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{INDEED_QUEUE_TAB}!A1:G1",
+        valueInputOption="RAW",
+        body={"values": [[
+            "Candidate Name", "Position", "Fit Quality",
+            "AI Recommendation", "HR Status",
+            "Indeed Application Closed", "Timestamp",
+        ]]},
+    ).execute()
+    log.info("Rewrote Indeed Queue headers.")
+
+    # 4. Append the new rows.
+    if indeed_rows:
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"{INDEED_QUEUE_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": indeed_rows},
+        ).execute()
+        # Make sure the "Indeed Application Closed" cells are real
+        # checkbox cells (the append wrote a literal FALSE which Sheets
+        # would render as text without explicit data validation).
+        end_row = 1 + len(indeed_rows)
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": inner_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": end_row,
+                            "startColumnIndex": 5,
+                            "endColumnIndex": 6,
+                        },
+                        "rule": {
+                            "condition": {"type": "BOOLEAN"},
+                        },
+                    }
+                }]},
+            ).execute()
+        except Exception as e:
+            log.warning("Could not apply checkbox validation: %s", e)
+
+    log.info("Indeed Queue rebuilt: %d clean rows (incl. fresh checkboxes).",
+             len(indeed_rows))
+
+
 def backfill_indeed_queue(svc, sheet_id):
     """Step 3: walk Candidates after migration, and for every row that
     looks like an Indeed candidate (per _is_indeed_candidate -- uses
@@ -1606,11 +1714,10 @@ def run() -> int:
     fix_pending_query(svc, cfg.sheet_id)
     backfill_indeed_queue_columns(svc, cfg.sheet_id)
 
-    log.info("STEP 3: Indeed Queue backfill (clean orphans, Gmail sender enrichment, then append)")
+    log.info("STEP 3: Indeed Queue rebuild (Gmail enrichment then full wipe + repopulate)")
     gmail_svc = google_auth.gmail(creds)
-    clean_indeed_queue_orphans(svc, cfg.sheet_id)
     enrich_indeed_from_gmail(svc, cfg.sheet_id, gmail_svc, cfg.gmail_user)
-    backfill_indeed_queue(svc, cfg.sheet_id)
+    rebuild_indeed_queue(svc, cfg.sheet_id)
 
     log.info("STEP 4: Gmail link backfill (authuser=jobs@)")
     backfill_gmail_links(svc, cfg.sheet_id)
