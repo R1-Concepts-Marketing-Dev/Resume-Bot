@@ -103,19 +103,36 @@ def _is_job_board_alias(email: str) -> bool:
     return any(domain == d or domain.endswith("." + d) for d in _JOB_BOARD_DOMAINS)
 
 
-def _pick_candidate_email(scorer_email: str, fallback_sender: str) -> str:
+_EMAIL_REGEX = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def _pick_candidate_email(scorer_email: str, fallback_sender: str,
+                          resume_text: str = "", email_body: str = "") -> str:
     """Return the best candidate email for the Candidates dashboard.
 
-    Priority: scorer-extracted email (from the resume / body) if it's not
-    itself a job-board alias. Otherwise the fallback (typically the From:
-    header) IF that sender isn't a job-board alias. Otherwise empty --
-    we'd rather show no email than write an Indeed alias HR can't use."""
+    Priority order:
+      1. scorer-extracted email (the LLM tried to read it from resume/body)
+      2. From: header (only if not a job-board alias)
+      3. Regex match on resume text -- catches cases where the scorer
+         returned empty but there IS an email in the resume (the LLM
+         occasionally misses obvious matches, especially on OCR'd PDFs)
+      4. Regex match on email body
+      5. Empty -- better than writing a job-board alias HR can't reply to
+    """
     se = (scorer_email or "").strip()
     if se and not _is_job_board_alias(se):
         return se
     fb = (fallback_sender or "").strip()
     if fb and not _is_job_board_alias(fb):
         return fb
+    # Regex fallback: scan resume text first (more reliable), then body.
+    for source in (resume_text, email_body):
+        if not source:
+            continue
+        for match in _EMAIL_REGEX.findall(source):
+            addr = match.strip().rstrip(".,;:")
+            if addr and not _is_job_board_alias(addr):
+                return addr
     return ""
 
 
@@ -795,7 +812,7 @@ def _process_resume_attachments(
             {
                 "timestamp": candidate_timestamp,
                 "candidate_name": result["candidate_name"],
-                "email": _pick_candidate_email(result["candidate_email"], msg.sender_email),
+                "email": _pick_candidate_email(result["candidate_email"], msg.sender_email, resume_text=text, email_body=msg.body_text),
                 "phone": result["candidate_phone"],
                 "filename": att.filename,
                 "applied_for": applied_for,
