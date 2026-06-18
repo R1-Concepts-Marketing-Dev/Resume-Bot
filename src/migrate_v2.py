@@ -228,38 +228,44 @@ def migrate_candidates(svc, sheet_id):
 
 
 def fix_indeed_queue_formulas(svc, sheet_id):
-    """Step 2: rewrite Indeed Queue HR Status VLOOKUP formulas to point
-    at the new HR Status position (Candidates!A:Q col 17)."""
+    """Step 2: FORCE-REWRITE Indeed Queue HR Status formulas based on the
+    timestamp in column G of each row. This is intentionally aggressive
+    because rows can get corrupted in various ways: stale formulas
+    pointing at the old col P/16, accidental HYPERLINK formulas
+    (resulting in the cell displaying "Link"), manual edits, blank
+    cells, etc. We don't try to detect "is the current value correct";
+    we just write the right formula for every row that has a timestamp.
+    """
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range=f"{INDEED_QUEUE_TAB}!E2:E",
-            valueRenderOption="FORMULA",
+            range=f"{INDEED_QUEUE_TAB}!A2:G",
         ).execute()
     except Exception as e:
-        log.warning("Could not read Indeed Queue formulas: %s", e)
+        log.warning("Could not read Indeed Queue rows: %s", e)
         return
-    formulas = resp.get("values", []) or []
-    if not formulas:
+    rows = resp.get("values", []) or []
+    if not rows:
         log.info("Indeed Queue is empty. Nothing to update.")
         return
 
-    updated = 0
-    skipped = 0
     new_formulas = []
-    for row in formulas:
-        f = (row[0] if row else "") or ""
-        if not f:
-            new_formulas.append([f])
+    written = 0
+    blanked = 0
+    for r in rows:
+        # Col G (index 6) holds the timestamp join key.
+        ts = (r[6] if len(r) > 6 else "") or ""
+        ts = str(ts).strip()
+        if not ts:
+            # No timestamp -> nothing to VLOOKUP; leave the cell blank
+            # instead of writing a formula that would always return "".
+            new_formulas.append([""])
+            blanked += 1
             continue
-        if "Candidates!A:Q,17" in f:
-            skipped += 1
-            new_formulas.append([f])
-            continue
-        fixed = f.replace("Candidates!A:P,16", "Candidates!A:Q,17")
-        if fixed != f:
-            updated += 1
-        new_formulas.append([fixed])
+        new_formulas.append([
+            f'=IFERROR(VLOOKUP("{ts}",Candidates!A:Q,17,FALSE),"")'
+        ])
+        written += 1
 
     svc.spreadsheets().values().update(
         spreadsheetId=sheet_id,
@@ -267,8 +273,66 @@ def fix_indeed_queue_formulas(svc, sheet_id):
         valueInputOption="USER_ENTERED",
         body={"values": new_formulas},
     ).execute()
-    log.info("Indeed Queue formulas: updated=%d already-correct=%d",
-             updated, skipped)
+    log.info("Indeed Queue HR Status: force-wrote %d formulas, %d rows blank (no timestamp).",
+             written, blanked)
+
+
+def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
+    """The Cross-Match tab uses a QUERY against Candidates that references
+    columns by position. After the restructure the column positions
+    shifted, so we re-write the QUERY formula in A2 to use the new
+    positions. The QUERY surfaces rows where Cross-Fit Flag (col I,
+    not_qualified) was set to the rocket-light emoji.
+
+    Idempotent: if there's no Cross-Match tab or the cell already has a
+    well-formed query, this is a no-op."""
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets.properties.title",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not load sheet metadata: %s", e)
+        return
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])
+              if s.get("properties")]
+    if tab not in titles:
+        log.info("No %s tab; skipping cross-match QUERY fix.", tab)
+        return
+
+    # Read what's currently in A2 (the QUERY entry point).
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A2",
+            valueRenderOption="FORMULA",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read %s!A2: %s", tab, e)
+        return
+    current = ((resp.get("values") or [[]])[0] or [""])[0] if resp.get("values") else ""
+    log.info("%s!A2 current: %s", tab, str(current)[:200])
+
+    # New layout columns we want surfaced (rocket cross-fit flag = col I,
+    # name = B, applied for = G, drive link = O, HR status = Q, etc.).
+    # We surface: Timestamp, Name, Applied For, Cross-Fit Match, Cross-Fit Flag,
+    # Decision, HR Status, Drive Link, Gmail Link.
+    new_query = (
+        '=QUERY(Candidates!A1:R, '
+        '"SELECT A,B,G,H,I,J,Q,O,P WHERE I = \'\U0001F6A8\' '
+        'AND (Q IS NULL OR Q = \'\') '
+        'ORDER BY A DESC LABEL A \'Timestamp\', B \'Candidate\', '
+        'G \'Applied For\', H \'Cross-Fit Match\', I \'Cross-Fit Flag\', '
+        'J \'Bot Decision\', Q \'HR Status\', O \'Drive\', P \'Gmail\'", 1)'
+    )
+
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[new_query]]},
+    ).execute()
+    log.info("%s!A2 QUERY rewritten for new layout.", tab)
 
 
 # Decision -> Fit Quality / AI Recommendation (mirror sheets_client.py)
@@ -841,8 +905,9 @@ def run() -> int:
     log.info("STEP 1: Candidates tab restructure")
     migrate_candidates(svc, cfg.sheet_id)
 
-    log.info("STEP 2: Indeed Queue formula update")
+    log.info("STEP 2: Indeed Queue formula update + Cross-Match QUERY fix")
     fix_indeed_queue_formulas(svc, cfg.sheet_id)
+    fix_cross_match_query(svc, cfg.sheet_id)
 
     log.info("STEP 3: Indeed Queue backfill (with Gmail sender enrichment)")
     gmail_svc = google_auth.gmail(creds)
