@@ -1,7 +1,12 @@
 name: Migrate Candidates layout v2 (2026-06-18)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "Comma list of steps to run (or 'all'). Choices: candidates,iq_formulas,cross_match,pending,iq_backfill,iq_rebuild,gmail_links,emails,inspect,hide_terminal,audit,dump,all"
+        required: false
+        default: "all"
 
 permissions:
   contents: read
@@ -13,7 +18,7 @@ concurrency:
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +32,7 @@ jobs:
 
       - name: Run migration
         env:
+          MIGRATE_STEPS:              ${{ inputs.steps }}
           GOOGLE_OAUTH_CLIENT_ID:     ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
