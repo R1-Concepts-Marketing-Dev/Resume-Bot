@@ -323,11 +323,11 @@ def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
     # header_count=0 -- no extra header row added by QUERY.
     rocket = "\U0001F6A8"  # 🚨
     new_query = (
-        '=QUERY(Candidates!A2:R, '
+        '=IFERROR(QUERY(Candidates!A2:R, '
         '"SELECT A, G, H, B, C, D, M, N, O, P, Q, R '
         'WHERE I = \'' + rocket + '\' '
         'AND (Q IS NULL OR Q = \'\') '
-        'ORDER BY A DESC", 0)'
+        'ORDER BY A DESC", 0), "")'
     )
 
     svc.spreadsheets().values().update(
@@ -910,11 +910,11 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
     # (Applied For), Score (Confidence), AI Reasoning, Drive, HR Status,
     # HR Notes from Candidates where Decision=pending_paused.
     query_b = (
-        '=QUERY(Candidates!A2:R, '
+        '=IFERROR(QUERY(Candidates!A2:R, '
         '"SELECT A, B, C, D, G, M, N, O, Q, R '
         'WHERE J = \'pending_paused\' '
         'AND (Q IS NULL OR Q = \'\') '
-        'ORDER BY A ASC", 0)'
+        'ORDER BY A ASC", 0), "")'
     )
     # A2: Days Pending = today - applied date. ARRAYFORMULA spills
     # alongside the QUERY.
