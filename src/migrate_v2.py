@@ -462,14 +462,13 @@ def _extract_email_from_drive(drive_svc, drive_cell: str) -> str:
 
 
 def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
-                    max_rows: int = 500):
+                    max_rows: int = 1000):
     """Walk Candidates, find rows with blank col C (Email), try to
     extract the candidate's email from the resume PDF on Drive (col O).
     Writes back to col C only if a non-job-board email was found.
 
-    max_rows caps how many empty rows we attempt (each one is a Drive
-    + parser call -- the cap keeps a single audit run from taking 30+
-    minutes on a 1000-row sheet)."""
+    Reports per-row diagnostics so we can see why rows are still empty
+    after the backfill (no Drive link / parse failed / no email in PDF)."""
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id,
         range=f"{tab}!A2:R",
@@ -478,20 +477,33 @@ def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
     rows = resp.get("values", []) or []
     log.info("Email backfill: %d Candidates rows", len(rows))
 
+    # Diagnostic counters
+    total_rows = len(rows)
+    already_filled = 0
+    no_drive_link = 0
+    drive_parse_failed = 0
+    no_email_in_pdf = 0
     attempted = 0
     found = 0
     updates = []
+    sample_empty_no_drive = []   # row numbers of empty + no-Drive cases
+    sample_no_email = []         # row numbers where Drive worked but no email
+
     for i, r in enumerate(rows, start=2):
         r = (r + [""] * 18)[:18]
         email = str(r[2]).strip()
         if email:
-            continue  # already has email
+            already_filled += 1
+            continue
         if attempted >= max_rows:
             log.info("Hit max_rows cap (%d); stopping early.", max_rows)
             break
         attempted += 1
         drive_link = str(r[14]).strip()  # col O = Drive File Link
         if not drive_link:
+            no_drive_link += 1
+            if len(sample_empty_no_drive) < 5:
+                sample_empty_no_drive.append(i)
             continue
         extracted = _extract_email_from_drive(drive_svc, drive_link)
         if extracted:
@@ -499,14 +511,88 @@ def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
             updates.append({"range": f"{tab}!C{i}",
                             "values": [[extracted]]})
             log.info("Row %d: extracted %s", i, extracted)
+        else:
+            # _extract_email_from_drive returns "" for any of: bad URL
+            # parse, Drive download failure, parser empty, no email in
+            # the extracted text. Treat as "no email" for the report.
+            no_email_in_pdf += 1
+            if len(sample_no_email) < 5:
+                sample_no_email.append(i)
 
     if updates:
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
             body={"data": updates, "valueInputOption": "USER_ENTERED"},
         ).execute()
-    log.info("Email backfill complete: attempted=%d found=%d wrote=%d",
-             attempted, found, len(updates))
+
+    log.info("--- Email backfill report ---")
+    log.info("  total rows:          %d", total_rows)
+    log.info("  already had email:   %d", already_filled)
+    log.info("  rows attempted:      %d", attempted)
+    log.info("  found + wrote:       %d", found)
+    log.info("  blank, no Drive:     %d  sample rows: %s",
+             no_drive_link, sample_empty_no_drive)
+    log.info("  blank, no email in PDF: %d  sample rows: %s",
+             no_email_in_pdf, sample_no_email)
+
+
+def hide_terminal_rows(svc, sheet_id, tab=CANDIDATES_TAB):
+    """One-time backfill: hide every Candidates row where HR Status
+    (col Q = col 17) is a terminal value. This was previously done by
+    an onEdit Apps Script trigger; running it once in Python brings the
+    sheet to the same end state without depending on the bound script."""
+    inner_id = _get_sheet_id(svc, sheet_id, tab)
+    if inner_id is None:
+        log.warning("Could not find sheet id for %s; skipping hide", tab)
+        return
+
+    # Read column Q (HR Status) for all data rows.
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!Q2:Q",
+    ).execute()
+    vals = resp.get("values", []) or []
+    terminal = {"Hired", "Rejected", "Not a fit", "Closed", "Withdrawn",
+                "Declined", "Move forward", "Interviewing", "Offer Extended"}
+
+    # Build a list of contiguous row ranges where status is terminal.
+    rows_to_hide = []
+    for i, v in enumerate(vals, start=2):
+        cell = (v[0] if v else "") or ""
+        if str(cell).strip() in terminal:
+            rows_to_hide.append(i)
+    if not rows_to_hide:
+        log.info("hide_terminal_rows: nothing to hide.")
+        return
+
+    # Merge into contiguous ranges to minimize requests.
+    requests = []
+    start = rows_to_hide[0]
+    prev = start
+    for r in rows_to_hide[1:]:
+        if r == prev + 1:
+            prev = r
+            continue
+        requests.append({"updateDimensionProperties": {
+            "range": {"sheetId": inner_id, "dimension": "ROWS",
+                      "startIndex": start - 1, "endIndex": prev},
+            "properties": {"hiddenByUser": True},
+            "fields": "hiddenByUser",
+        }})
+        start = r
+        prev = r
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": inner_id, "dimension": "ROWS",
+                  "startIndex": start - 1, "endIndex": prev},
+        "properties": {"hiddenByUser": True},
+        "fields": "hiddenByUser",
+    }})
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
+    ).execute()
+    log.info("hide_terminal_rows: hid %d rows in %d range(s).",
+             len(rows_to_hide), len(requests))
 
 
 # ============================================================
@@ -625,6 +711,9 @@ def run() -> int:
     log.info("STEP 6: Diagnostic dump of rows 13 and 26 for review")
     inspect_row(svc, cfg.sheet_id, CANDIDATES_TAB, 13)
     inspect_row(svc, cfg.sheet_id, CANDIDATES_TAB, 26)
+
+    log.info("STEP 7: Hide rows with terminal HR Status (replacement for Apps Script onEdit)")
+    hide_terminal_rows(svc, cfg.sheet_id)
 
     log.info("Migration complete.")
     return 0
