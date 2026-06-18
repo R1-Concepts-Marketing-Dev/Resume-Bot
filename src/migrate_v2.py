@@ -938,6 +938,45 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
     log.info("%s!A2 (ARRAYFORMULA days) + B2 (QUERY pending_paused) written.", tab)
 
 
+def clean_indeed_queue_orphans(svc, sheet_id):
+    """Indeed Queue rows where Timestamp is set but Candidate Name is
+    empty would block backfill_indeed_queue from appending fresh rows
+    (the dedupe-by-timestamp check would see those timestamps and skip
+    the corresponding Candidates row).
+
+    This step finds such orphan rows and CLEARS their Timestamp cell
+    (col G), freeing the backfill to re-add the row from Candidates.
+    Idempotent."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{INDEED_QUEUE_TAB}!A2:G",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read Indeed Queue: %s", e)
+        return
+    rows = resp.get("values", []) or []
+    cleared = []
+    for i, r in enumerate(rows, start=2):
+        r = (r + [""] * 7)[:7]
+        name = str(r[0]).strip()
+        ts = str(r[6]).strip()
+        if (not name) and ts:
+            # Orphan: timestamp without name -> clear the timestamp.
+            cleared.append({"range": f"{INDEED_QUEUE_TAB}!G{i}",
+                            "values": [[""]]})
+
+    if cleared:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": cleared, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+        log.info("Cleared timestamp on %d orphan Indeed Queue rows (now backfill can re-add).",
+                 len(cleared))
+    else:
+        log.info("No orphan Indeed Queue rows found.")
+
+
 def backfill_indeed_queue_columns(svc, sheet_id):
     """Fill in missing B (Position), C (Fit Quality), D (AI Recommendation)
     on existing Indeed Queue rows by looking up the matching Candidates
@@ -1515,8 +1554,9 @@ def run() -> int:
     fix_pending_query(svc, cfg.sheet_id)
     backfill_indeed_queue_columns(svc, cfg.sheet_id)
 
-    log.info("STEP 3: Indeed Queue backfill (with Gmail sender enrichment)")
+    log.info("STEP 3: Indeed Queue backfill (clean orphans, Gmail sender enrichment, then append)")
     gmail_svc = google_auth.gmail(creds)
+    clean_indeed_queue_orphans(svc, cfg.sheet_id)
     enrich_indeed_from_gmail(svc, cfg.sheet_id, gmail_svc, cfg.gmail_user)
     backfill_indeed_queue(svc, cfg.sheet_id)
 
