@@ -1125,9 +1125,9 @@ def audit_all_tabs(svc, sheet_id):
 
 def dump_all_tabs_state(svc, sheet_id):
     """Walk every tab and log its header row + first data row + total
-    row count + formula count. Used as a sanity check after migrations.
-    Anything anomalous (empty headers, broken formulas, fewer cols than
-    expected) will be obvious in the report."""
+    row count + formula count. Also write the same report to a
+    "Migration Report" tab on the spreadsheet so the user can read it
+    directly without needing to dig into GitHub Actions logs."""
     try:
         meta = svc.spreadsheets().get(
             spreadsheetId=sheet_id,
@@ -1209,6 +1209,106 @@ def dump_all_tabs_state(svc, sheet_id):
             log.warning("  Could not read formulas: %s", e)
 
     log.info("======== END TAB STATE DUMP ========")
+
+    # Also write the report to a "Migration Report" tab so the user can
+    # see the same information without digging into Actions logs.
+    report_tab = "Migration Report"
+    if _get_sheet_id(svc, sheet_id, report_tab) is None:
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": report_tab}}}]},
+            ).execute()
+            log.info("Created %s tab.", report_tab)
+        except Exception as e:
+            log.warning("Could not create %s tab: %s", report_tab, e)
+            return
+
+    # Re-collect the same info but as rows for the report tab.
+    report_rows = [[
+        "Tab", "Grid Rows", "Grid Cols", "Header Count",
+        "First Data Row Preview", "Formulas In First 100",
+        "Notes", "Audited At",
+    ]]
+    from datetime import datetime as _dt, timezone as _tz
+    audited = _dt.now(_tz.utc).isoformat(timespec="seconds")
+    try:
+        meta2 = svc.spreadsheets().get(
+            spreadsheetId=sheet_id, fields="sheets.properties",
+        ).execute()
+    except Exception:
+        meta2 = {"sheets": []}
+    for s2 in meta2.get("sheets", []):
+        p = s2.get("properties") or {}
+        title = p.get("title", "")
+        if title == report_tab:
+            continue
+        grid = p.get("gridProperties") or {}
+        r_count = grid.get("rowCount", 0)
+        c_count = grid.get("columnCount", 0)
+        try:
+            v = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=f"\'{title}\'!A1:Z2",
+            ).execute()
+            rows2 = v.get("values", []) or []
+            hdr = rows2[0] if rows2 else []
+            d1 = rows2[1] if len(rows2) > 1 else []
+        except Exception:
+            hdr, d1 = [], []
+        try:
+            f = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=f"\'{title}\'!A1:Z100",
+                valueRenderOption="FORMULA",
+            ).execute()
+            f_rows = f.get("values", []) or []
+            fcount = sum(1 for row in f_rows
+                         for cell in row
+                         if str(cell or "").startswith("="))
+        except Exception:
+            fcount = 0
+        # Notes: flag obvious issues
+        notes = []
+        if not hdr:
+            notes.append("EMPTY HEADER")
+        if len(hdr) < 2:
+            notes.append("<2 cols")
+        # Check for stale refs in any cell formula
+        if title not in ("Candidates", "Inbox Log", "Archive - Misc",
+                         "Bot Errors", "Bot Learning Log"):
+            for row in f_rows:
+                for cell in row:
+                    cv = str(cell or "")
+                    if "Candidates!A:P" in cv and ",16" in cv.replace(" ", ""):
+                        notes.append("stale A:P,16 ref")
+                        break
+                if notes and notes[-1] == "stale A:P,16 ref":
+                    break
+
+        report_rows.append([
+            title,
+            str(r_count),
+            str(c_count),
+            str(len(hdr)),
+            " | ".join(str(c)[:40] for c in d1[:8]),
+            str(fcount),
+            "; ".join(notes) if notes else "ok",
+            audited,
+        ])
+
+    try:
+        # Clear the tab then write the report
+        svc.spreadsheets().values().clear(
+            spreadsheetId=sheet_id, range=f"\'{report_tab}\'!A:Z",
+        ).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"\'{report_tab}\'!A1",
+            valueInputOption="RAW",
+            body={"values": report_rows},
+        ).execute()
+        log.info("Wrote %d-row report to %s tab.", len(report_rows), report_tab)
+    except Exception as e:
+        log.warning("Could not write report tab: %s", e)
 
 
 def run() -> int:
