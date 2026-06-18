@@ -311,6 +311,85 @@ def _is_indeed_candidate(row):
     return False
 
 
+def enrich_indeed_from_gmail(svc, sheet_id, gmail_svc, gmail_user,
+                             tab=CANDIDATES_TAB):
+    """For Candidates rows whose Application Submitted is not yet
+    "Indeed", look up the row's Gmail thread by its embedded thread_id
+    (in col P) and check whether the original sender domain is
+    indeed.com / indeedemail.com / similar. If so, mark the row as
+    Indeed so the subsequent backfill_indeed_queue picks it up.
+
+    Quietly skips rows where the thread fetch fails (deleted threads,
+    permission issues, etc.)."""
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{tab}!A2:R",
+        valueRenderOption="FORMULA",
+    ).execute()
+    rows = resp.get("values", []) or []
+    if not rows:
+        return
+
+    job_board_domains = (
+        "indeed.com", "indeedemail.com", "ziprecruiter.com",
+        "glassdoor.com", "monster.com", "careerbuilder.com", "snagajob.com",
+    )
+
+    examined = 0
+    upgraded = 0
+    failed = 0
+    updates = []
+    for i, r in enumerate(rows, start=2):
+        r = (r + [""] * 18)[:18]
+        appsub = str(r[4]).strip().lower()
+        if appsub.startswith("indeed"):
+            continue  # already correctly labeled
+        gmail_cell = str(r[15]).strip()  # col P
+        tm = _re.search(r"#inbox/([A-Za-z0-9_-]+)", gmail_cell)
+        if not tm:
+            continue
+        thread_id = tm.group(1)
+        examined += 1
+        if examined > 200:
+            break  # cap API calls per run
+        try:
+            thread = gmail_svc.users().threads().get(
+                userId=gmail_user, id=thread_id,
+                format="metadata", metadataHeaders=["From"],
+            ).execute()
+        except Exception:
+            failed += 1
+            continue
+        from_addr = ""
+        for msg in thread.get("messages", []):
+            for h in msg.get("payload", {}).get("headers", []):
+                if h.get("name", "").lower() == "from":
+                    from_addr = h.get("value", "")
+                    break
+            if from_addr:
+                break
+        if not from_addr:
+            continue
+        # Normalize: extract domain
+        import email.utils as _eu
+        _, sender_email = _eu.parseaddr(from_addr)
+        if "@" not in sender_email:
+            continue
+        domain = sender_email.rsplit("@", 1)[-1].lower()
+        if any(domain == d or domain.endswith("." + d) for d in job_board_domains):
+            updates.append({"range": f"{tab}!E{i}",
+                            "values": [["Indeed"]]})
+            upgraded += 1
+
+    if updates:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": updates, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+    log.info("Gmail Indeed enrichment: examined=%d upgraded=%d failed=%d",
+             examined, upgraded, failed)
+
+
 def backfill_indeed_queue(svc, sheet_id):
     """Step 3: walk Candidates after migration, and for every row that
     looks like an Indeed candidate (per _is_indeed_candidate -- uses
@@ -428,11 +507,14 @@ def _is_job_board_email(addr: str) -> bool:
     return any(domain == d or domain.endswith("." + d) for d in _JOB_BOARD_DOMAINS)
 
 
-def _extract_email_from_drive(drive_svc, drive_cell: str) -> str:
-    """drive_cell is the formula =HYPERLINK("https://drive.google.com/.../file_id/...","Link").
-    Returns the first non-job-board email found in the PDF, or "" on
-    any failure. Quietly degrades on errors so one bad row doesn't kill
-    the whole backfill pass."""
+def _extract_email_from_drive(drive_svc, drive_cell: str, anthropic_api_key: str = "") -> str:
+    """Pull the candidate email out of the resume PDF stored on Drive.
+
+    Try cheap regex first (no API cost). If regex finds nothing AND we
+    have an Anthropic key, send the PDF to Claude Haiku and ask it for
+    the candidate's email. Haiku reading a PDF natively catches emails
+    the regex misses (OCR-degraded text, unusual spacing, "name AT domain
+    DOT com" obfuscation, etc.). Returns "" on any failure."""
     if not drive_cell:
         return ""
     m = _re.search(r"/d/([A-Za-z0-9_-]{20,})", drive_cell)
@@ -446,23 +528,87 @@ def _extract_email_from_drive(drive_svc, drive_cell: str) -> str:
     except Exception as e:
         log.warning("Drive read failed for %s: %s", file_id, e)
         return ""
+
+    # Pass 1: cheap parse + regex
+    text = ""
     try:
         from . import resume_parser
         text, _ = resume_parser.extract("resume", mime, data)
     except Exception as e:
-        log.warning("resume_parser.extract failed: %s", e)
-        return ""
-    if not text:
-        return ""
-    for match in _EMAIL_REGEX.findall(text):
-        addr = match.strip().rstrip(".,;:")
-        if not _is_job_board_email(addr):
-            return addr
+        log.warning("resume_parser.extract failed for %s: %s", file_id, e)
+
+    if text:
+        for match in _EMAIL_REGEX.findall(text):
+            addr = match.strip().rstrip(".,;:")
+            if not _is_job_board_email(addr):
+                return addr
+
+    # Pass 2: ask Claude with the PDF if available
+    if anthropic_api_key and mime == "application/pdf" and data:
+        try:
+            email_from_llm = _ask_claude_for_email(anthropic_api_key, data)
+            if email_from_llm and not _is_job_board_email(email_from_llm):
+                return email_from_llm
+        except Exception as e:
+            log.warning("Claude email extract failed for %s: %s", file_id, e)
+
     return ""
 
 
-def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
-                    max_rows: int = 1000):
+def _ask_claude_for_email(api_key: str, pdf_bytes: bytes) -> str:
+    """Send the PDF directly to Claude Haiku and ask for the candidate's
+    email address. Returns empty string on no-match or any error.
+
+    Claude reads the PDF natively (vision/document mode), so it picks
+    up emails the regex misses -- e.g. when OCR mangled the @ sign, or
+    the resume writes "name@domain.com" inside a header bar that the
+    text extractor stripped."""
+    import base64 as _b64
+    import json as _json
+    import anthropic
+    encoded = _b64.standard_b64encode(pdf_bytes).decode("ascii")
+    system = (
+        "You read a single resume PDF and extract the candidate's real "
+        "email address. Return ONLY a JSON object: {\"email\": \"<addr>\"} "
+        "or {\"email\": \"\"} if no candidate email is visible. "
+        "Do NOT return employer emails, generic recruiting addresses "
+        "(jobs@, hr@, info@), or job-board relay aliases (anything "
+        "@indeed.com, @indeedemail.com, @ziprecruiter.com, @glassdoor.com, "
+        "@monster.com, @careerbuilder.com, @snagajob.com). Return ONLY "
+        "the candidate's personal email. No prose, no code fences."
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=80,
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document",
+                 "source": {"type": "base64",
+                            "media_type": "application/pdf",
+                            "data": encoded}},
+                {"type": "text",
+                 "text": "What is the candidate's real email address? Return JSON only."},
+            ],
+        }],
+    )
+    text = "".join(b.text for b in resp.content
+                   if getattr(b, "type", "") == "text").strip()
+    if text.startswith("```"):
+        text = _re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = _re.sub(r"\n?```\s*$", "", text).strip()
+    try:
+        data = _json.loads(text)
+    except Exception:
+        return ""
+    addr = str(data.get("email", "") or "").strip().rstrip(".,;:")
+    return addr
+
+
+def backfill_emails(svc, sheet_id, drive_svc, anthropic_key="",
+                    tab=CANDIDATES_TAB, max_rows: int = 1000):
     """Walk Candidates, find rows with blank col C (Email), try to
     extract the candidate's email from the resume PDF on Drive (col O).
     Writes back to col C only if a non-job-board email was found.
@@ -505,7 +651,7 @@ def backfill_emails(svc, sheet_id, drive_svc, tab=CANDIDATES_TAB,
             if len(sample_empty_no_drive) < 5:
                 sample_empty_no_drive.append(i)
             continue
-        extracted = _extract_email_from_drive(drive_svc, drive_link)
+        extracted = _extract_email_from_drive(drive_svc, drive_link, anthropic_api_key=anthropic_key)
         if extracted:
             found += 1
             updates.append({"range": f"{tab}!C{i}",
@@ -698,15 +844,18 @@ def run() -> int:
     log.info("STEP 2: Indeed Queue formula update")
     fix_indeed_queue_formulas(svc, cfg.sheet_id)
 
-    log.info("STEP 3: Indeed Queue backfill")
+    log.info("STEP 3: Indeed Queue backfill (with Gmail sender enrichment)")
+    gmail_svc = google_auth.gmail(creds)
+    enrich_indeed_from_gmail(svc, cfg.sheet_id, gmail_svc, cfg.gmail_user)
     backfill_indeed_queue(svc, cfg.sheet_id)
 
     log.info("STEP 4: Gmail link backfill (authuser=jobs@)")
     backfill_gmail_links(svc, cfg.sheet_id)
 
-    log.info("STEP 5: Email backfill (extract from resume PDFs on Drive)")
+    log.info("STEP 5: Email backfill (extract from resume PDFs on Drive, Claude fallback)")
     drive_svc = google_auth.drive(creds)
-    backfill_emails(svc, cfg.sheet_id, drive_svc)
+    backfill_emails(svc, cfg.sheet_id, drive_svc,
+                    anthropic_key=cfg.anthropic_api_key)
 
     log.info("STEP 6: Diagnostic dump of rows 13 and 26 for review")
     inspect_row(svc, cfg.sheet_id, CANDIDATES_TAB, 13)
