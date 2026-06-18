@@ -1195,6 +1195,65 @@ def dump_all_tabs_state(svc, sheet_id):
         return
 
     log.info("======== TAB STATE DUMP ========")
+
+    # First: count true data rows on Candidates including hidden ones.
+    # The Sheets API returns all rows regardless of hiddenByUser, so we
+    # get the authoritative count here. This catches cases where the
+    # hide_terminal_rows step has hidden many rows that gviz/QUERY
+    # would otherwise exclude.
+    try:
+        c_resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{CANDIDATES_TAB}!A2:R",
+        ).execute()
+        c_rows = c_resp.get("values", []) or []
+        non_empty = sum(1 for r in c_rows if r and str(r[0]).strip())
+        log.info("Candidates true data rows (incl. hidden): %d", non_empty)
+
+        # Count how many are hidden by checking sheet metadata
+        meta_resp = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            ranges=[f"{CANDIDATES_TAB}!A:A"],
+            fields="sheets(properties,data.rowMetadata)",
+        ).execute()
+        hidden_count = 0
+        terminal_count = 0
+        from collections import Counter as _Counter
+        appsub_counter = _Counter()
+        hr_status_counter = _Counter()
+        for r in c_rows:
+            if not r or not str(r[0]).strip():
+                continue
+            appsub = (r[4] if len(r) > 4 else "") or ""
+            hr_status = (r[16] if len(r) > 16 else "") or ""
+            appsub_counter[appsub] += 1
+            hr_status_counter[hr_status] += 1
+            if hr_status.strip() in {"Hired","Rejected","Not a fit","Closed",
+                                     "Withdrawn","Declined","Move forward",
+                                     "Interviewing","Offer Extended"}:
+                terminal_count += 1
+        log.info("Application Submitted breakdown: %s",
+                 dict(appsub_counter.most_common()))
+        log.info("HR Status breakdown: %s",
+                 dict(hr_status_counter.most_common()))
+        log.info("Rows with terminal HR Status (hidden by Apps Script): %d",
+                 terminal_count)
+
+        # Read hiddenByUser flag for each row from sheet metadata
+        for s in meta_resp.get("sheets", []):
+            props = s.get("properties") or {}
+            if props.get("title") != CANDIDATES_TAB:
+                continue
+            for data_block in s.get("data") or []:
+                meta_rows = data_block.get("rowMetadata") or []
+                for i, mr in enumerate(meta_rows):
+                    if mr.get("hiddenByUser"):
+                        hidden_count += 1
+            break
+        log.info("Rows hidden by user (hiddenByUser=true): %d", hidden_count)
+    except Exception as e:
+        log.warning("Could not count true Candidates rows: %s", e)
+
     for s in meta.get("sheets", []):
         props = s.get("properties") or {}
         title = props.get("title", "")
