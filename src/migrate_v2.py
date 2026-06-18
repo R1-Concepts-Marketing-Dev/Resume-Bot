@@ -894,6 +894,95 @@ def inspect_row(svc, sheet_id, tab, row_number):
         log.info("  %s: %r", h, val)
 
 
+def backfill_indeed_queue_columns(svc, sheet_id):
+    """Fill in missing B (Position), C (Fit Quality), D (AI Recommendation)
+    on existing Indeed Queue rows by looking up the matching Candidates
+    row via the timestamp in col G.
+
+    Rows that pre-existed our recent migration ended up with only
+    Candidate Name + HR Status + Closed checkbox + Timestamp populated.
+    This step walks every Indeed Queue row, and if B/C/D are blank,
+    pulls Applied For (Candidates!G) + a derived Fit Quality + AI
+    Recommendation from Candidates!J (Decision)."""
+    # Read full Indeed Queue
+    try:
+        q_resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{INDEED_QUEUE_TAB}!A2:G",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read Indeed Queue: %s", e)
+        return
+    q_rows = q_resp.get("values", []) or []
+    if not q_rows:
+        log.info("Indeed Queue empty -- nothing to backfill columns for.")
+        return
+
+    # Read Candidates A:R into a timestamp-indexed dict.
+    try:
+        c_resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{CANDIDATES_TAB}!A2:R",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read Candidates for IQ backfill: %s", e)
+        return
+    c_rows = c_resp.get("values", []) or []
+    by_ts = {}
+    for r in c_rows:
+        r = (r + [""] * 18)[:18]
+        ts = str(r[0]).strip()
+        if ts:
+            by_ts[ts] = {
+                "name": str(r[1]).strip(),
+                "applied_for": str(r[6]).strip(),
+                "decision": str(r[9]).strip(),
+            }
+    log.info("Loaded %d Candidates rows by timestamp for IQ join.",
+             len(by_ts))
+
+    updates = []
+    filled_b = 0
+    filled_c = 0
+    filled_d = 0
+    no_match = 0
+    for i, r in enumerate(q_rows, start=2):
+        r = (r + [""] * 7)[:7]
+        ts = str(r[6]).strip()
+        if not ts:
+            continue
+        cand = by_ts.get(ts)
+        if not cand:
+            no_match += 1
+            continue
+
+        # Position (col B)
+        if not str(r[1]).strip() and cand["applied_for"]:
+            updates.append({"range": f"{INDEED_QUEUE_TAB}!B{i}",
+                            "values": [[cand["applied_for"]]]})
+            filled_b += 1
+        # Fit Quality (col C) -- derived from decision
+        if not str(r[2]).strip() and cand["decision"]:
+            fit = _FIT_QUALITY.get(cand["decision"], cand["decision"])
+            updates.append({"range": f"{INDEED_QUEUE_TAB}!C{i}",
+                            "values": [[fit]]})
+            filled_c += 1
+        # AI Recommendation (col D) -- derived from decision
+        if not str(r[3]).strip() and cand["decision"]:
+            rec = _AI_RECOMMENDATION.get(cand["decision"], "Review manually")
+            updates.append({"range": f"{INDEED_QUEUE_TAB}!D{i}",
+                            "values": [[rec]]})
+            filled_d += 1
+
+    if updates:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": updates, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+    log.info("Indeed Queue columns backfilled: B=%d C=%d D=%d  no-match-in-Candidates=%d",
+             filled_b, filled_c, filled_d, no_match)
+
+
 def audit_all_tabs(svc, sheet_id):
     """Walk every tab in the spreadsheet and scan all formulas for
     references to Candidates columns. Identifies and auto-fixes ones
@@ -1058,9 +1147,10 @@ def run() -> int:
     log.info("STEP 1: Candidates tab restructure")
     migrate_candidates(svc, cfg.sheet_id)
 
-    log.info("STEP 2: Indeed Queue formula update + Cross-Match QUERY fix")
+    log.info("STEP 2: Indeed Queue formula update + Cross-Match QUERY fix + col backfill")
     fix_indeed_queue_formulas(svc, cfg.sheet_id)
     fix_cross_match_query(svc, cfg.sheet_id)
+    backfill_indeed_queue_columns(svc, cfg.sheet_id)
 
     log.info("STEP 3: Indeed Queue backfill (with Gmail sender enrichment)")
     gmail_svc = google_auth.gmail(creds)
