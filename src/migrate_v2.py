@@ -1745,5 +1745,26 @@ def run() -> int:
     return 0
 
 
+
+def run_email_only() -> int:
+    """Backfill emails only -- skips the destructive Indeed Queue rebuild
+    and other already-completed migration steps. Triggered when the
+    workflow_dispatch input `steps` is 'emails' or 'email'.
+    """
+    cfg = config.load()
+    log.info("Email-only backfill. Sheet=%s", cfg.sheet_id)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    svc = google_auth.sheets(creds)
+    drive_svc = google_auth.drive(creds)
+    backfill_emails(svc, cfg.sheet_id, drive_svc, anthropic_key=cfg.anthropic_api_key)
+    return 0
+
+
 if __name__ == "__main__":
+    import os as _os
+    _steps = (_os.environ.get("MIGRATE_STEPS", "all") or "all").strip().lower()
+    if _steps in ("emails", "email"):
+        sys.exit(run_email_only())
     sys.exit(run())
