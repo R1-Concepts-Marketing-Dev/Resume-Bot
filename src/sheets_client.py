@@ -32,6 +32,7 @@ DASHBOARD_HEADERS = [
     "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
     "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
     "Recruiter/Agency", "Indeed", "Indeed Action Done",
+    "Application Submitted",
 ]
 
 
@@ -776,7 +777,7 @@ def append_error(svc, sheet_id, tab, row):
 
 
 def append_candidate(svc, sheet_id, tab, row):
-    """Append a candidate row to the Candidates dashboard (columns A:T).
+    """Append a candidate row to the Candidates dashboard (columns A:U).
 
     Indeed column (S): "Yes" if the candidate came in via a job-board
     alias (Indeed conversation-*@indeed.com etc.), else "No". Used by the
@@ -785,8 +786,15 @@ def append_candidate(svc, sheet_id, tab, row):
     Indeed Action Done (T): HR-managed; bot writes empty. Once HR has
     moved/declined the candidate inside Indeed's dashboard they tick
     this; the Indeed Queue's filter view then hides the row.
+
+    Application Submitted (U): Where the application came from --
+    one of Email / Indeed / Recruiter-Agency / Craigslist. Bot
+    computes this from sender + recruiter_agency scorer signal +
+    body keyword match for Craigslist. Defaults to Email when no
+    other signal triggers.
     """
     recruiter_agency = (row.get("recruiter_agency") or "N/A").strip() or "N/A"
+    application_submitted = (row.get("application_submitted") or "Email").strip() or "Email"
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         _safe(row.get("candidate_name", "")),
@@ -808,10 +816,11 @@ def append_candidate(svc, sheet_id, tab, row):
         _safe(recruiter_agency),
         "Yes" if row.get("indeed") else "No",
         "",  # Indeed Action Done (HR fills in)
+        _safe(application_submitted),  # Application Submitted (Email/Indeed/Recruiter-Agency/Craigslist)
     ]
     svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A:T",
+        range=f"{tab}!A:U",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},

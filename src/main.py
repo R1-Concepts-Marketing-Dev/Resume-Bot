@@ -775,6 +775,23 @@ def _process_resume_attachments(
         if is_internal_forward:
             template_key = None
 
+        # ----- Recruiter / agency suppression -----
+        # When the scorer flags the application as coming from a
+        # recruiter/agency (rather than the candidate themselves), the
+        # bot never auto-replies. Replying to a recruiter goes back to
+        # the recruiter, not the candidate -- HR wants to handle that
+        # outreach manually because the recruiter expects a direct
+        # conversation. The row still lands in Candidates so HR can
+        # see the candidate and decide; we only suppress the reply.
+        recruiter_agency_value = (result.get("recruiter_agency") or "N/A").strip() or "N/A"
+        is_recruiter_submission = recruiter_agency_value.lower() not in {
+            "n/a", "na", "none", "null", "unknown", "",
+        }
+        if is_recruiter_submission and template_key:
+            log.info("  -> recruiter/agency submission (%s); suppressing auto-reply",
+                     recruiter_agency_value)
+            template_key = None
+
         tag_roles = active_matches or paused_matches or qualifying
         tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
         tagged_name = f"{tag}{att.filename}" if tag else att.filename
@@ -805,6 +822,27 @@ def _process_resume_attachments(
             cross_fit_match = ""
 
         is_indeed_candidate = _is_job_board_alias(msg.sender_email)
+
+        # ----- Application source classification -----
+        # Drives the new "Application Submitted" column on the
+        # Candidates dashboard. Precedence: recruiter beats Indeed
+        # (a recruiter forwarding through Indeed is still routed via a
+        # recruiter), Indeed beats Craigslist body match, everything
+        # else defaults to Email. Craigslist detection is sender-OR-body
+        # because Craigslist relays through randomized reply aliases
+        # (something@reply.craigslist.org) but the body text consistently
+        # mentions "craigslist".
+        _sender_lc = (msg.sender_email or "").lower()
+        _body_lc = (msg.body_text or "").lower()
+        if is_recruiter_submission:
+            application_submitted = "Recruiter/Agency"
+        elif is_indeed_candidate:
+            application_submitted = "Indeed"
+        elif "craigslist" in _sender_lc or "craigslist.org" in _body_lc:
+            application_submitted = "Craigslist"
+        else:
+            application_submitted = "Email"
+
         candidate_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
@@ -824,8 +862,9 @@ def _process_resume_attachments(
                 "reasoning": result["reasoning"],
                 "drive_link": drive_link,
                 "gmail_link": msg.thread_link,
-                "recruiter_agency": result.get("recruiter_agency", "N/A"),
+                "recruiter_agency": recruiter_agency_value,
                 "indeed": is_indeed_candidate,
+                "application_submitted": application_submitted,
             },
         )
         # Dual-write to the Indeed Queue tab: HR's focused worklist for
@@ -901,12 +940,6 @@ def _process_resume_attachments(
         return scored
 
     outcome_id = outcome_label_ids.get(final_bucket)
-    if outcome_id:
-        gmail_client.archive_with_outcome(
-            gmail, cfg.gmail_user, msg_id,
-            processed_label_id=label_id,
-            outcome_label_id=outcome_id,
-        )
     if outcome_id:
         gmail_client.archive_with_outcome(
             gmail, cfg.gmail_user, msg_id,

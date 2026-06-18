@@ -119,7 +119,18 @@ class Message:
 
     @property
     def thread_link(self) -> str:
-        return f"https://mail.google.com/mail/u/0/#inbox/{self.thread_id}"
+        # Force Gmail to open the thread under the jobs@r1concepts.com
+        # account. Without ?authuser=, clicking the link from a user
+        # signed in to a different Google account (e.g. HR's work email)
+        # routes to Gmail under that account, where the thread doesn't
+        # exist -- they see an empty/error page. Pinning authuser to
+        # the jobs@ mailbox makes the link work for any HR user who has
+        # delegated access to that mailbox.
+        return (
+            "https://mail.google.com/mail/"
+            "?authuser=jobs@r1concepts.com"
+            f"#inbox/{self.thread_id}"
+        )
 
     @property
     def has_resume(self) -> bool:
