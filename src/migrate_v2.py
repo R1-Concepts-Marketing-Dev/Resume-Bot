@@ -1784,6 +1784,64 @@ def run() -> int:
 
 
 
+def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
+    """For every Candidates row, set col S to "🚩 Previously rejected"
+    if an earlier row exists with the same trimmed/case-insensitive name
+    AND a terminal-rejection HR Status (Rejected / Not Selected / Not a fit).
+    Idempotent."""
+    REJECTED = {"Rejected", "Not Selected", "Not a fit"}
+    FLAG = "🚩 Previously rejected"
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=f"{tab}!A2:R",
+    ).execute()
+    rows = resp.get("values", []) or []
+    log.info("prior-rejection backfill: %d Candidates rows", len(rows))
+    history = {}
+    for i, r in enumerate(rows):
+        r = (r + [""] * 18)[:18]
+        name = str(r[1] or "").strip().lower()
+        if not name:
+            continue
+        hr_status = str(r[16] or "").strip()
+        history.setdefault(name, []).append((i, hr_status))
+    updates = []
+    flagged = 0
+    for i, r in enumerate(rows):
+        r = (r + [""] * 18)[:18]
+        name = str(r[1] or "").strip().lower()
+        flag = ""
+        if name:
+            for j, prev_status in history.get(name, []):
+                if j < i and prev_status in REJECTED:
+                    flag = FLAG
+                    flagged += 1
+                    break
+        updates.append({"range": f"{tab}!S{i + 2}", "values": [[flag]]})
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id, range=f"{tab}!S1",
+        valueInputOption="RAW",
+        body={"values": [["Prior Rejection"]]},
+    ).execute()
+    if updates:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"data": updates, "valueInputOption": "USER_ENTERED"},
+        ).execute()
+    log.info("prior-rejection backfill: flagged %d row(s) of %d", flagged, len(rows))
+
+
+def run_prior_rejection_only() -> int:
+    """Set col S header and backfill the duplicate-rejection flag. Idempotent."""
+    cfg = config.load()
+    log.info("Prior-rejection backfill. Sheet=%s", cfg.sheet_id)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    svc = google_auth.sheets(creds)
+    backfill_prior_rejection(svc, cfg.sheet_id)
+    return 0
+
+
 def run_email_only() -> int:
     """Backfill emails only -- skips the destructive Indeed Queue rebuild
     and other already-completed migration steps. Triggered when the
@@ -1805,4 +1863,6 @@ if __name__ == "__main__":
     _steps = (_os.environ.get("MIGRATE_STEPS", "all") or "all").strip().lower()
     if _steps in ("emails", "email"):
         sys.exit(run_email_only())
+    if _steps in ("prior_rejection", "rejection", "dup"):
+        sys.exit(run_prior_rejection_only())
     sys.exit(run())
