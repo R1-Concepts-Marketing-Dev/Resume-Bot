@@ -1784,6 +1784,83 @@ def run() -> int:
 
 
 
+def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
+    """Apply visual styling to col S so it visually fits with the other
+    HR-active columns:
+      * Column width 190px so the flag text doesn't get truncated.
+      * S1 header: light green bg (matching HR Status/HR Notes), bold.
+      * S2:S conditional format: light-red bg + dark-red bold text when
+        the cell contains "Previously rejected" (the flag).
+    Idempotent: removes any prior matching CF rule before re-adding."""
+    inner_id = _get_sheet_id(svc, sheet_id, tab)
+    if inner_id is None:
+        log.warning("Could not find sheet id for %s; skipping styling.", tab)
+        return
+
+    # 1) Column width
+    requests = [{
+        "updateDimensionProperties": {
+            "range": {"sheetId": inner_id, "dimension": "COLUMNS",
+                      "startIndex": 18, "endIndex": 19},
+            "properties": {"pixelSize": 190},
+            "fields": "pixelSize",
+        }
+    }]
+
+    # 2) S1 header format: light green bg, bold, vertically centered, wrap
+    requests.append({
+        "repeatCell": {
+            "range": {"sheetId": inner_id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 18, "endColumnIndex": 19},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
+                    "textFormat": {"bold": True, "fontSize": 10,
+                                   "foregroundColor": {"red": 0.122, "green": 0.153, "blue": 0.227}},
+                    "verticalAlignment": "MIDDLE",
+                    "horizontalAlignment": "LEFT",
+                    "wrapStrategy": "WRAP",
+                }
+            },
+            "fields": ("userEnteredFormat.backgroundColor,"
+                       "userEnteredFormat.textFormat,"
+                       "userEnteredFormat.verticalAlignment,"
+                       "userEnteredFormat.horizontalAlignment,"
+                       "userEnteredFormat.wrapStrategy"),
+        }
+    })
+
+    # 3) Conditional formatting on S2:S -- light red bg + bold dark red text
+    #    when cell text contains "Previously rejected".
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": inner_id, "startRowIndex": 1,
+                    "startColumnIndex": 18, "endColumnIndex": 19,
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": "TEXT_CONTAINS",
+                        "values": [{"userEnteredValue": "Previously rejected"}],
+                    },
+                    "format": {
+                        "backgroundColor": {"red": 0.988, "green": 0.898, "blue": 0.902},
+                        "textFormat": {"bold": True,
+                                       "foregroundColor": {"red": 0.722, "green": 0.314, "blue": 0.259}},
+                    },
+                }
+            },
+            "index": 0,
+        }
+    })
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
+    ).execute()
+    log.info("style_prior_rejection_column: width + header + conditional format applied.")
+
+
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
     """For every Candidates row, set col S to "🚩 Previously rejected"
     if an earlier row exists with the same trimmed/case-insensitive name
@@ -1839,6 +1916,7 @@ def run_prior_rejection_only() -> int:
     )
     svc = google_auth.sheets(creds)
     backfill_prior_rejection(svc, cfg.sheet_id)
+    style_prior_rejection_column(svc, cfg.sheet_id)
     return 0
 
 
