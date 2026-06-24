@@ -75,18 +75,18 @@ _CALENDAR_MIME_TYPES = {
 
 # Outcome labels applied to threads. Names use Gmail's "Parent/Child"
 # convention so they nest in the sidebar.
-#   "Done/*"   = bot handled the thread; INBOX label removed (archived).
+#   "Handled/*"   = bot handled the thread; INBOX label removed (archived).
 #   "For HR"   = umbrella label applied to every stuck thread so HR can
 #                click it in the sidebar and see the full queue.
 #   "For HR/*" = sub-label naming the specific reason it's stuck.
 OUTCOME_LABELS = {
-    "qualified":         "Done/Qualified",
-    "needs_review":      "Done/Needs review",
-    "not_qualified":     "Done/Not qualified",
-    "pending_paused":    "Done/Paused role",
-    "unreadable":        "Done/Unreadable",
-    "not_a_resume":      "Done/Not a resume",
-    "closed":            "Done/Closed",
+    "qualified":         "Handled/Qualified",
+    "needs_review":      "Handled/Needs review",
+    "not_qualified":     "Handled/Not qualified",
+    "pending_paused":    "Handled/Paused role",
+    "unreadable":        "Handled/Unreadable",
+    "not_a_resume":      "Handled/Not a resume",
+    "closed":            "Handled/Closed",
     "needs_human":       "For HR",
     "for_hr":            "For HR",
     "for_hr_question":         "For HR/Question?",
@@ -103,13 +103,13 @@ REASON_TYPE_TO_HR_SUBLABEL = {
 
 
 LEGACY_LABEL_RENAMES = {
-    "Resume Bot/Qualified":          "Done/Qualified",
-    "Resume Bot/Needs Review":       "Done/Needs review",
-    "Resume Bot/Not Qualified":      "Done/Not qualified",
-    "Resume Bot/Pending Paused Role":"Done/Paused role",
-    "Resume Bot/Unreadable":         "Done/Unreadable",
-    "Resume Bot/Not A Resume":       "Done/Not a resume",
-    "Resume Bot/Closed":             "Done/Closed",
+    "Resume Bot/Qualified":          "Handled/Qualified",
+    "Resume Bot/Needs Review":       "Handled/Needs review",
+    "Resume Bot/Not Qualified":      "Handled/Not qualified",
+    "Resume Bot/Pending Paused Role":"Handled/Paused role",
+    "Resume Bot/Unreadable":         "Handled/Unreadable",
+    "Resume Bot/Not A Resume":       "Handled/Not a resume",
+    "Resume Bot/Closed":             "Handled/Closed",
     "Resume Bot/Needs Human":        "For HR",
 }
 
@@ -187,7 +187,7 @@ def ensure_label(svc, user: str, name: str) -> str:
 def migrate_legacy_labels(svc, user: str) -> int:
     """One-time idempotent rename of pre-redesign labels.
 
-    Maps each "Resume Bot/X" label to its new "Done/X" or "For HR" name
+    Maps each "Resume Bot/X" label to its new "Handled/X" or "For HR" name
     via the Gmail labels PATCH endpoint. Renaming preserves the label
     ID so threads previously labeled keep their label under the new
     name -- no thread-level re-labeling needed. Safe to re-run."""
@@ -248,7 +248,7 @@ def ensure_outcome_labels(svc, user: str) -> dict[str, str]:
         log.info("created Gmail label %r", name)
         return created["id"]
 
-    for parent in ("Done", "For HR"):
+    for parent in ("Handled", "For HR"):
         if parent not in existing:
             _create(parent)
 
