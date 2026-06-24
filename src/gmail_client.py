@@ -27,11 +27,6 @@ TERMINAL_TEMPLATE_KEYS = frozenset({"denied", "paused_match"})
 
 ALL_TEMPLATE_KEYS = frozenset({"no_resume", "question", "denied", "paused_match"})
 
-# Only headers that genuinely indicate an automated REPLY (RFC 3834-ish).
-# Removed list-unsubscribe / list-id / precedence:bulk -- those are also
-# set by legitimate transactional mailers like Indeed and Greenhouse, which
-# we MUST process as real candidate applications. Keep precedence:junk
-# (spam-ish) but drop bulk/list (used by every job board's notifications).
 _AUTO_REPLY_HEADER_SIGNALS = {
     "auto-submitted":  ("auto-replied", "auto-generated", "auto-notified"),
     "x-autoreply":     None,
@@ -40,8 +35,6 @@ _AUTO_REPLY_HEADER_SIGNALS = {
     "precedence":      ("auto_reply", "junk"),
 }
 
-# Subject-line OOO heuristic. Used as belt-and-suspenders alongside
-# header detection -- some mail clients don't set Auto-Submitted etc.
 _OOO_SUBJECT_PATTERNS = [
     re.compile(r"\bout[\s-]of[\s-]office\b", re.IGNORECASE),
     re.compile(r"\bauto[\s-]?reply\b", re.IGNORECASE),
@@ -74,23 +67,50 @@ RESUME_MIME_TYPES = {
     "image/tiff": ".tif",
 }
 
-# MIME types / filename extensions that mean "calendar invite" -- these
-# should bypass the classifier and go straight to MISC.
 _CALENDAR_MIME_TYPES = {
     "text/calendar",
     "application/ics",
     "application/vnd.icalendar",
 }
 
+# Outcome labels applied to threads. Names use Gmail's "Parent/Child"
+# convention so they nest in the sidebar.
+#   "Done/*"   = bot handled the thread; INBOX label removed (archived).
+#   "For HR"   = umbrella label applied to every stuck thread so HR can
+#                click it in the sidebar and see the full queue.
+#   "For HR/*" = sub-label naming the specific reason it's stuck.
 OUTCOME_LABELS = {
-    "qualified":       "Resume Bot/Qualified",
-    "needs_review":    "Resume Bot/Needs Review",
-    "not_qualified":   "Resume Bot/Not Qualified",
-    "pending_paused":  "Resume Bot/Pending Paused Role",
-    "unreadable":      "Resume Bot/Unreadable",
-    "not_a_resume":    "Resume Bot/Not A Resume",
-    "needs_human":     "Resume Bot/Needs Human",
-    "closed":          "Resume Bot/Closed",
+    "qualified":         "Done/Qualified",
+    "needs_review":      "Done/Needs review",
+    "not_qualified":     "Done/Not qualified",
+    "pending_paused":    "Done/Paused role",
+    "unreadable":        "Done/Unreadable",
+    "not_a_resume":      "Done/Not a resume",
+    "closed":            "Done/Closed",
+    "needs_human":       "For HR",
+    "for_hr":            "For HR",
+    "for_hr_question":         "For HR/Question?",
+    "for_hr_indeed_fetch":     "For HR/Indeed fetch failed",
+    "for_hr_loop":             "For HR/Looping sender",
+}
+
+
+REASON_TYPE_TO_HR_SUBLABEL = {
+    "low_confidence": "for_hr_question",
+    "indeed_fetch":   "for_hr_indeed_fetch",
+    "loop":           "for_hr_loop",
+}
+
+
+LEGACY_LABEL_RENAMES = {
+    "Resume Bot/Qualified":          "Done/Qualified",
+    "Resume Bot/Needs Review":       "Done/Needs review",
+    "Resume Bot/Not Qualified":      "Done/Not qualified",
+    "Resume Bot/Pending Paused Role":"Done/Paused role",
+    "Resume Bot/Unreadable":         "Done/Unreadable",
+    "Resume Bot/Not A Resume":       "Done/Not a resume",
+    "Resume Bot/Closed":             "Done/Closed",
+    "Resume Bot/Needs Human":        "For HR",
 }
 
 
@@ -113,19 +133,10 @@ class Message:
     attachments: list[Attachment] = field(default_factory=list)
     was_unread: bool = False
     headers: dict[str, str] = field(default_factory=dict)
-    # True if any MIME part is a calendar invite (text/calendar or .ics).
-    # Set during fetch() so callers don't have to re-walk the payload.
     has_calendar_invite: bool = False
 
     @property
     def thread_link(self) -> str:
-        # Force Gmail to open the thread under the jobs@r1concepts.com
-        # account. Without ?authuser=, clicking the link from a user
-        # signed in to a different Google account (e.g. HR's work email)
-        # routes to Gmail under that account, where the thread doesn't
-        # exist -- they see an empty/error page. Pinning authuser to
-        # the jobs@ mailbox makes the link work for any HR user who has
-        # delegated access to that mailbox.
         return (
             "https://mail.google.com/mail/"
             "?authuser=jobs@r1concepts.com"
@@ -138,7 +149,6 @@ class Message:
 
     @property
     def is_auto_response(self) -> bool:
-        """True if headers indicate an auto-reply / OOO / newsletter."""
         for hdr, allowed_substrings in _AUTO_REPLY_HEADER_SIGNALS.items():
             val = (self.headers.get(hdr) or "").lower()
             if not val:
@@ -151,9 +161,6 @@ class Message:
 
     @property
     def subject_indicates_ooo(self) -> bool:
-        """True if the subject line matches a common OOO/auto-reply
-        pattern. Used as a fallback when headers don't expose the
-        Auto-Submitted/etc. fields."""
         s = self.subject or ""
         return any(p.search(s) for p in _OOO_SUBJECT_PATTERNS)
 
@@ -177,30 +184,80 @@ def ensure_label(svc, user: str, name: str) -> str:
     return created["id"]
 
 
+def migrate_legacy_labels(svc, user: str) -> int:
+    """One-time idempotent rename of pre-redesign labels.
+
+    Maps each "Resume Bot/X" label to its new "Done/X" or "For HR" name
+    via the Gmail labels PATCH endpoint. Renaming preserves the label
+    ID so threads previously labeled keep their label under the new
+    name -- no thread-level re-labeling needed. Safe to re-run."""
+    try:
+        labels = svc.users().labels().list(userId=user).execute().get("labels", [])
+    except Exception as e:
+        log.warning("migrate_legacy_labels: could not list labels: %s", e)
+        return 0
+    by_name = {lbl["name"]: lbl["id"] for lbl in labels}
+    renamed = 0
+    for old_name, new_name in LEGACY_LABEL_RENAMES.items():
+        if old_name not in by_name:
+            continue
+        if new_name in by_name:
+            log.info("migrate_legacy_labels: skip %r -> %r (target exists)",
+                     old_name, new_name)
+            continue
+        try:
+            svc.users().labels().patch(
+                userId=user, id=by_name[old_name],
+                body={"name": new_name},
+            ).execute()
+            log.info("migrate_legacy_labels: renamed %r -> %r",
+                     old_name, new_name)
+            renamed += 1
+        except Exception as e:
+            log.warning("migrate_legacy_labels: could not rename %r: %s",
+                        old_name, e)
+    try:
+        labels_after = svc.users().labels().list(
+            userId=user).execute().get("labels", [])
+        children_remain = any(
+            lbl["name"].startswith("Resume Bot/") for lbl in labels_after
+        )
+        if "Resume Bot" in by_name and not children_remain:
+            svc.users().labels().delete(
+                userId=user, id=by_name["Resume Bot"]).execute()
+            log.info("migrate_legacy_labels: removed empty 'Resume Bot' parent")
+    except Exception as e:
+        log.warning("migrate_legacy_labels: parent cleanup failed: %s", e)
+    return renamed
+
+
 def ensure_outcome_labels(svc, user: str) -> dict[str, str]:
-    """Create all outcome labels under a 'Resume Bot' parent if missing."""
+    """Create the For HR / Done label tree if missing. Idempotent."""
+    migrate_legacy_labels(svc, user)
     existing = {lbl["name"]: lbl["id"]
                 for lbl in svc.users().labels().list(userId=user).execute().get("labels", [])}
-    if "Resume Bot" not in existing:
-        created = svc.users().labels().create(
-            userId=user,
-            body={"name": "Resume Bot",
-                  "labelListVisibility": "labelShow",
-                  "messageListVisibility": "show"},
-        ).execute()
-        existing["Resume Bot"] = created["id"]
-    out: dict[str, str] = {}
-    for key, name in OUTCOME_LABELS.items():
-        if name in existing:
-            out[key] = existing[name]
-            continue
+
+    def _create(name: str) -> str:
         created = svc.users().labels().create(
             userId=user,
             body={"name": name,
                   "labelListVisibility": "labelShow",
                   "messageListVisibility": "show"},
         ).execute()
-        out[key] = created["id"]
+        existing[name] = created["id"]
+        log.info("created Gmail label %r", name)
+        return created["id"]
+
+    for parent in ("Done", "For HR"):
+        if parent not in existing:
+            _create(parent)
+
+    out: dict[str, str] = {}
+    for key, name in OUTCOME_LABELS.items():
+        if name in existing:
+            out[key] = existing[name]
+            continue
+        out[key] = _create(name)
     return out
 
 
@@ -259,13 +316,6 @@ _ANCHOR_TAG_RE = re.compile(
 
 
 def _html_to_text(html: str) -> str:
-    """Convert an HTML email body to readable text while PRESERVING
-    href URLs inside anchor tags. A naive `re.sub("<[^>]+>", " ", ...)`
-    drops the href attribute along with the tag, so any link whose text
-    differs from its URL (e.g., a 'View resume' button) loses the URL.
-    This matters when the bot needs to detect the Indeed Quick Apply
-    URL or any other action link in the body. We inline each anchor as
-    'TEXT URL' before stripping the remaining tags."""
     if not html:
         return ""
     def inline(match):
@@ -276,7 +326,6 @@ def _html_to_text(html: str) -> str:
         return href or text
     inlined = _ANCHOR_TAG_RE.sub(inline, html)
     stripped = re.sub(r"<[^>]+>", " ", inlined)
-    # Collapse runs of whitespace so URLs land cleanly on their own.
     return re.sub(r"[ \t]+", " ", stripped).strip()
 
 
@@ -289,10 +338,6 @@ def _extract_body_text(payload: dict) -> str:
             plain_chunks.append(_decode_body(part))
         elif mime.startswith("text/html"):
             html_chunks.append(_decode_body(part))
-    # Always combine plain + HTML-with-anchors-inlined so URL-only
-    # content (e.g., Avanan-wrapped 'View resume' links) is visible to
-    # downstream extractors even when the plain part omits URLs. Plain
-    # wins for readability ordering; HTML appends for URL coverage.
     parts: list[str] = []
     if plain_chunks:
         parts.append("\n".join(plain_chunks).strip())
@@ -302,8 +347,6 @@ def _extract_body_text(payload: dict) -> str:
 
 
 def _has_calendar_invite(payload: dict) -> bool:
-    """True if any MIME part is a calendar invite. Catches both modern
-    invites (text/calendar) and attached .ics files."""
     for part in _walk_parts(payload):
         mime = (part.get("mimeType") or "").lower()
         if mime in _CALENDAR_MIME_TYPES:
@@ -390,15 +433,22 @@ def archive_with_outcome(svc, user: str, msg_id: str, *,
 
 def flag_needs_human(svc, user: str, msg_id: str, *,
                      needs_human_label_id: str,
-                     processed_label_id: str = "") -> None:
-    """Apply the Needs Human label so HR sees the email in their inbox /
-    Multiple Inbox pane. Does NOT remove INBOX (keeps it visible) and
-    does NOT mark processed by default -- those decisions belong to
-    main.py based on whether the email also needs to be picked up again
-    on a later run (e.g. business-hours retry)."""
+                     processed_label_id: str = "",
+                     extra_label_ids: list | None = None) -> None:
+    """Apply the For HR umbrella label so HR sees the thread in their
+    inbox via the "For HR" sidebar entry. Does NOT remove INBOX -- the
+    point is that HR keeps seeing the thread.
+
+    Pass extra_label_ids to also attach a "For HR/<reason>" sub-label
+    so HR can see WHY at a glance.
+    """
     label_ids = [needs_human_label_id]
     if processed_label_id:
         label_ids.append(processed_label_id)
+    if extra_label_ids:
+        for lid in extra_label_ids:
+            if lid and lid not in label_ids:
+                label_ids.append(lid)
     try:
         svc.users().messages().modify(
             userId=user, id=msg_id,

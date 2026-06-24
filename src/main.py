@@ -60,9 +60,6 @@ def _is_internal_sender(sender_email: str, internal_domains: tuple) -> bool:
 
 
 def _is_blocklisted_sender(sender_email: str, blocklist: tuple) -> bool:
-    """Check sender against the configured BLOCKLIST_SENDERS. Each entry
-    is either a full email (matches exact) or a domain like 'example.com'
-    or '@example.com' (matches any sender from that domain)."""
     if not sender_email or not blocklist:
         return False
     se = sender_email.strip().lower()
@@ -80,11 +77,6 @@ def _is_blocklisted_sender(sender_email: str, blocklist: tuple) -> bool:
     return False
 
 
-# Job-board forwarders use opaque email aliases (e.g. apply+abc123@indeed.com)
-# that aren't the candidate's real email -- replies are relayed through the
-# board. We can still REPLY to these aliases (Indeed/etc. forward back to the
-# candidate), but we must NOT write them into the Candidates dashboard Email
-# column, where HR would expect a real reply-to address.
 _JOB_BOARD_DOMAINS = (
     "indeed.com",
     "indeedemail.com",
@@ -108,24 +100,12 @@ _EMAIL_REGEX = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 def _pick_candidate_email(scorer_email: str, fallback_sender: str,
                           resume_text: str = "", email_body: str = "") -> str:
-    """Return the best candidate email for the Candidates dashboard.
-
-    Priority order:
-      1. scorer-extracted email (the LLM tried to read it from resume/body)
-      2. From: header (only if not a job-board alias)
-      3. Regex match on resume text -- catches cases where the scorer
-         returned empty but there IS an email in the resume (the LLM
-         occasionally misses obvious matches, especially on OCR'd PDFs)
-      4. Regex match on email body
-      5. Empty -- better than writing a job-board alias HR can't reply to
-    """
     se = (scorer_email or "").strip()
     if se and not _is_job_board_alias(se):
         return se
     fb = (fallback_sender or "").strip()
     if fb and not _is_job_board_alias(fb):
         return fb
-    # Regex fallback: scan resume text first (more reliable), then body.
     for source in (resume_text, email_body):
         if not source:
             continue
@@ -137,14 +117,7 @@ def _pick_candidate_email(scorer_email: str, fallback_sender: str,
 
 
 def _is_business_hours(now_utc: datetime, start_pt: int, end_pt: int) -> bool:
-    """True if current Pacific Time is Mon-Fri AND inside [start_pt, end_pt).
-
-    Saturdays and Sundays always return False, so weekend emails get
-    queued by the same outside-biz-hours logic as off-hours emails and
-    pick up on Monday morning. PDT for most of the year (Mar-Nov);
-    accept 1h drift in winter rather than detecting DST."""
     pt = now_utc - timedelta(hours=7)
-    # weekday(): Monday=0 ... Sunday=6. Skip Sat (5) and Sun (6).
     if pt.weekday() >= 5:
         return False
     return start_pt <= pt.hour < end_pt
@@ -189,18 +162,12 @@ def run() -> int:
     log.info("Loaded %d known candidate email(s) for dup-reply suppression",
              len(known_emails))
 
-    # Threads already in the Needs Human queue (status Open/Investigating).
-    # Used to dedupe: a stuck conversation that loop-detection keeps
-    # flagging shouldn't add a fresh row every 10 minutes.
     open_needs_human = sheets_client.load_open_needs_human_threads(
         sheets, cfg.sheet_id, cfg.needs_human_tab,
     )
     log.info("Loaded %d open Needs Human thread(s) for dedup",
              len(open_needs_human))
 
-    # Loop detection: count messages per sender in the past N hours so we
-    # can flag senders who have hit jobs@ 3+ times in 24h (likely stuck
-    # conversation or spam) -> Needs Human queue.
     recent_sender_counts = sheets_client.load_recent_inbox_senders(
         sheets, cfg.sheet_id, cfg.inbox_log_tab,
         hours_back=cfg.loop_window_hours,
@@ -208,9 +175,6 @@ def run() -> int:
     log.info("Loaded loop-detection counts for %d sender(s) in past %dh",
              len(recent_sender_counts), cfg.loop_window_hours)
 
-    # Audit feedback: load HR-corrected examples to pass into the scorer
-    # as few-shot context. Quietly degrades to an empty list if the
-    # Bot Learning Log tab doesn't exist yet (pre-audit deployments).
     learning_examples = sheets_client.load_learning_examples(
         sheets, cfg.sheet_id, getattr(cfg, "learning_log_tab", "Bot Learning Log"),
         max_examples=getattr(cfg, "learning_examples_max", 8),
@@ -331,10 +295,10 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     def _flag_needs_human(reason: str, reason_type: str = "manual",
                           bot_guess: str = "", confidence: str = "",
                           mark_done: bool = True):
-        """Route to the Needs Human queue: Gmail label + sheet row +
-        Inbox Log."""
+        """Route to the For HR queue: Gmail labels (umbrella + reason
+        sub-label) + sheet row (dual-write transition) + Inbox Log."""
         if open_needs_human_threads and msg.thread_id in open_needs_human_threads:
-            log.info("  -> thread %s already in Needs Human queue; skipping duplicate row",
+            log.info("  -> thread %s already in For HR queue; skipping duplicate row",
                      msg.thread_id)
             _log_inbox("needs_human", f"duplicate suppressed ({reason})")
         else:
@@ -359,11 +323,16 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         if cfg.shadow_mode:
             return
         nh_label = outcome_label_ids.get("needs_human", "")
+        # Pick the "For HR/<reason>" sub-label that matches this routing
+        # decision so HR can see WHY a thread is stuck at a glance.
+        sub_label_key = gmail_client.REASON_TYPE_TO_HR_SUBLABEL.get(reason_type, "")
+        sub_label_id = outcome_label_ids.get(sub_label_key, "") if sub_label_key else ""
         if nh_label:
             gmail_client.flag_needs_human(
                 gmail, cfg.gmail_user, msg_id,
                 needs_human_label_id=nh_label,
                 processed_label_id=label_id if mark_done else "",
+                extra_label_ids=[sub_label_id] if sub_label_id else None,
             )
         elif mark_done:
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
@@ -384,7 +353,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         else:
             gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
 
-    # ----- Pre-filter #1: blocklisted sender -----
     if _is_blocklisted_sender(msg.sender_email, cfg.blocklist_senders):
         log.info("  -> sender on blocklist; archiving as misc")
         _archive_as_misc(
@@ -393,7 +361,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- Pre-filter #2: calendar invite -----
     if msg.has_calendar_invite:
         log.info("  -> calendar invite detected; archiving as misc")
         _archive_as_misc(
@@ -402,7 +369,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- Pre-filter #3: auto-reply / OOO / newsletter -----
     if msg.is_auto_response or msg.subject_indicates_ooo:
         log.info("  -> auto-response or OOO-subject detected; archiving as misc")
         _archive_as_misc(
@@ -411,7 +377,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # ----- Pre-filter #4: internal-forward handling -----
     internal_forward = _is_internal_sender(msg.sender_email, cfg.internal_domains)
     if internal_forward:
         log.info("  -> internal sender %s; will classify but suppress outbound reply",
@@ -428,7 +393,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             )
             return scored
 
-    # ----- Pre-filter #5: loop detection -----
     sender_lc = (msg.sender_email or "").strip().lower()
     if not _is_job_board_alias(msg.sender_email):
         sender_count = recent_sender_counts.get(sender_lc, 0)
@@ -445,7 +409,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
     else:
         log.info("  -> sender %s is a job-board alias; skipping loop check", sender_lc)
 
-    # ----- Pre-filter #6: thread-history introspection -----
     if cfg.shadow_mode:
         thread_history = gmail_client.ThreadHistory(frozenset(), False)
     else:
@@ -480,7 +443,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             return False, "outside business hours (queued for next biz-hour run)"
         return True, ""
 
-    # ----- Pre-filter #6.5: conversation closure detection -----
     if sent_in_thread:
         closure = scorer.classify_conversation_closure(
             api_key=cfg.anthropic_api_key,
@@ -504,7 +466,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
             )
             return 0
 
-    # ----- Pre-filter #6.7: Indeed Quick Apply auto-fetch -----
     indeed_quick_apply_attached = False
     if not msg.has_resume and _is_job_board_alias(msg.sender_email):
         view_url = indeed_fetcher.extract_view_resume_url(msg.body_text)
@@ -529,7 +490,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                 )
                 return 0
 
-    # ----- Pre-filter #7: classifier -----
     if indeed_quick_apply_attached:
         log.info("  -> classifier skipped: Indeed Quick Apply PDF attached, routing to RESUME")
         cr = scorer.ClassifierResult(label="resume", confidence=0.99)
@@ -746,7 +706,6 @@ def _process_resume_attachments(
         if is_internal_forward:
             template_key = None
 
-        # ----- Recruiter / agency suppression -----
         recruiter_agency_value = (result.get("recruiter_agency") or "N/A").strip() or "N/A"
         is_recruiter_submission = recruiter_agency_value.lower() not in {
             "n/a", "na", "none", "null", "unknown", "",
@@ -787,14 +746,6 @@ def _process_resume_attachments(
 
         is_indeed_candidate = _is_job_board_alias(msg.sender_email)
 
-        # ----- Application source classification (column E) -----
-        # Single source-of-truth column on Candidates. Precedence:
-        # recruiter beats Indeed (a recruiter forwarding through Indeed
-        # is still routed via a recruiter), Indeed beats Craigslist body
-        # match, everything else defaults to Email. For recruiter, the
-        # agency name is embedded inline so HR sees who sent it without
-        # a dedicated column. Craigslist detection is sender-OR-body
-        # because Craigslist relays through randomized reply aliases.
         _sender_lc = (msg.sender_email or "").lower()
         _body_lc = (msg.body_text or "").lower()
         if is_recruiter_submission:
