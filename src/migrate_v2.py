@@ -1908,91 +1908,143 @@ def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
 
 
 def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
-    """Wipe + repopulate the Usage Guide tab with the For HR / Handled
-    label-flow documentation. Idempotent: safe to re-run."""
+    """Wipe + repopulate the Usage Guide tab as a quick-reference KEY
+    (not a narrative guide). Three-column lookup tables grouped by
+    section, color-coded section headers, scannable at a glance.
+    Idempotent: safe to re-run."""
     inner_id = _get_sheet_id(svc, sheet_id, tab)
     if inner_id is None:
         log.warning("Usage Guide tab not found; skipping")
         return
 
-    # Clear the tab first (rows 1-200, columns A-C)
     svc.spreadsheets().values().clear(
-        spreadsheetId=sheet_id, range=f"'{tab}'!A1:C200",
+        spreadsheetId=sheet_id, range=f"'{tab}'!A1:C400",
     ).execute()
 
-    rows = [
-        ["Resume Bot Usage Guide", "", ""],
-        ["", "", ""],
-        ["Updated 2026-06-24 to reflect the new For HR / Handled inbox-label flow.", "", ""],
-        ["The Needs Human tab is RETIRED -- the bot no longer writes there. Your stuck-thread queue now lives entirely in Gmail.", "", ""],
-        ["", "", ""],
-        ["What the bot does in one breath", "", ""],
-        ["Reads jobs@r1concepts.com, scores resumes against your active roles in the Filters tab, archives anything it can handle, and leaves the rest in your inbox under a 'For HR' label so you can spot it.", "", ""],
-        ["", "", ""],
-        ["YOUR DAILY WORKFLOW (3 steps)", "", ""],
-        ["1. Open the Candidates tab. One row per scored resume; newest at top. Set HR Status in col Q as the candidate moves through your process.", "", ""],
-        ["2. Open your Gmail (jobs@r1concepts.com). Anything labeled 'For HR' is something the bot couldn't handle and needs you. Sub-label tells you why.", "", ""],
-        ["3. When you're done with a 'For HR' thread (replied, ignored, whatever), label it 'For HR/Closed'. Bot auto-archives within 10 minutes.", "", ""],
-        ["", "", ""],
-        ["GMAIL LABELS (created automatically; you do not manage these)", "", ""],
-        ["Label", "Where it appears", "What it means"],
-        ["For HR", "Inbox (green sidebar entry)", "Umbrella on every stuck thread. Click in sidebar to see the full queue."],
-        ["For HR/Question?", "Inbox", "Bot wasn't confident enough to classify. You decide."],
-        ["For HR/Indeed fetch failed", "Inbox", "Indeed sent an application but the resume link broke. Grab from Indeed dashboard."],
-        ["For HR/Looping sender", "Inbox", "Same sender hit jobs@ many times in a short window. Spam or stuck conversation."],
-        ["For HR/Closed", "Inbox (HR applies this)", "You're done with this thread. Bot will archive on next tick."],
-        ["Handled/Qualified", "Archived (out of inbox)", "Resume scored as qualified; row added to Candidates."],
-        ["Handled/Not qualified", "Archived", "Resume reviewed and ruled out."],
-        ["Handled/Needs review", "Archived", "Scorer wasn't certain. Goes to Drive Review folder."],
-        ["Handled/Paused role", "Archived", "Strong fit for a role currently on hold."],
-        ["Handled/Auto-reply sent", "Archived", "Bot replied (no-resume / question / paused match)."],
-        ["Handled/Unreadable", "Archived", "Couldn't extract text from the resume PDF."],
-        ["Handled/Not a resume", "Archived", "Attachment wasn't a real resume."],
-        ["Handled/Closed", "Archived", "Conversation silently closed by candidate reply (e.g. 'thanks')."],
-        ["", "", ""],
-        ["SHEET TABS (what each is for, briefly)", "", ""],
-        ["Candidates", "Main dashboard", "One row per scored resume. HR Status (col Q) is the one column you actively set."],
-        ["Indeed Queue", "Indeed-specific worklist", "Color-coded list of Indeed Quick Apply candidates. Same HR Status as Candidates."],
-        ["Cross-Match", "Filtered view", "Candidates flagged as a stronger fit for a different open role."],
-        ["Pending", "Filtered view", "Candidates flagged Pending/Paused Role."],
-        ["Filters", "HR-editable", "Your active roles + minimum requirements. Bot reloads on every tick."],
-        ["Templates", "HR-editable", "The 4 auto-reply messages. Bot reloads on every tick."],
-        ["Bot Learning Log", "Read-only", "Audit logs disagreements between bot and HR. Approved entries become few-shot examples for the scorer."],
-        ["Inbox Log / Bot Errors / Migration Report", "Audit", "Operational trail. HR doesn't need to touch."],
-        ["Needs Human", "RETIRED", "Historical record only. New stuck threads land in Gmail under 'For HR' label, not here."],
-        ["", "", ""],
-        ["HR STATUS values + what they do", "", ""],
-        ["In Review", "Default after row appears", "You're actively looking. No bot action."],
-        ["Contacted", "You reached out", "Bot will stop any auto-reply on that thread."],
-        ["Interview Scheduled", "Forward progress", "No bot action; useful for your own tracking."],
-        ["Offer Made", "Forward progress", "Late-stage tracking signal."],
-        ["On Hold", "Paused", "Row stays visible."],
-        ["Hired (terminal)", "Done", "Row auto-hides from active view."],
-        ["Rejected (terminal)", "Done", "Row auto-hides. Bot will flag any future submission from same name as 'Previously rejected' in col S."],
-        ["Not Selected (terminal)", "Done", "Row auto-hides."],
-        ["", "", ""],
-        ["WHAT THE BOT IS NOT DOING (still HR)", "", ""],
-        ["Contacting candidates", "All you. Bot does not initiate outreach.", ""],
-        ["Scheduling interviews", "All you. No calendar integration.", ""],
-        ["Talking to recruiters / agencies", "All you. Bot logs the row + suppresses auto-replies; never engages.", ""],
-        ["Hire / no-hire decisions", "All you. Bot decisions are recommendations.", ""],
-        ["", "", ""],
-        ["WHEN SOMETHING SEEMS OFF", "", ""],
-        ["A candidate scored wrong", "Set HR Status to Rejected and leave a short note in HR Notes (col R). The weekly audit feeds your reasoning to the scorer.", ""],
-        ["A stuck thread is wrong", "Apply 'For HR/Closed' to archive it; the colored sub-label stays so you can find it later via search.", ""],
-        ["Bot didn't reply to someone you expected", "Check Inbox Log -- the Action Taken column says why (shadow mode, off-hours, recruiter, etc.).", ""],
+    # Each tuple: (col_A, col_B, col_C). Section headers are 1-cell
+    # strings (col_B/C blank) handled by the heading-formatter below.
+    SECTIONS = [
+        ("Resume Bot · Quick reference key", "", ""),
+        (f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d')} · Two work spaces: the Sheet (decisions) and Gmail jobs@ (conversations).", "", ""),
+
+        # ---- Section 1: Sheet columns ----
+        ("CANDIDATES TAB · COLUMN KEY", "", ""),
+        ("Column", "Name", "Meaning"),
+        ("A", "Timestamp", "When the bot scored the resume."),
+        ("B", "Candidate Name", "Pulled from the resume."),
+        ("C", "Email", "Real address, or \"Email not included\" if none on file."),
+        ("D", "Phone", "Pulled from the resume."),
+        ("E", "Application Submitted", "Email / Indeed / Craigslist / Recruiter-Agency - <name>."),
+        ("F", "Original Filename", "Resume file as it arrived."),
+        ("G", "Applied For", "Role from the email/resume."),
+        ("H", "Cross-Fit Match", "Stronger fit for a different active role."),
+        ("I", "Cross-Fit Flag", "🚨 emoji = cross-fit candidate; redirect to the right role."),
+        ("J", "Decision", "qualified · borderline · not_qualified · pending_paused · needs_review."),
+        ("K", "Years Relevant Exp", "Scorer's extraction."),
+        ("L", "Job Hopping", "positive / caution flag."),
+        ("M", "Confidence", "Scorer's 0-1 confidence."),
+        ("N", "AI Reasoning", "One-line explanation. Read this before setting Status."),
+        ("O", "Drive File Link", "Click → resume PDF opens in browser."),
+        ("P", "Gmail Thread Link", "Click → candidate's email thread (under jobs@)."),
+        ("Q", "HR Status", "The dropdown YOU set. See HR Status key below."),
+        ("R", "HR Notes", "Free text. Leave a note when you disagree with the bot."),
+        ("S", "Prior Rejection", "🚩 fires when a same-name candidate was previously rejected."),
+
+        # ---- Section 2: HR Status options ----
+        ("HR STATUS KEY", "", ""),
+        ("Value", "Effect", "When to set it"),
+        ("In Review", "Default; row stays visible.", "You're actively looking."),
+        ("Contacted", "Row stays visible; bot stops any auto-reply on the thread.", "You've reached out."),
+        ("Interview Scheduled", "Row stays visible.", "Forward progress."),
+        ("Offer Made", "Row stays visible.", "Late-stage tracking."),
+        ("On Hold", "Row stays visible.", "Paused for now."),
+        ("Hired (terminal)", "Row auto-hides from view.", "Final decision."),
+        ("Rejected (terminal)", "Row auto-hides. Future submissions get 🚩.", "Final decision; bot auto-sets this if it sent the denial."),
+        ("Not Selected (terminal)", "Row auto-hides.", "Final decision."),
+
+        # ---- Section 3: Gmail labels ----
+        ("GMAIL LABEL KEY", "", ""),
+        ("Label", "Where", "Meaning"),
+        ("For HR", "Inbox · green sidebar entry", "Umbrella on every stuck thread. Click it = full queue."),
+        ("For HR/Question?", "Inbox · yellow chip", "Bot wasn't sure how to classify."),
+        ("For HR/Indeed fetch failed", "Inbox · red chip", "Indeed sent an applicant but the resume link broke."),
+        ("For HR/Looping sender", "Inbox · blue chip", "Same sender hammered jobs@ many times."),
+        ("For HR/Closed", "Inbox · gray chip (HR applies)", "YOU label this when done. Bot archives within 10 min."),
+        ("Handled/Qualified", "Out of inbox", "Resume scored qualified; row added to Candidates."),
+        ("Handled/Not qualified", "Out of inbox", "Resume reviewed and ruled out."),
+        ("Handled/Needs review", "Out of inbox", "Scorer wasn't certain. Goes to Drive Review folder."),
+        ("Handled/Paused role", "Out of inbox", "Strong fit for a role currently on hold."),
+        ("Handled/Unreadable", "Out of inbox", "Couldn't extract text from the resume PDF."),
+        ("Handled/Not a resume", "Out of inbox", "Attachment wasn't a resume."),
+        ("Handled/Closed", "Out of inbox", "Candidate silently closed the conversation."),
+
+        # ---- Section 4: Icons + colors ----
+        ("ICON & COLOR KEY", "", ""),
+        ("Symbol", "Where", "Meaning"),
+        ("🚨 (siren)", "Candidates col I · Cross-Match tab", "Cross-fit match — candidate is a better fit for a different role."),
+        ("🚩 (red flag)", "Candidates col S", "Same-name candidate was previously rejected."),
+        ("Green chip", "Gmail sidebar · row label", "Thread needs HR attention (For HR umbrella)."),
+        ("Light red cell", "Candidates col S · Bot Errors rows", "Conditional formatting on prior-rejection or error."),
+        ("Gray cell with strikethrough", "Candidates rows", "Terminal HR Status → row auto-hidden."),
+
+        # ---- Section 5: Tabs ----
+        ("OTHER TABS · WHAT EACH IS FOR", "", ""),
+        ("Tab", "Purpose", ""),
+        ("Candidates", "Main dashboard. One row per scored resume.", ""),
+        ("Indeed Queue", "Focused list of Indeed Quick Apply applicants. HR Status syncs from Candidates.", ""),
+        ("Cross-Match", "Auto-filtered view of cross-fit-flagged candidates with empty HR Status.", ""),
+        ("Pending", "Candidates flagged Pending/Paused Role.", ""),
+        ("Filters", "Your active roles + minimum requirements. HR-editable; bot reloads on every run.", ""),
+        ("Templates", "The 4 auto-reply messages. HR-editable.", ""),
+        ("Inbox Log", "Audit trail of every email the bot processed.", ""),
+        ("Bot Errors", "Operational errors. Quiet by design.", ""),
+        ("Bot Learning Log", "Disagreements between bot and HR feed back into the scorer.", ""),
+        ("Migration Report", "Historical record of sheet structure migrations.", ""),
+        ("Needs Human (retired)", "Old queue. RETIRED — the bot no longer writes here.", ""),
+        ("Archive - Approved / Denied / Misc", "Long-term historical archives.", ""),
+
+        # ---- Section 6: Scope ----
+        ("WHAT THE BOT DOES NOT DO", "", ""),
+        ("Contacting candidates", "Still you. Bot does not initiate outreach.", ""),
+        ("Scheduling interviews", "Still you. No calendar integration.", ""),
+        ("Talking to recruiters/agencies", "Still you. Bot logs them; never replies.", ""),
+        ("Hire / no-hire decisions", "Still you. Bot decisions are recommendations.", ""),
+
+        # ---- Footer ----
+        ("", "", ""),
+        ("Questions or fixes needed? Ping Ben.", "", ""),
     ]
 
-    end_col = "C"
+    rows = [list(row) for row in SECTIONS]
+
     end_row = len(rows)
     svc.spreadsheets().values().update(
         spreadsheetId=sheet_id,
-        range=f"'{tab}'!A1:{end_col}{end_row}",
+        range=f"'{tab}'!A1:C{end_row}",
         valueInputOption="USER_ENTERED",
         body={"values": rows},
     ).execute()
 
-    # Formatting: bold headers, freeze row 1, set column widths
+    # Identify which rows are section headers (col_A is ALL CAPS or the title).
+    section_header_rows = []
+    table_header_rows = []
+    for i, row in enumerate(rows):
+        a = row[0] or ""
+        b = row[1] or ""
+        c = row[2] or ""
+        # The top title + freshness note
+        if i == 0:
+            section_header_rows.append(i)
+            continue
+        # All-caps section labels
+        if a.isupper() and len(a) > 4 and not b:
+            section_header_rows.append(i)
+            continue
+        # Table-header rows have ALL THREE cells filled with short labels
+        if a in {"Column", "Value", "Label", "Symbol", "Tab"}:
+            table_header_rows.append(i)
+
+    # Build the formatting requests
     requests = [
         {
             "updateSheetProperties": {
@@ -2005,7 +2057,7 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
             "updateDimensionProperties": {
                 "range": {"sheetId": inner_id, "dimension": "COLUMNS",
                           "startIndex": 0, "endIndex": 1},
-                "properties": {"pixelSize": 280},
+                "properties": {"pixelSize": 240},
                 "fields": "pixelSize",
             }
         },
@@ -2013,7 +2065,7 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
             "updateDimensionProperties": {
                 "range": {"sheetId": inner_id, "dimension": "COLUMNS",
                           "startIndex": 1, "endIndex": 2},
-                "properties": {"pixelSize": 220},
+                "properties": {"pixelSize": 260},
                 "fields": "pixelSize",
             }
         },
@@ -2021,16 +2073,44 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
             "updateDimensionProperties": {
                 "range": {"sheetId": inner_id, "dimension": "COLUMNS",
                           "startIndex": 2, "endIndex": 3},
-                "properties": {"pixelSize": 600},
+                "properties": {"pixelSize": 620},
                 "fields": "pixelSize",
+            }
+        },
+        # Wrap text on all 3 columns so long descriptions don't overflow
+        {
+            "repeatCell": {
+                "range": {"sheetId": inner_id,
+                          "startRowIndex": 0, "endRowIndex": end_row,
+                          "startColumnIndex": 0, "endColumnIndex": 3},
+                "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP",
+                                               "verticalAlignment": "MIDDLE"}},
+                "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
             }
         },
     ]
 
-    # Bold the section-header rows (rows where col A starts with a capital
-    # and looks like a heading -- detect by indexing the rows list above).
-    heading_idx_0based = [0, 5, 8, 13, 14, 30, 41, 53, 59]
-    for i in heading_idx_0based:
+    # Title row: bold + larger navy text on light bg
+    requests.append({
+        "repeatCell": {
+            "range": {"sheetId": inner_id,
+                      "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 3},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.118, "green": 0.153, "blue": 0.380},
+                    "textFormat": {"bold": True, "fontSize": 14,
+                                   "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                }
+            },
+            "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+        }
+    })
+
+    # Section header rows (skip the title row already styled)
+    for i in section_header_rows:
+        if i == 0:
+            continue
         requests.append({
             "repeatCell": {
                 "range": {"sheetId": inner_id,
@@ -2038,9 +2118,27 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
                           "startColumnIndex": 0, "endColumnIndex": 3},
                 "cell": {
                     "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.91, "green": 0.95, "blue": 0.92},
-                        "textFormat": {"bold": True,
-                                       "foregroundColor": {"red": 0.07, "green": 0.15, "blue": 0.38}},
+                        "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
+                        "textFormat": {"bold": True, "fontSize": 11,
+                                       "foregroundColor": {"red": 0.075, "green": 0.302, "blue": 0.227}},
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }
+        })
+
+    # Table header rows (Column / Value / Label / Symbol / Tab)
+    for i in table_header_rows:
+        requests.append({
+            "repeatCell": {
+                "range": {"sheetId": inner_id,
+                          "startRowIndex": i, "endRowIndex": i + 1,
+                          "startColumnIndex": 0, "endColumnIndex": 3},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.937, "green": 0.945, "blue": 0.953},
+                        "textFormat": {"bold": True, "fontSize": 10,
+                                       "foregroundColor": {"red": 0.094, "green": 0.122, "blue": 0.157}},
                     }
                 },
                 "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
@@ -2050,7 +2148,7 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id, body={"requests": requests},
     ).execute()
-    log.info("rewrite_usage_guide: wrote %d row(s) to %s", end_row, tab)
+    log.info("rewrite_usage_guide: wrote %d row(s) + formatting to %s", end_row, tab)
 
 
 def run_usage_guide_only() -> int:
