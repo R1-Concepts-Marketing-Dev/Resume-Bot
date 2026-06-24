@@ -848,13 +848,38 @@ def append_candidate(svc, sheet_id, tab, row):
         "",  # R: HR Notes (HR fills in)
         prior_flag,  # S: Prior Rejection (🚩 flag for duplicate-rejected applicants)
     ]
-    svc.spreadsheets().values().append(
+    resp = svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
         range=f"{tab}!A:S",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
+    # Parse the updated range like "Candidates!A1139:S1139" to get the row #.
+    # Returned so callers can do follow-up writes (e.g. auto-set HR Status
+    # after a denied auto-reply fires).
+    m = re.search(r"!\w+(\d+):", (resp.get("updates", {}) or {}).get("updatedRange", "") or "")
+    return int(m.group(1)) if m else 0
+
+
+def set_hr_status(svc, sheet_id, tab: str, row_num: int, status: str) -> None:
+    """Update HR Status (col Q) on the given Candidates row. Used by the
+    bot to auto-stamp 'Rejected' on rows where it sent the denied template
+    end-to-end, so (a) the row auto-hides on the next onEdit cycle and
+    (b) the Prior Rejection flag catches any future submissions from the
+    same name. No-op if row_num is 0 (caller couldn't parse the append
+    response)."""
+    if not row_num or row_num <= 0:
+        return
+    try:
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"{tab}!Q{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[status]]},
+        ).execute()
+    except Exception as e:
+        log.warning("Failed to set HR Status row=%d to %r: %s", row_num, status, e)
 
 
 def append_indeed_queue(svc, sheet_id, tab, row):

@@ -755,7 +755,7 @@ def _process_resume_attachments(
             application_submitted = "Email"
 
         candidate_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        sheets_client.append_candidate(
+        candidates_row_num = sheets_client.append_candidate(
             sheets, cfg.sheet_id, cfg.dashboard_tab,
             {
                 "timestamp": candidate_timestamp,
@@ -817,6 +817,17 @@ def _process_resume_attachments(
                 log.info("  -> %s | conf=%.2f | sent '%s' to %s",
                          bucket, result["confidence"], template_key, msg.sender_email)
                 log_inbox(inbox_type, f"scored - {bucket}; replied with {template_key}")
+                # If the bot just sent the rejection (denied) template, stamp
+                # HR Status="Rejected" on the new Candidates row so it
+                # auto-hides AND so re-applicants from the same name get
+                # caught by the Prior Rejection flag.
+                if template_key == "denied" and bucket == "not_qualified":
+                    sheets_client.set_hr_status(
+                        sheets, cfg.sheet_id, cfg.dashboard_tab,
+                        candidates_row_num, "Rejected",
+                    )
+                    log.info("  -> auto-stamped HR Status=Rejected (row %d)",
+                             candidates_row_num)
         else:
             if is_internal_forward:
                 log.info("  -> %s | conf=%.2f | internal forward (no auto-reply)",
