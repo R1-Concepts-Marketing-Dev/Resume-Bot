@@ -119,8 +119,15 @@ def month_key(timestamp_str: str) -> Optional[str]:
 def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
     """Roll up Candidates rows into per-month counters + point-in-time state.
 
-    rows: raw values from Candidates!A2:Q (17 columns A..Q)
+    rows: raw values from Candidates!A2:S (19 columns A..S)
     months: list of YYYY-MM keys we want to aggregate over
+
+    Column map (post Application-Submitted move, post Prior-Rejection add):
+      A Timestamp        | F Original Filename | K Years Exp     | P Gmail Thread
+      B Candidate Name   | G Applied For       | L Job Hopping   | Q HR Status
+      C Email            | H Cross-Fit Match   | M Confidence    | R HR Notes
+      D Phone            | I Cross-Fit Flag    | N AI Reasoning  | S Prior Rejection
+      E Application Sub. | J Decision          | O Drive File
 
     Engagement framing: any time we measure "the bot's decision was
     validated by HR," we check hr_status in ENGAGED_HR_STATUSES, which
@@ -133,15 +140,16 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
     backlog = 0
 
     for raw in rows:
-        # Pad to 17 columns so missing trailing cells become empty strings
-        row = (raw + [""] * 17)[:17]
+        # Pad to 19 columns so missing trailing cells become empty strings
+        row = (raw + [""] * 19)[:19]
         timestamp = row[0]
-        cross_fit_raw = (row[7] or "").strip()
+        cross_fit_raw = (row[8] or "").strip()  # col I = Cross-Fit Flag
         # Cross-fit flag was historically "Yes"/"No", now an emoji.
         # Treat both representations as cross-fit so historical rows still count.
         cross_fit_is_yes = cross_fit_raw == "\U0001F6A8" or cross_fit_raw.lower() == "yes"
-        decision = (row[8] or "").strip().lower()
-        hr_status = (row[15] or "").strip()
+        decision = (row[9] or "").strip().lower()      # col J = Decision
+        hr_status = (row[16] or "").strip()             # col Q = HR Status
+        prior_rejection = (row[18] or "").strip()       # col S = Prior Rejection
 
         # Point-in-time queue state (NOT month-scoped):
         #   active_queue = candidates HR is currently working
@@ -178,6 +186,12 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
         if cross_fit_is_yes and hr_status in ENGAGED_HR_STATUSES:
             c["cross_fit_catches"] += 1
 
+        # Prior-rejection catches: the bot spotted a re-applicant whose
+        # earlier app was already Rejected (Lisa's duplicate-detect ask).
+        # Any non-empty value in col S means the flag fired on this row.
+        if prior_rejection:
+            c["prior_rejection_catches"] += 1
+
         if decision in {"qualified", "not_qualified", "pending_paused"}:
             c["time_saved_sec"] += TIME_SAVED_PER_CASE_SEC
 
@@ -203,7 +217,7 @@ def build_blocks(metrics: dict) -> dict:
     Returns a dict with keys:
       header   (1xN): month labels
       volume   (6xN): per-month volume counts
-      outcomes (5xN): per-month filter accuracy (engagement-framed)
+      outcomes (6xN): per-month filter accuracy (engagement-framed)
       workflow (3xN): point-in-time HR pipeline + per-month time saved
       kpi_band (dict): hero KPI tile values for the top of the sheet
 
@@ -227,20 +241,21 @@ def build_blocks(metrics: dict) -> dict:
     ]
 
     # FILTER ACCURACY: engagement-framed (bot decision validated by HR
-    # moving the candidate past auto-archive). Five rows, matches sheet
-    # labels at A15:A19.
+    # moving the candidate past auto-archive). Six rows, matches sheet
+    # labels at A15:A20.
     outcomes = [
         per_month(lambda c: c["qualified_engaged"]),
         per_month(lambda c: safe_pct(c["qualified_engaged"], c["qualified"])),
         per_month(lambda c: c["needs_review_engaged"]),
         per_month(lambda c: safe_pct(c["needs_review_engaged"], c["needs_review"])),
         per_month(lambda c: c["cross_fit_catches"]),
+        per_month(lambda c: c["prior_rejection_catches"]),
     ]
 
-    # HR PIPELINE: row order matches sheet labels at A22:A24.
-    #   Row 22: Awaiting HR action       -> backlog (point-in-time)
-    #   Row 23: Active in HR pipeline    -> active_queue (point-in-time)
-    #   Row 24: Estimated HR time saved  -> per-month, in HOURS (not min)
+    # HR PIPELINE: row order matches sheet labels at A23:A25.
+    #   Row 23: Awaiting HR action       -> backlog (point-in-time)
+    #   Row 24: Active in HR pipeline    -> active_queue (point-in-time)
+    #   Row 25: Estimated HR time saved  -> per-month, in HOURS (not min)
     workflow = [
         [metrics["backlog"]] + [""] * 5,
         [metrics["active_queue"]] + [""] * 5,
@@ -301,7 +316,7 @@ def build_credentials() -> Credentials:
 def read_candidates(sheets, sheet_id: str, tab: str) -> list[list[str]]:
     resp = sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A2:Q",
+        range=f"{tab}!A2:S",
     ).execute()
     return resp.get("values", [])
 
@@ -336,8 +351,39 @@ def write_overview(sheets, metrics_sheet_id: str, blocks: dict,
         kpi["cross_fit_catches"],
     ]
 
+    # Row labels in col A are written by the bot so the sheet is fully
+    # self-managed. HR moving / renaming rows can't desync the layout.
+    # Using ASCII "->" instead of arrow glyphs to keep the file safe for
+    # OneDrive sync (it has eaten unicode arrows mid-string before).
+    row_labels_a = [
+        ["Resume Bot Metrics"],                       # A1
+        [last_run],                                   # A2
+        [""], [""],                                   # A3, A4 (KPI band)
+        [""],                                         # A5 (filler)
+        ["VOLUME"],                                   # A6
+        ["Resumes processed"],                        # A7
+        ["Auto-approved (qualified)"],                # A8
+        ["Sent for review"],                          # A9
+        ["Auto-denied (not_qualified)"],              # A10
+        ["Pending paused"],                           # A11
+        ["Unreadable"],                               # A12
+        [""],                                         # A13
+        ["FILTER ACCURACY"],                          # A14
+        ["Qualified -> HR engaged"],                  # A15
+        ["Qualified pass-through rate %"],            # A16
+        ["Needs-review -> HR engaged"],               # A17
+        ["Needs-review pass-through rate %"],         # A18
+        ["Cross-fit catches (HR engaged)"],           # A19
+        ["Prior-rejection catches"],                  # A20 (NEW)
+        [""],                                         # A21
+        ["HR PIPELINE"],                              # A22
+        ["Awaiting HR action (current)"],             # A23
+        ["Active in HR pipeline (current)"],          # A24
+        ["Estimated HR time saved (hrs / month)"],    # A25
+    ]
+
     data = [
-        {"range": "Overview!A2", "values": [[last_run]]},
+        {"range": "Overview!A1:A25", "values": row_labels_a},
         {"range": "Overview!A3:E3", "values": [kpi_labels]},
         {"range": "Overview!A4:E4", "values": [kpi_values]},
         {"range": "Overview!H3",
@@ -346,8 +392,8 @@ def write_overview(sheets, metrics_sheet_id: str, blocks: dict,
                      "Pass-through rate stabilizes as HR works through pipeline."]]},
         {"range": "Overview!B5:G5", "values": [blocks["header"]]},
         {"range": "Overview!B7:G12", "values": blocks["volume"]},
-        {"range": "Overview!B15:G19", "values": blocks["outcomes"]},
-        {"range": "Overview!B22:G24", "values": blocks["workflow"]},
+        {"range": "Overview!B15:G20", "values": blocks["outcomes"]},
+        {"range": "Overview!B23:G25", "values": blocks["workflow"]},
     ]
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=metrics_sheet_id,
