@@ -1907,6 +1907,164 @@ def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
     log.info("prior-rejection backfill: flagged %d row(s) of %d", flagged, len(rows))
 
 
+def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
+    """Wipe + repopulate the Usage Guide tab with the For HR / Handled
+    label-flow documentation. Idempotent: safe to re-run."""
+    inner_id = _get_sheet_id(svc, sheet_id, tab)
+    if inner_id is None:
+        log.warning("Usage Guide tab not found; skipping")
+        return
+
+    # Clear the tab first (rows 1-200, columns A-C)
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sheet_id, range=f"'{tab}'!A1:C200",
+    ).execute()
+
+    rows = [
+        ["Resume Bot Usage Guide", "", ""],
+        ["", "", ""],
+        ["Updated 2026-06-24 to reflect the new For HR / Handled inbox-label flow.", "", ""],
+        ["The Needs Human tab is RETIRED -- the bot no longer writes there. Your stuck-thread queue now lives entirely in Gmail.", "", ""],
+        ["", "", ""],
+        ["What the bot does in one breath", "", ""],
+        ["Reads jobs@r1concepts.com, scores resumes against your active roles in the Filters tab, archives anything it can handle, and leaves the rest in your inbox under a 'For HR' label so you can spot it.", "", ""],
+        ["", "", ""],
+        ["YOUR DAILY WORKFLOW (3 steps)", "", ""],
+        ["1. Open the Candidates tab. One row per scored resume; newest at top. Set HR Status in col Q as the candidate moves through your process.", "", ""],
+        ["2. Open your Gmail (jobs@r1concepts.com). Anything labeled 'For HR' is something the bot couldn't handle and needs you. Sub-label tells you why.", "", ""],
+        ["3. When you're done with a 'For HR' thread (replied, ignored, whatever), label it 'For HR/Closed'. Bot auto-archives within 10 minutes.", "", ""],
+        ["", "", ""],
+        ["GMAIL LABELS (created automatically; you do not manage these)", "", ""],
+        ["Label", "Where it appears", "What it means"],
+        ["For HR", "Inbox (green sidebar entry)", "Umbrella on every stuck thread. Click in sidebar to see the full queue."],
+        ["For HR/Question?", "Inbox", "Bot wasn't confident enough to classify. You decide."],
+        ["For HR/Indeed fetch failed", "Inbox", "Indeed sent an application but the resume link broke. Grab from Indeed dashboard."],
+        ["For HR/Looping sender", "Inbox", "Same sender hit jobs@ many times in a short window. Spam or stuck conversation."],
+        ["For HR/Closed", "Inbox (HR applies this)", "You're done with this thread. Bot will archive on next tick."],
+        ["Handled/Qualified", "Archived (out of inbox)", "Resume scored as qualified; row added to Candidates."],
+        ["Handled/Not qualified", "Archived", "Resume reviewed and ruled out."],
+        ["Handled/Needs review", "Archived", "Scorer wasn't certain. Goes to Drive Review folder."],
+        ["Handled/Paused role", "Archived", "Strong fit for a role currently on hold."],
+        ["Handled/Auto-reply sent", "Archived", "Bot replied (no-resume / question / paused match)."],
+        ["Handled/Unreadable", "Archived", "Couldn't extract text from the resume PDF."],
+        ["Handled/Not a resume", "Archived", "Attachment wasn't a real resume."],
+        ["Handled/Closed", "Archived", "Conversation silently closed by candidate reply (e.g. 'thanks')."],
+        ["", "", ""],
+        ["SHEET TABS (what each is for, briefly)", "", ""],
+        ["Candidates", "Main dashboard", "One row per scored resume. HR Status (col Q) is the one column you actively set."],
+        ["Indeed Queue", "Indeed-specific worklist", "Color-coded list of Indeed Quick Apply candidates. Same HR Status as Candidates."],
+        ["Cross-Match", "Filtered view", "Candidates flagged as a stronger fit for a different open role."],
+        ["Pending", "Filtered view", "Candidates flagged Pending/Paused Role."],
+        ["Filters", "HR-editable", "Your active roles + minimum requirements. Bot reloads on every tick."],
+        ["Templates", "HR-editable", "The 4 auto-reply messages. Bot reloads on every tick."],
+        ["Bot Learning Log", "Read-only", "Audit logs disagreements between bot and HR. Approved entries become few-shot examples for the scorer."],
+        ["Inbox Log / Bot Errors / Migration Report", "Audit", "Operational trail. HR doesn't need to touch."],
+        ["Needs Human", "RETIRED", "Historical record only. New stuck threads land in Gmail under 'For HR' label, not here."],
+        ["", "", ""],
+        ["HR STATUS values + what they do", "", ""],
+        ["In Review", "Default after row appears", "You're actively looking. No bot action."],
+        ["Contacted", "You reached out", "Bot will stop any auto-reply on that thread."],
+        ["Interview Scheduled", "Forward progress", "No bot action; useful for your own tracking."],
+        ["Offer Made", "Forward progress", "Late-stage tracking signal."],
+        ["On Hold", "Paused", "Row stays visible."],
+        ["Hired (terminal)", "Done", "Row auto-hides from active view."],
+        ["Rejected (terminal)", "Done", "Row auto-hides. Bot will flag any future submission from same name as 'Previously rejected' in col S."],
+        ["Not Selected (terminal)", "Done", "Row auto-hides."],
+        ["", "", ""],
+        ["WHAT THE BOT IS NOT DOING (still HR)", "", ""],
+        ["Contacting candidates", "All you. Bot does not initiate outreach.", ""],
+        ["Scheduling interviews", "All you. No calendar integration.", ""],
+        ["Talking to recruiters / agencies", "All you. Bot logs the row + suppresses auto-replies; never engages.", ""],
+        ["Hire / no-hire decisions", "All you. Bot decisions are recommendations.", ""],
+        ["", "", ""],
+        ["WHEN SOMETHING SEEMS OFF", "", ""],
+        ["A candidate scored wrong", "Set HR Status to Rejected and leave a short note in HR Notes (col R). The weekly audit feeds your reasoning to the scorer.", ""],
+        ["A stuck thread is wrong", "Apply 'For HR/Closed' to archive it; the colored sub-label stays so you can find it later via search.", ""],
+        ["Bot didn't reply to someone you expected", "Check Inbox Log -- the Action Taken column says why (shadow mode, off-hours, recruiter, etc.).", ""],
+    ]
+
+    end_col = "C"
+    end_row = len(rows)
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"'{tab}'!A1:{end_col}{end_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
+
+    # Formatting: bold headers, freeze row 1, set column widths
+    requests = [
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": inner_id,
+                               "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": inner_id, "dimension": "COLUMNS",
+                          "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 280},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": inner_id, "dimension": "COLUMNS",
+                          "startIndex": 1, "endIndex": 2},
+                "properties": {"pixelSize": 220},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": inner_id, "dimension": "COLUMNS",
+                          "startIndex": 2, "endIndex": 3},
+                "properties": {"pixelSize": 600},
+                "fields": "pixelSize",
+            }
+        },
+    ]
+
+    # Bold the section-header rows (rows where col A starts with a capital
+    # and looks like a heading -- detect by indexing the rows list above).
+    heading_idx_0based = [0, 5, 8, 13, 14, 30, 41, 53, 59]
+    for i in heading_idx_0based:
+        requests.append({
+            "repeatCell": {
+                "range": {"sheetId": inner_id,
+                          "startRowIndex": i, "endRowIndex": i + 1,
+                          "startColumnIndex": 0, "endColumnIndex": 3},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.91, "green": 0.95, "blue": 0.92},
+                        "textFormat": {"bold": True,
+                                       "foregroundColor": {"red": 0.07, "green": 0.15, "blue": 0.38}},
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }
+        })
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
+    ).execute()
+    log.info("rewrite_usage_guide: wrote %d row(s) to %s", end_row, tab)
+
+
+def run_usage_guide_only() -> int:
+    """Rewrite the Usage Guide tab in-place. Triggered with MIGRATE_STEPS=usage_guide."""
+    cfg = config.load()
+    log.info("Usage Guide refresh. Sheet=%s", cfg.sheet_id)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    svc = google_auth.sheets(creds)
+    rewrite_usage_guide(svc, cfg.sheet_id)
+    return 0
+
+
 def run_prior_rejection_only() -> int:
     """Set col S header and backfill the duplicate-rejection flag. Idempotent."""
     cfg = config.load()
@@ -1943,4 +2101,6 @@ if __name__ == "__main__":
         sys.exit(run_email_only())
     if _steps in ("prior_rejection", "rejection", "dup"):
         sys.exit(run_prior_rejection_only())
+    if _steps in ("usage_guide", "guide", "docs"):
+        sys.exit(run_usage_guide_only())
     sys.exit(run())
