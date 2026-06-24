@@ -135,7 +135,7 @@ def load() -> Config:
         errors_tab=_optional("ERRORS_TAB_NAME", "Bot Errors"),
         misc_tab=_optional("MISC_TAB_NAME", "Archive - Misc"),
         inbox_log_tab=_optional("INBOX_LOG_TAB_NAME", "Inbox Log"),
-        needs_human_tab=_optional("NEEDS_HUMAN_TAB_NAME", "Needs Human"),
+        needs_human_tab=_optional("NEEDS_HUMAN_TAB_NAME", "Needs Human (retired)"),
         processed_label=_optional("PROCESSED_LABEL", "resume-bot/processed"),
         max_messages_per_run=int(_optional("MAX_MESSAGES_PER_RUN", "25")),
         company_name=_optional("COMPANY_NAME", "R1 Concepts"),

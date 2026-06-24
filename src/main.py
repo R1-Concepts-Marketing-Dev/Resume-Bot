@@ -138,7 +138,10 @@ def run() -> int:
     sheets_client.ensure_templates_seeded(sheets, cfg.sheet_id, cfg.templates_tab)
     sheets_client.ensure_misc_headers(sheets, cfg.sheet_id, cfg.misc_tab)
     sheets_client.ensure_inbox_log_headers(sheets, cfg.sheet_id, cfg.inbox_log_tab)
-    sheets_client.ensure_needs_human_headers(sheets, cfg.sheet_id, cfg.needs_human_tab)
+    # Retired 2026-06-24: Needs Human sheet tab no longer used (Gmail "For HR"
+    # label is the new queue). Removing this call so the bot stops recreating
+    # an empty tab every run.
+    # sheets_client.ensure_needs_human_headers(sheets, cfg.sheet_id, cfg.needs_human_tab)
 
     all_filters = sheets_client.load_filters(sheets, cfg.sheet_id, cfg.filters_tab)
     if not all_filters:
