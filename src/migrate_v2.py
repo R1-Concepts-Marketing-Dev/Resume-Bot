@@ -2065,6 +2065,102 @@ def run_usage_guide_only() -> int:
     return 0
 
 
+def retire_needs_human_tab(svc, sheet_id):
+    """Mark the Needs Human tab as retired: rename to 'Needs Human (retired)'
+    and insert a banner row at the top explaining the new flow. Preserves
+    every existing row as historical record. Idempotent."""
+    meta = svc.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties",
+    ).execute()
+    target_id = None
+    current_name = None
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        name = props.get("title", "")
+        if name in ("Needs Human", "Needs Human (retired)"):
+            target_id = props.get("sheetId")
+            current_name = name
+            break
+    if target_id is None:
+        log.info("retire_needs_human_tab: tab not found, nothing to do")
+        return
+
+    requests = []
+    # Rename if still on the old name
+    if current_name == "Needs Human":
+        requests.append({
+            "updateSheetProperties": {
+                "properties": {"sheetId": target_id, "title": "Needs Human (retired)"},
+                "fields": "title",
+            }
+        })
+
+    # Move the tab to the very end so HR doesn't see it in their daily flow
+    # We can compute the next index by counting sheets in the metadata.
+    sheet_count = len(meta.get("sheets", []))
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {"sheetId": target_id, "index": sheet_count - 1},
+            "fields": "index",
+        }
+    })
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
+    ).execute()
+
+    # Inject a banner at A1 (preserves existing data underneath via
+    # inserting a row, not overwriting). We insert a new row at index 0
+    # then write the banner text.
+    insert_req = [{
+        "insertDimension": {
+            "range": {"sheetId": target_id, "dimension": "ROWS",
+                      "startIndex": 0, "endIndex": 1},
+            "inheritFromBefore": False,
+        }
+    }, {
+        "repeatCell": {
+            "range": {"sheetId": target_id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 10},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.988, "green": 0.898, "blue": 0.902},
+                    "textFormat": {"bold": True,
+                                   "foregroundColor": {"red": 0.722, "green": 0.314, "blue": 0.259}},
+                }
+            },
+            "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+        }
+    }]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": insert_req},
+    ).execute()
+
+    banner = (
+        "RETIRED  ·  The bot no longer writes new rows here. "
+        "Stuck threads now live in Gmail under the green 'For HR' label. "
+        "See the Usage Guide tab for the new flow."
+    )
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range="'Needs Human (retired)'!A1",
+        valueInputOption="RAW",
+        body={"values": [[banner]]},
+    ).execute()
+    log.info("retire_needs_human_tab: tab renamed + banner inserted")
+
+
+def run_retire_needs_human_only() -> int:
+    cfg = config.load()
+    log.info("Retiring Needs Human tab on sheet %s", cfg.sheet_id)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    svc = google_auth.sheets(creds)
+    retire_needs_human_tab(svc, cfg.sheet_id)
+    return 0
+
+
 def run_prior_rejection_only() -> int:
     """Set col S header and backfill the duplicate-rejection flag. Idempotent."""
     cfg = config.load()
@@ -2103,4 +2199,6 @@ if __name__ == "__main__":
         sys.exit(run_prior_rejection_only())
     if _steps in ("usage_guide", "guide", "docs"):
         sys.exit(run_usage_guide_only())
+    if _steps in ("retire_needs_human", "retire_nh"):
+        sys.exit(run_retire_needs_human_only())
     sys.exit(run())
