@@ -212,6 +212,15 @@ def run() -> int:
         seen_thread_ids = set()
         label_id = gmail_client.ensure_label(gmail, cfg.gmail_user, cfg.processed_label)
         outcome_label_ids = gmail_client.ensure_outcome_labels(gmail, cfg.gmail_user)
+        # Sweep: archive anything HR labeled "For HR/Closed" while triaging.
+        # Runs every bot tick so HR's marks disappear from inbox within
+        # 10 minutes without HR having to click archive on each thread.
+        hr_closed_id = outcome_label_ids.get("hr_closed", "")
+        if hr_closed_id:
+            n_closed = gmail_client.archive_hr_closed_threads(
+                gmail, cfg.gmail_user, hr_closed_id)
+            if n_closed:
+                log.info("Archived %d HR-closed thread(s) from inbox.", n_closed)
         msg_ids = gmail_client.list_unprocessed(
             gmail, cfg.gmail_user, cfg.processed_label,
             cfg.max_messages_per_run, start_date=cfg.bot_start_date,
@@ -297,26 +306,14 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
                           mark_done: bool = True):
         """Route to the For HR queue: Gmail labels (umbrella + reason
         sub-label) + sheet row (dual-write transition) + Inbox Log."""
+        # Needs Human sheet tab retired in favor of Gmail labels (For HR/*).
+        # We still log to Inbox Log so the audit trail is preserved.
         if open_needs_human_threads and msg.thread_id in open_needs_human_threads:
-            log.info("  -> thread %s already in For HR queue; skipping duplicate row",
+            log.info("  -> thread %s already flagged For HR; skipping duplicate log",
                      msg.thread_id)
             _log_inbox("needs_human", f"duplicate suppressed ({reason})")
         else:
-            body_preview = (msg.body_text or "").replace("\n", " ")[:1500]
-            sheets_client.append_needs_human(
-                sheets, cfg.sheet_id, cfg.needs_human_tab,
-                {
-                    "sender": msg.sender,
-                    "subject": msg.subject,
-                    "body_preview": body_preview,
-                    "reason": reason,
-                    "reason_type": reason_type,
-                    "bot_guess": bot_guess,
-                    "confidence": confidence,
-                    "gmail_link": msg.thread_link,
-                },
-            )
-            _log_inbox("needs_human", f"flagged for human ({reason})")
+            _log_inbox("needs_human", f"flagged For HR ({reason_type}): {reason}")
             if open_needs_human_threads is not None:
                 open_needs_human_threads.add(msg.thread_id)
 

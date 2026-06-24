@@ -92,6 +92,9 @@ OUTCOME_LABELS = {
     "for_hr_question":         "For HR/Question?",
     "for_hr_indeed_fetch":     "For HR/Indeed fetch failed",
     "for_hr_loop":             "For HR/Looping sender",
+    # HR-applied label: when HR is done with a thread, they label it
+    # this and the bot auto-archives on the next run (every 10 min).
+    "hr_closed":               "For HR/Closed",
 }
 
 
@@ -429,6 +432,53 @@ def archive_with_outcome(svc, user: str, msg_id: str, *,
             "removeLabelIds": ["INBOX"],
         },
     ).execute()
+
+
+def archive_hr_closed_threads(svc, user: str, closed_label_id: str) -> int:
+    """Find every thread that is BOTH still in INBOX AND tagged with the
+    "For HR/Closed" label, and archive it (remove INBOX). Returns the
+    count archived. Used as a batch background sweep so HR can mark
+    several stuck threads as Closed while triaging and have them
+    disappear from inbox on the next bot tick (every 10 min).
+
+    Idempotent: messages without INBOX label are excluded by the Gmail
+    query automatically. Safe to run as often as you like.
+
+    Note: leaves the For HR/Closed label intact -- HR can still find
+    everything they closed via the sidebar / search."""
+    if not closed_label_id:
+        return 0
+    archived = 0
+    page_token = None
+    while True:
+        kwargs = {
+            "userId": user,
+            "labelIds": [closed_label_id, "INBOX"],
+            "maxResults": 100,
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        try:
+            resp = svc.users().messages().list(**kwargs).execute()
+        except Exception as e:
+            log.warning("archive_hr_closed_threads: list failed: %s", e)
+            break
+        for m in resp.get("messages", []) or []:
+            try:
+                svc.users().messages().modify(
+                    userId=user, id=m["id"],
+                    body={"removeLabelIds": ["INBOX"]},
+                ).execute()
+                archived += 1
+            except Exception as e:
+                log.warning("archive_hr_closed_threads: modify %s failed: %s",
+                            m["id"], e)
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    if archived:
+        log.info("archive_hr_closed_threads: archived %d HR-closed threads", archived)
+    return archived
 
 
 def flag_needs_human(svc, user: str, msg_id: str, *,
