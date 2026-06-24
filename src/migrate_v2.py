@@ -1925,7 +1925,7 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
     # strings (col_B/C blank) handled by the heading-formatter below.
     SECTIONS = [
         ("Resume Bot · Quick reference key", "", ""),
-        (f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d')} · Two work spaces: the Sheet (decisions) and Gmail jobs@ (conversations).", "", ""),
+        ("Updated 2026-06-24 · Two work spaces: the Sheet (decisions) and Gmail jobs@ (conversations).", "", ""),
 
         # ---- Section 1: Sheet columns ----
         ("CANDIDATES TAB · COLUMN KEY", "", ""),
