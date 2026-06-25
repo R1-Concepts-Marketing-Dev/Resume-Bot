@@ -1146,11 +1146,22 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
                 "index": 0,
             }
         }]
+        # Also clear baked-in cell background fill on data area (A2:K200).
+        clear_bg_request = {
+            "repeatCell": {
+                "range": {"sheetId": inner_id, "startRowIndex": 1,
+                          "endRowIndex": 200, "startColumnIndex": 0,
+                          "endColumnIndex": 11},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        }
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id,
-            body={"requests": delete_requests + add_requests},
+            body={"requests": delete_requests + [clear_bg_request] + add_requests},
         ).execute()
-        log.info("%s: removed %d stale CF rules, added Days >=5 red rule.",
+        log.info("%s: removed %d stale CF rules, cleared baked bg, added Days >=5 red rule.",
                  tab, n_rules)
     except Exception as e:
         log.warning("Could not refresh %s CF rules: %s", tab, e)
