@@ -1968,9 +1968,13 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
             "cell": {
                 "userEnteredFormat": {
                     "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
+                    "backgroundColorStyle": {
+                        "rgbColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
+                    },
                 }
             },
-            "fields": "userEnteredFormat.backgroundColor",
+            "fields": ("userEnteredFormat.backgroundColor,"
+                       "userEnteredFormat.backgroundColorStyle"),
         }
     })
 
