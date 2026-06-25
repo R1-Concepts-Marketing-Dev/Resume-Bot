@@ -119,15 +119,16 @@ def month_key(timestamp_str: str) -> Optional[str]:
 def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
     """Roll up Candidates rows into per-month counters + point-in-time state.
 
-    rows: raw values from Candidates!A2:S (19 columns A..S)
+    rows: raw values from Candidates!A2:T (20 columns A..T, post v3 layout)
     months: list of YYYY-MM keys we want to aggregate over
 
-    Column map (post Application-Submitted move, post Prior-Rejection add):
-      A Timestamp        | F Original Filename | K Years Exp     | P Gmail Thread
-      B Candidate Name   | G Applied For       | L Job Hopping   | Q HR Status
-      C Email            | H Cross-Fit Match   | M Confidence    | R HR Notes
-      D Phone            | I Cross-Fit Flag    | N AI Reasoning  | S Prior Rejection
-      E Application Sub. | J Decision          | O Drive File
+    Column map (v3 layout 2026-06-25 -- Prior Rejection moved to M,
+    Bot Feedback added at T; HR-input cols cluster at the end):
+      A Timestamp        | F Original Filename | K Years Exp        | P Drive File
+      B Candidate Name   | G Applied For       | L Job Hopping      | Q Gmail Thread
+      C Email            | H Cross-Fit Match   | M Prior Rejection  | R HR Status
+      D Phone            | I Cross-Fit Flag    | N Confidence       | S HR Notes
+      E Application Sub. | J Decision          | O AI Reasoning     | T Bot Feedback
 
     Engagement framing: any time we measure "the bot's decision was
     validated by HR," we check hr_status in ENGAGED_HR_STATUSES, which
@@ -140,16 +141,16 @@ def compute_metrics(rows: list[list[str]], months: list[str]) -> dict:
     backlog = 0
 
     for raw in rows:
-        # Pad to 19 columns so missing trailing cells become empty strings
-        row = (raw + [""] * 19)[:19]
+        # Pad to 20 columns (v3 layout) so missing trailing cells become empty strings
+        row = (raw + [""] * 20)[:20]
         timestamp = row[0]
         cross_fit_raw = (row[8] or "").strip()  # col I = Cross-Fit Flag
         # Cross-fit flag was historically "Yes"/"No", now an emoji.
         # Treat both representations as cross-fit so historical rows still count.
         cross_fit_is_yes = cross_fit_raw == "\U0001F6A8" or cross_fit_raw.lower() == "yes"
-        decision = (row[9] or "").strip().lower()      # col J = Decision
-        hr_status = (row[16] or "").strip()             # col Q = HR Status
-        prior_rejection = (row[18] or "").strip()       # col S = Prior Rejection
+        decision = (row[9] or "").strip().lower()       # col J = Decision
+        prior_rejection = (row[12] or "").strip()       # col M = Prior Rejection (v3)
+        hr_status = (row[17] or "").strip()             # col R = HR Status (v3)
 
         # Point-in-time queue state (NOT month-scoped):
         #   active_queue = candidates HR is currently working
@@ -316,7 +317,7 @@ def build_credentials() -> Credentials:
 def read_candidates(sheets, sheet_id: str, tab: str) -> list[list[str]]:
     resp = sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A2:S",
+        range=f"{tab}!A2:T",
     ).execute()
     return resp.get("values", [])
 

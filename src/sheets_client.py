@@ -31,9 +31,12 @@ DASHBOARD_HEADERS = [
     "Application Submitted",  # E -- Email / Indeed / Craigslist / "Recruiter/Agency - {name}"
     "Original Filename",
     "Applied For", "Cross-Fit Match", "Cross-Fit Flag", "Decision",
-    "Years Relevant Exp", "Job Hopping", "Confidence", "AI Reasoning",
-    "Drive File Link", "Gmail Thread Link", "HR Status", "HR Notes",
-    "Prior Rejection",  # S -- "🚩 Previously rejected" when same-name row already has terminal HR Status
+    "Years Relevant Exp", "Job Hopping",
+    "Prior Rejection",  # M -- "🚩 Previously rejected" when same-name row already has terminal HR Status. Bot-detected, sits next to other bot-decision cols.
+    "Confidence", "AI Reasoning",
+    "Drive File Link", "Gmail Thread Link",
+    "HR Status", "HR Notes",
+    "Bot Feedback",  # T -- free-text col where HR notes what they disagreed with the bot about; feeds the learning loop.
 ]
 
 
@@ -787,94 +790,88 @@ def _has_prior_rejection(svc, sheet_id, candidate_name,
                          tab="Candidates"):
     """Return True if any existing Candidates row has the same name AND
     a terminal-rejection HR Status. Match is case-insensitive on trimmed
-    name. Reads B (name) and Q (HR Status)."""
+    name. Reads B (name) and R (HR Status, post v3 layout)."""
     if not candidate_name or not str(candidate_name).strip():
         return False
     target = str(candidate_name).strip().lower()
     try:
         resp = svc.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=f"{tab}!B2:Q",
+            spreadsheetId=sheet_id, range=f"{tab}!B2:R",
         ).execute()
     except Exception as e:
         log.warning("prior-rejection lookup failed for %s: %s", candidate_name, e)
         return False
     for r in resp.get("values", []) or []:
-        r = (r + [""] * 16)[:16]
+        r = (r + [""] * 17)[:17]
         row_name = str(r[0] or "").strip().lower()
-        # B is offset 0 in the slice; Q is offset 15 (B..Q = 16 cols).
-        hr_status = str(r[15] or "").strip()
+        # B is offset 0 in the slice; R is offset 16 (B..R = 17 cols).
+        hr_status = str(r[16] or "").strip()
         if row_name == target and hr_status in _REJECTED_STATUSES:
             return True
     return False
 
 
 def append_candidate(svc, sheet_id, tab, row):
-    """Append a candidate row to the Candidates dashboard (columns A:R).
+    """Append a candidate row to the Candidates dashboard (columns A:T).
+
+    v3 layout (2026-06-25): Prior Rejection moved from col S to col M so
+    bot-detected fields cluster together; HR-input cols sit at the end
+    (R=HR Status, S=HR Notes, T=Bot Feedback).
 
     Application Submitted (E): Where the application came from. One of
     "Email", "Indeed", "Craigslist", or "Recruiter/Agency - {name}"
     (with the actual agency name extracted by the scorer when known).
     Computed in main.py from sender + scorer recruiter_agency signal +
     body keyword match for Craigslist.
-
-    The Recruiter/Agency column, Indeed boolean, and Indeed Action Done
-    columns from the prior layout were collapsed into this single
-    Application Submitted column on 2026-06-18 -- the per-source detail
-    they carried is now either in Application Submitted itself (recruiter
-    name) or available via filter on Application Submitted=Indeed
-    (Indeed Queue tab) so the dedicated boolean/checkbox columns were
-    redundant.
     """
     application_submitted = (row.get("application_submitted") or "Email").strip() or "Email"
     prior_flag = _PRIOR_REJECTION_FLAG if _has_prior_rejection(svc, sheet_id, row.get("candidate_name", ""), tab) else ""
     values = [
-        row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        _safe(row.get("candidate_name", "")),
-        _safe(row.get("email", "")),
-        _safe(row.get("phone", "")),
-        _safe(application_submitted),  # E: Application Submitted
-        _safe(row.get("filename", "")),
-        _safe(row.get("applied_for", "")),
-        _safe(row.get("cross_fit_match", "")),
-        row.get("cross_fit_flag", ""),
-        row.get("decision", ""),
-        row.get("years_relevant_experience", ""),
-        _safe(row.get("job_hopping_flag", "")),
-        row.get("confidence", ""),
-        _safe(row.get("reasoning", "")),
-        _hyperlink(row.get("drive_link", "")),
-        _hyperlink(row.get("gmail_link", "")),
-        "",  # Q: HR Status (HR fills in)
-        "",  # R: HR Notes (HR fills in)
-        prior_flag,  # S: Prior Rejection (🚩 flag for duplicate-rejected applicants)
+        row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),  # A
+        _safe(row.get("candidate_name", "")),                                                # B
+        _safe(row.get("email", "")),                                                          # C
+        _safe(row.get("phone", "")),                                                          # D
+        _safe(application_submitted),                                                         # E
+        _safe(row.get("filename", "")),                                                       # F
+        _safe(row.get("applied_for", "")),                                                    # G
+        _safe(row.get("cross_fit_match", "")),                                                # H
+        row.get("cross_fit_flag", ""),                                                        # I
+        row.get("decision", ""),                                                              # J
+        row.get("years_relevant_experience", ""),                                             # K
+        _safe(row.get("job_hopping_flag", "")),                                               # L
+        prior_flag,  # M: Prior Rejection (🚩 if same-name + terminal HR Status exists)
+        row.get("confidence", ""),                                                            # N
+        _safe(row.get("reasoning", "")),                                                      # O
+        _hyperlink(row.get("drive_link", "")),                                                # P
+        _hyperlink(row.get("gmail_link", "")),                                                # Q
+        "",  # R: HR Status (HR fills in)
+        "",  # S: HR Notes (HR fills in)
+        "",  # T: Bot Feedback (HR fills in when scorer was wrong)
     ]
     resp = svc.spreadsheets().values().append(
         spreadsheetId=sheet_id,
-        range=f"{tab}!A:S",
+        range=f"{tab}!A:T",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
-    # Parse the updated range like "Candidates!A1139:S1139" to get the row #.
-    # Returned so callers can do follow-up writes (e.g. auto-set HR Status
-    # after a denied auto-reply fires).
+    # Parse the updated range like "Candidates!A1139:T1139" to get the row #.
     m = re.search(r"!\w+(\d+):", (resp.get("updates", {}) or {}).get("updatedRange", "") or "")
     return int(m.group(1)) if m else 0
 
 
 def set_hr_status(svc, sheet_id, tab: str, row_num: int, status: str) -> None:
-    """Update HR Status (col Q) on the given Candidates row. Used by the
-    bot to auto-stamp 'Rejected' on rows where it sent the denied template
-    end-to-end, so (a) the row auto-hides on the next onEdit cycle and
-    (b) the Prior Rejection flag catches any future submissions from the
-    same name. No-op if row_num is 0 (caller couldn't parse the append
-    response)."""
+    """Update HR Status (col R, post v3 layout) on the given Candidates
+    row. Used by the bot to auto-stamp 'Rejected' on rows where it sent
+    the denied template end-to-end, so (a) the row auto-hides on the
+    next onEdit cycle and (b) the Prior Rejection flag catches any
+    future submissions from the same name. No-op if row_num is 0."""
     if not row_num or row_num <= 0:
         return
     try:
         svc.spreadsheets().values().update(
             spreadsheetId=sheet_id,
-            range=f"{tab}!Q{row_num}",
+            range=f"{tab}!R{row_num}",
             valueInputOption="USER_ENTERED",
             body={"values": [[status]]},
         ).execute()
@@ -902,10 +899,10 @@ def append_indeed_queue(svc, sheet_id, tab, row):
     fit_quality = _INDEED_FIT_QUALITY.get(decision, decision)
     ai_rec = _INDEED_AI_RECOMMENDATION.get(decision, "Review manually")
     # VLOOKUP by timestamp -> HR Status column on Candidates.
-    # Candidates layout (post 2026-06-18 restructure):
-    # A=Timestamp ... Q=HR Status (column 17 in A:Q).
+    # Candidates v3 layout (2026-06-25):
+    # A=Timestamp ... R=HR Status (column 18 in A:R).
     hr_status_formula = (
-        f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:Q,17,FALSE),"")'
+        f'=IFERROR(VLOOKUP("{timestamp}",Candidates!A:R,18,FALSE),"")'
     )
     values = [
         candidate_name, position, _safe(fit_quality), _safe(ai_rec),
@@ -1047,7 +1044,7 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range=f"{tab}!A2:R",
+            range=f"{tab}!A2:T",
         ).execute()
     except Exception as e:
         log.warning("Could not load %s for audit: %s", tab, e)
@@ -1056,7 +1053,8 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     out = []
     for r in rows:
-        r = (r + [""] * 18)[:18]
+        # v3 layout: 20 cols A..T
+        r = (r + [""] * 20)[:20]
         ts_str = r[0]
         try:
             ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
@@ -1066,20 +1064,21 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
             ts = ts.replace(tzinfo=timezone.utc)
         if ts < cutoff:
             continue
-        hr_status = (r[16] or "").strip()
+        hr_status = (r[17] or "").strip()  # R = HR Status
         if hr_status not in terminal_statuses:
             continue
         out.append({
             "timestamp": ts_str,
-            "candidate_name": r[1],
-            "application_submitted": r[4],
-            "filename": r[5],
-            "applied_for": r[6],
-            "decision": r[9],
-            "confidence": r[12],
-            "ai_reasoning": r[13],
-            "gmail_link": r[15],
-            "hr_status": hr_status,
-            "hr_notes": (r[17] or "").strip(),
+            "candidate_name": r[1],                    # B
+            "application_submitted": r[4],             # E
+            "filename": r[5],                          # F
+            "applied_for": r[6],                       # G
+            "decision": r[9],                          # J
+            "confidence": r[13],                       # N (was M pre-v3)
+            "ai_reasoning": r[14],                     # O (was N pre-v3)
+            "gmail_link": r[16],                       # Q (was P pre-v3)
+            "hr_status": hr_status,                    # R (was Q pre-v3)
+            "hr_notes": (r[18] or "").strip(),         # S (was R pre-v3)
+            "bot_feedback": (r[19] or "").strip(),     # T (NEW v3)
         })
     return out

@@ -1785,11 +1785,11 @@ def run() -> int:
 
 
 def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
-    """Apply visual styling to col S so it visually fits with the other
-    HR-active columns:
+    """Apply visual styling to col M (v3 layout; was col S pre-v3) so it
+    visually fits next to the other bot-detection columns:
       * Column width 190px so the flag text doesn't get truncated.
-      * S1 header: light green bg (matching HR Status/HR Notes), bold.
-      * S2:S conditional format: light-red bg + dark-red bold text when
+      * M1 header: light green bg (matching HR-area cols), bold.
+      * M2:M conditional format: light-red bg + dark-red bold text when
         the cell contains "Previously rejected" (the flag).
     Idempotent: removes any prior matching CF rule before re-adding."""
     inner_id = _get_sheet_id(svc, sheet_id, tab)
@@ -1801,7 +1801,7 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     requests = [{
         "updateDimensionProperties": {
             "range": {"sheetId": inner_id, "dimension": "COLUMNS",
-                      "startIndex": 18, "endIndex": 19},
+                      "startIndex": 12, "endIndex": 13},
             "properties": {"pixelSize": 190},
             "fields": "pixelSize",
         }
@@ -1811,7 +1811,7 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     requests.append({
         "repeatCell": {
             "range": {"sheetId": inner_id, "startRowIndex": 0, "endRowIndex": 1,
-                      "startColumnIndex": 18, "endColumnIndex": 19},
+                      "startColumnIndex": 12, "endColumnIndex": 13},
             "cell": {
                 "userEnteredFormat": {
                     "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
@@ -1837,7 +1837,7 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
             "rule": {
                 "ranges": [{
                     "sheetId": inner_id, "startRowIndex": 1,
-                    "startColumnIndex": 18, "endColumnIndex": 19,
+                    "startColumnIndex": 12, "endColumnIndex": 13,
                 }],
                 "booleanRule": {
                     "condition": {
@@ -1862,10 +1862,10 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
 
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
-    """For every Candidates row, set col S to "🚩 Previously rejected"
-    if an earlier row exists with the same trimmed/case-insensitive name
-    AND a terminal-rejection HR Status (Rejected / Not Selected / Not a fit).
-    Idempotent."""
+    """For every Candidates row, set col M (v3 layout; was col S pre-v3)
+    to "🚩 Previously rejected" if an earlier row exists with the same
+    trimmed/case-insensitive name AND a terminal-rejection HR Status
+    (Rejected / Not Selected / Not a fit). Idempotent."""
     REJECTED = {"Rejected", "Not Selected", "Not a fit"}
     FLAG = "🚩 Previously rejected"
     resp = svc.spreadsheets().values().get(
@@ -1879,7 +1879,7 @@ def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
         name = str(r[1] or "").strip().lower()
         if not name:
             continue
-        hr_status = str(r[16] or "").strip()
+        hr_status = str(r[17] or "").strip()  # col R (v3)
         history.setdefault(name, []).append((i, hr_status))
     updates = []
     flagged = 0
@@ -1893,9 +1893,9 @@ def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
                     flag = FLAG
                     flagged += 1
                     break
-        updates.append({"range": f"{tab}!S{i + 2}", "values": [[flag]]})
+        updates.append({"range": f"{tab}!M{i + 2}", "values": [[flag]]})
     svc.spreadsheets().values().update(
-        spreadsheetId=sheet_id, range=f"{tab}!S1",
+        spreadsheetId=sheet_id, range=f"{tab}!M1",
         valueInputOption="RAW",
         body={"values": [["Prior Rejection"]]},
     ).execute()
@@ -1905,6 +1905,124 @@ def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
             body={"data": updates, "valueInputOption": "USER_ENTERED"},
         ).execute()
     log.info("prior-rejection backfill: flagged %d row(s) of %d", flagged, len(rows))
+
+
+def migrate_to_v3_layout(svc, sheet_id, tab=CANDIDATES_TAB):
+    """One-time Sheet migration to v3 column layout (2026-06-25):
+      * Move col S "Prior Rejection" to col M (right of Job Hopping).
+        Bot-detected fields now cluster together at K..M.
+      * Add col T "Bot Feedback" for HR free-text on what the bot got
+        wrong; feeds the learning loop.
+      * Rewrite every Indeed Queue HR Status VLOOKUP from
+        Candidates!A:Q,17 -> Candidates!A:R,18 so HR-status sync
+        keeps working after the column shift.
+    Idempotent: a second run is a no-op once the v3 markers are in place.
+    """
+    inner_id = _get_sheet_id(svc, sheet_id, tab)
+    if inner_id is None:
+        log.warning("Could not find sheet id for %s; skipping v3 layout.", tab)
+        return
+
+    # Snapshot current header row to figure out what work is left to do.
+    headers_resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=f"{tab}!A1:T1",
+    ).execute().get("values", [[]])
+    headers = (headers_resp[0] if headers_resp else []) + [""] * 20
+    headers = headers[:20]
+
+    already_v3 = (headers[12] == "Prior Rejection" and headers[19] == "Bot Feedback")
+    if already_v3:
+        log.info("v3 layout already in place; nothing to do on Candidates.")
+    else:
+        requests = []
+        # 1) Move Prior Rejection from col S (idx 18) to col M (insert at idx 12).
+        if headers[18] == "Prior Rejection":
+            requests.append({
+                "moveDimension": {
+                    "source": {"sheetId": inner_id, "dimension": "COLUMNS",
+                               "startIndex": 18, "endIndex": 19},
+                    "destinationIndex": 12,
+                }
+            })
+            log.info("v3 layout: queued moveDimension col S -> col M")
+        # 2) Ensure the sheet has at least 20 columns so col T exists.
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets(properties(sheetId,title,gridProperties))",
+        ).execute()
+        candidates_grid = None
+        for s in meta.get("sheets", []):
+            if s.get("properties", {}).get("title") == tab:
+                candidates_grid = s["properties"].get("gridProperties", {})
+                break
+        if candidates_grid:
+            col_count = candidates_grid.get("columnCount", 19)
+            if col_count < 20:
+                requests.append({
+                    "appendDimension": {"sheetId": inner_id,
+                                        "dimension": "COLUMNS",
+                                        "length": 20 - col_count}
+                })
+                log.info("v3 layout: queued appendDimension +%d cols", 20 - col_count)
+        if requests:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id, body={"requests": requests},
+            ).execute()
+
+        # 3) Stamp Bot Feedback header at T1.
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{tab}!T1",
+            valueInputOption="RAW", body={"values": [["Bot Feedback"]]},
+        ).execute()
+        log.info("v3 layout: wrote T1 = 'Bot Feedback'")
+
+    # 4) Rewrite Indeed Queue HR Status formulas (A:Q,17 -> A:R,18).
+    iq_tab = "Indeed Queue"
+    try:
+        col_e = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{iq_tab}!E2:E",
+            valueRenderOption="FORMULA",
+        ).execute().get("values", []) or []
+        updates = []
+        for i, row in enumerate(col_e):
+            formula = (row[0] if row else "")
+            if not formula or "VLOOKUP" not in str(formula):
+                continue
+            new_formula = (
+                str(formula)
+                .replace("Candidates!A:Q,17,", "Candidates!A:R,18,")
+                .replace("Candidates!$A:$Q,17,", "Candidates!$A:$R,18,")
+            )
+            if new_formula != formula:
+                updates.append({"range": f"{iq_tab}!E{i + 2}",
+                                "values": [[new_formula]]})
+        if updates:
+            svc.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"data": updates, "valueInputOption": "USER_ENTERED"},
+            ).execute()
+            log.info("v3 layout: rewrote %d Indeed Queue HR Status formulas", len(updates))
+        else:
+            log.info("v3 layout: no Indeed Queue formulas needed rewriting.")
+    except Exception as e:
+        log.warning("v3 layout: Indeed Queue formula rewrite failed: %s", e)
+
+
+def run_v3_layout_only() -> int:
+    """Workflow step `v3_layout`: move Prior Rejection to col M and add
+    Bot Feedback at col T on the live sheet. Pairs with the v3 code
+    push so the bot's writes line up with the new column positions.
+    """
+    cfg = config.load()
+    log.info("v3 layout migration. Sheet=%s", cfg.sheet_id)
+    creds = google_auth.make_credentials(
+        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
+    )
+    svc = google_auth.sheets(creds)
+    migrate_to_v3_layout(svc, cfg.sheet_id)
+    style_prior_rejection_column(svc, cfg.sheet_id)
+    return 0
 
 
 def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
@@ -1942,13 +2060,14 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
         ("J", "Decision", "qualified · borderline · not_qualified · pending_paused · needs_review."),
         ("K", "Years Relevant Exp", "Scorer's extraction."),
         ("L", "Job Hopping", "positive / caution flag."),
-        ("M", "Confidence", "Scorer's 0-1 confidence."),
-        ("N", "AI Reasoning", "One-line explanation. Read this before setting Status."),
-        ("O", "Drive File Link", "Click → resume PDF opens in browser."),
-        ("P", "Gmail Thread Link", "Click → candidate's email thread (under jobs@)."),
-        ("Q", "HR Status", "The dropdown YOU set. See HR Status key below."),
-        ("R", "HR Notes", "Free text. Leave a note when you disagree with the bot."),
-        ("S", "Prior Rejection", "🚩 fires when a same-name candidate was previously rejected."),
+        ("M", "Prior Rejection", "🚩 fires when a same-name candidate was previously rejected."),
+        ("N", "Confidence", "Scorer's 0-1 confidence."),
+        ("O", "AI Reasoning", "One-line explanation. Read this before setting Status."),
+        ("P", "Drive File Link", "Click -> resume PDF opens in browser."),
+        ("Q", "Gmail Thread Link", "Click -> candidate's email thread (under jobs@)."),
+        ("R", "HR Status", "The dropdown YOU set. See HR Status key below."),
+        ("S", "HR Notes", "Free text. Use for anything not about the bot's decision."),
+        ("T", "Bot Feedback", "What the bot got wrong. Feeds back into the scorer next week."),
 
         # ---- Section 2: HR Status options ----
         ("HR STATUS KEY", "", ""),
@@ -2621,4 +2740,6 @@ if __name__ == "__main__":
         sys.exit(run_retire_needs_human_only())
     if _steps in ("checkup", "test", "audit_sheet"):
         sys.exit(run_comprehensive_checkup())
+    if _steps in ("v3_layout", "v3", "layout"):
+        sys.exit(run_v3_layout_only())
     sys.exit(run())
