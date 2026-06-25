@@ -1171,9 +1171,29 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
                     break
         except Exception:
             band_ids = []
+        # Also remove any active filter views on this tab — they can paint
+        # the visible row range with their own color and look like CF.
+        try:
+            fv_meta = svc.spreadsheets().get(
+                spreadsheetId=sheet_id,
+                fields="sheets(properties(sheetId,title),filterViews)",
+            ).execute()
+            fv_ids = []
+            for s in fv_meta.get("sheets", []):
+                if s.get("properties", {}).get("title") == tab:
+                    fv_ids = [fv["filterViewId"] for fv in s.get("filterViews", []) or []]
+                    break
+        except Exception:
+            fv_ids = []
+        fv_delete_requests = [
+            {"deleteFilterView": {"filterId": fid}} for fid in fv_ids
+        ]
+        # Also remove any basicFilter (the simpler "Data > Create a filter"
+        # variant) on this sheet.
+        clear_basic_filter = [{"clearBasicFilter": {"sheetId": inner_id}}]
         band_delete_requests = [
             {"deleteBanding": {"bandedRangeId": bid}} for bid in band_ids
-        ]
+        ] + fv_delete_requests + clear_basic_filter
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id,
             body={"requests": delete_requests + band_delete_requests + [clear_bg_request] + add_requests},
