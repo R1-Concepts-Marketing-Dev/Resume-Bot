@@ -2080,46 +2080,41 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     except Exception as e:
         log.warning("Could not extend Candidates filter ranges: %s", e)
 
-    # ---- Copy col L's formatting onto col M ----
-    # The base sage-green tint and other per-row formatting on cols A-L
-    # was baked in as cell formatting (not CF). Col M was inserted post-v3
-    # so it never got the same fill. CopyPaste with PASTE_FORMAT clones
-    # col L's per-row formatting onto col M while preserving M's own
-    # values + the conditional-formatting rule for "Previously rejected".
+    # ---- Force col M data cells to sage green via a low-priority CF ----
+    # Other cols (A-L) get their per-row green from a CF rule whose range
+    # ended at col L pre-v3. Extending that CF didn't work consistently,
+    # so we add a NEW low-priority CF rule on M2:M whose condition is
+    # CUSTOM_FORMULA "=TRUE" -- it always fires, painting sage green.
+    # The higher-priority "Previously rejected" rule (index 0) wins on
+    # flagged rows, so red still shows where the duplicate flag is set.
     try:
-        meta = svc.spreadsheets().get(
-            spreadsheetId=sheet_id,
-            fields="sheets(properties(sheetId,title,gridProperties))",
-        ).execute()
-        for s in meta.get("sheets", []):
-            if s.get("properties", {}).get("title") != tab:
-                continue
-            cand_inner = s["properties"]["sheetId"]
-            max_row = s["properties"].get("gridProperties", {}).get("rowCount", 2000)
-            # Copy L2:L<maxRow> formatting onto M2:M<maxRow>
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=sheet_id,
-                body={"requests": [{
-                    "copyPaste": {
-                        "source": {
-                            "sheetId": cand_inner,
-                            "startRowIndex": 1, "endRowIndex": max_row,
-                            "startColumnIndex": 11, "endColumnIndex": 12,
+        green_rule_request = {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": inner_id, "startRowIndex": 1,
+                        "startColumnIndex": 12, "endColumnIndex": 13,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": "=TRUE"}],
                         },
-                        "destination": {
-                            "sheetId": cand_inner,
-                            "startRowIndex": 1, "endRowIndex": max_row,
-                            "startColumnIndex": 12, "endColumnIndex": 13,
+                        "format": {
+                            "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
                         },
-                        "pasteType": "PASTE_FORMAT",
-                        "pasteOrientation": "NORMAL",
                     }
-                }]},
-            ).execute()
-            log.info("Copied col L formatting onto col M (rows 2..%d).", max_row)
-            break
+                },
+                "index": 1,  # below the index-0 "Previously rejected" rule
+            }
+        }
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [green_rule_request]},
+        ).execute()
+        log.info("Added low-priority sage-green CF rule on M2:M.")
     except Exception as e:
-        log.warning("Could not copy col L formatting to col M: %s", e)
+        log.warning("Could not add green CF on col M: %s", e)
 
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
