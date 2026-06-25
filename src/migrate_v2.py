@@ -1960,21 +1960,46 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     # 4) Paint col M data cells (M2:M) sage green to match the rest
     #    of the row. Conditional rule above still wins on flagged rows
     #    because CF beats userEnteredFormat.
-    # IMPORTANT: do NOT paint col M data cells with a single color.
-    # Row colors on Candidates are CONDITIONAL (different HR states /
-    # decisions paint different colors). Solid-painting col M would
-    # break that signal. Instead we extend each existing CF rule below
-    # to include col M, so per-row colors flow through naturally.
-    # Clear any baked cell-level bg on M2:M so CF rules can take over.
-    requests.append({
-        "updateCells": {
-            "range": {"sheetId": inner_id, "startRowIndex": 1,
-                      "endRowIndex": 2000, "startColumnIndex": 12,
-                      "endColumnIndex": 13},
-            "fields": ("userEnteredFormat.backgroundColor,"
-                       "userEnteredFormat.backgroundColorStyle"),
-        }
-    })
+    # Row-by-row: sample col L's effectiveFormat.backgroundColor for each
+    # data row, then paint the matching col M cell with the SAME color.
+    # This guarantees col M matches the row's CF-driven color (green for
+    # qualified+engaged, red for rejected, etc.) per row.
+    try:
+        l_data = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            ranges=[f"{tab}!L2:L"],
+            fields=("sheets.data.rowData.values."
+                    "effectiveFormat.backgroundColor"),
+        ).execute()
+        l_rows = (l_data.get("sheets", [{}])[0]
+                  .get("data", [{}])[0]
+                  .get("rowData", []) or [])
+        log.info("Sampled %d rows of col L bg for col M paint.", len(l_rows))
+        # Build a rowData list of identical bg values for col M
+        m_row_data = []
+        for r in l_rows:
+            vals = r.get("values") or [{}]
+            bg = (vals[0].get("effectiveFormat", {}) or {}).get("backgroundColor", {})
+            # Default to white if effectiveFormat returns near-white (no bg)
+            m_row_data.append({"values": [{
+                "userEnteredFormat": {
+                    "backgroundColor": bg,
+                    "backgroundColorStyle": {"rgbColor": bg},
+                }
+            }]})
+        if m_row_data:
+            requests.append({
+                "updateCells": {
+                    "rows": m_row_data,
+                    "fields": ("userEnteredFormat.backgroundColor,"
+                               "userEnteredFormat.backgroundColorStyle"),
+                    "start": {"sheetId": inner_id, "rowIndex": 1,
+                              "columnIndex": 12},
+                }
+            })
+            log.info("Queued per-row col M paint for %d rows.", len(m_row_data))
+    except Exception as e:
+        log.warning("Could not sample col L per-row for M paint: %s", e)
 
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id, body={"requests": requests},
