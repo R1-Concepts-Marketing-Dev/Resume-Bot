@@ -87,6 +87,10 @@ OUTCOME_LABELS = {
     "unreadable":        "Handled/Unreadable",
     "not_a_resume":      "Handled/Not a resume",
     "closed":            "Handled/Closed",
+    # Applied to every Indeed Quick Apply thread the bot processes -- HR
+    # uses this label to find Indeed-sourced candidates in Gmail without
+    # having to filter by sender.
+    "handled_indeed":    "Handled/Indeed",
     "needs_human":       "For HR",
     "for_hr":            "For HR",
     "for_hr_question":         "For HR/Question?",
