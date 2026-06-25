@@ -1960,15 +1960,9 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     # 4) Paint col M data cells (M2:M) sage green to match the rest
     #    of the row. Conditional rule above still wins on flagged rows
     #    because CF beats userEnteredFormat.
-    requests.append({
-        "updateCells": {
-            "range": {"sheetId": inner_id, "startRowIndex": 1,
-                      "endRowIndex": 2000, "startColumnIndex": 12,
-                      "endColumnIndex": 13},
-            "fields": ("userEnteredFormat.backgroundColor,"
-                       "userEnteredFormat.backgroundColorStyle"),
-        }
-    })
+    # No-op for col M data cells: HR has paste-formatted col L's CF rules
+    # onto col M so the row banding extends naturally. Touching the cells
+    # here would strip that formatting on every dispatch.
 
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id, body={"requests": requests},
