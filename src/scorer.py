@@ -430,7 +430,8 @@ def _build_filter_block(filters: list) -> str:
 
 def score(*, api_key: str, model: str, resume_text: str, filters: list,
           email_subject: str = "", email_body: str = "",
-          used_ocr: bool = False) -> dict[str, Any]:
+          used_ocr: bool = False,
+          learning_examples: list | None = None) -> dict[str, Any]:
     if not resume_text.strip():
         return _fallback("Empty resume text - could not extract content.")
 
