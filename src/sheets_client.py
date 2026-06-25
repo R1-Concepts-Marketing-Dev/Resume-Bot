@@ -98,6 +98,20 @@ _INDEED_AI_RECOMMENDATION = {
 
 SEED_TEMPLATES: list[Template] = [
     Template(
+        key="submission_received",
+        subject="Thanks -- we got your resume",
+        body=(
+            "Hi {applicant_name},\n\n"
+            "Thanks for sending your resume to {company_name} -- we "
+            "have it. Our hiring team will review it and follow up "
+            "with you shortly.\n\n"
+            "If you have questions in the meantime, just reply to "
+            "this email.\n\n"
+            "-- {company_name} HR"
+        ),
+        active=True,
+    ),
+    Template(
         key="no_resume",
         subject="Please resend with your resume attached",
         body=(
@@ -1039,8 +1053,14 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
     gmail_link, hr_status, hr_notes.
     """
     if terminal_statuses is None:
-        terminal_statuses = {"Hired", "Rejected", "Not a fit",
-                             "Closed", "Withdrawn", "Declined"}
+        # "Saved" parks a candidate for later reference (moves to the
+        # Saved Candidates tab) -- treated as terminal for audit
+        # purposes since HR has acted. "No Show" + "Not Interested" +
+        # "Unavailable" all close out the conversation.
+        terminal_statuses = {"Hired", "Rejected", "Not Selected",
+                             "Not a fit", "Not Interested", "Unavailable",
+                             "Closed", "Withdrawn", "Declined",
+                             "No Show", "Saved"}
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
