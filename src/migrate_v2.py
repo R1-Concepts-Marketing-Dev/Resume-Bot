@@ -1,3 +1,4 @@
+
 """One-off Candidates dashboard migration (2026-06-18).
 
 Transforms the Candidates tab from the old 20-21 column layout to the
@@ -1104,6 +1105,56 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
     ).execute()
     log.info("%s!A2 (ARRAYFORMULA days) + B2 (QUERY pending_paused) written.", tab)
 
+    # Strip stale CF rules that painted empty Pending rows red. Replace
+    # with a single rule: paint col A (Days Pending) red when value >= 5.
+    inner_id = _get_sheet_id(svc, sheet_id, tab)
+    if inner_id is None:
+        return
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets(properties(sheetId,title),conditionalFormats)",
+        ).execute()
+        n_rules = 0
+        for s in meta.get("sheets", []):
+            if s.get("properties", {}).get("title") == tab:
+                n_rules = len(s.get("conditionalFormats", []) or [])
+                break
+        delete_requests = [
+            {"deleteConditionalFormatRule": {"sheetId": inner_id, "index": i}}
+            for i in range(n_rules - 1, -1, -1)
+        ]
+        add_requests = [{
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": inner_id, "startRowIndex": 1,
+                        "startColumnIndex": 0, "endColumnIndex": 1,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "NUMBER_GREATER_THAN_EQ",
+                            "values": [{"userEnteredValue": "5"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.988, "green": 0.898, "blue": 0.902},
+                            "textFormat": {"bold": True,
+                                           "foregroundColor": {"red": 0.722, "green": 0.314, "blue": 0.259}},
+                        },
+                    }
+                },
+                "index": 0,
+            }
+        }]
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": delete_requests + add_requests},
+        ).execute()
+        log.info("%s: removed %d stale CF rules, added Days >=5 red rule.",
+                 tab, n_rules)
+    except Exception as e:
+        log.warning("Could not refresh %s CF rules: %s", tab, e)
+
 
 def clean_indeed_queue_orphans(svc, sheet_id):
     """Indeed Queue cleanup. Removes two kinds of garbage:
@@ -2135,7 +2186,7 @@ def rewrite_usage_guide(svc, sheet_id, tab="Usage Guide"):
         ("🚩 (red flag)", "Candidates col S", "Same-name candidate was previously rejected."),
         ("Green chip", "Gmail sidebar · row label", "Thread needs HR attention (For HR umbrella)."),
         ("Light red cell", "Candidates col S · Bot Errors rows", "Conditional formatting on prior-rejection or error."),
-        ("Gray cell with strikethrough", "Candidates rows", "Terminal HR Status → row auto-hidden."),
+        ("Gray cell with strikethrough", "Candidates rows", "Terminal HR Status -> row auto-hidden."),
 
         # ---- Section 5: Tabs ----
         ("OTHER TABS · WHAT EACH IS FOR", "", ""),
@@ -2405,356 +2456,4 @@ def run_retire_needs_human_only() -> int:
         cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
     )
     svc = google_auth.sheets(creds)
-    retire_needs_human_tab(svc, cfg.sheet_id)
-    return 0
-
-
-def run_comprehensive_checkup() -> int:
-    """End-to-end check of every sheet automation. Writes 3 TEST rows
-    to Candidates and verifies the downstream pipeline. Writes a
-    Test Report tab summarizing what passed / failed.
-
-    The 3 test rows are:
-      1. TEST normal Email candidate (qualified)
-      2. TEST Indeed candidate (qualified) -- should propagate to Indeed Queue
-      3. TEST "Tester Tester" duplicate -- a prior row with this name and
-         HR Status=Rejected is also written, so this third row should
-         get the Prior Rejection flag in col S.
-    """
-    import time as _time
-    cfg = config.load()
-    log.info("Comprehensive checkup. Sheet=%s", cfg.sheet_id)
-    creds = google_auth.make_credentials(
-        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
-    )
-    svc = google_auth.sheets(creds)
-
-    findings = []
-    def report(area, status, detail):
-        findings.append([area, status, detail])
-        log.info("[%s] %s: %s", status, area, detail)
-
-    # ---- 1. Snapshot existing tab inventory ----
-    try:
-        meta = svc.spreadsheets().get(
-            spreadsheetId=cfg.sheet_id, fields="sheets.properties",
-        ).execute()
-        tab_names = [s["properties"]["title"] for s in meta.get("sheets", [])]
-        report("Tabs", "OK", f"{len(tab_names)} tabs: {', '.join(tab_names)}")
-    except Exception as e:
-        report("Tabs", "FAIL", f"could not list tabs: {e}")
-        tab_names = []
-
-    # ---- 2. Verify Candidates header is A:S, 19 cols ----
-    try:
-        h = svc.spreadsheets().values().get(
-            spreadsheetId=cfg.sheet_id, range="Candidates!A1:T1",
-        ).execute().get("values", [[]])[0]
-        if len(h) >= 19 and h[18] == "Prior Rejection":
-            report("Candidates headers", "OK", f"{len(h)} cols, col S = Prior Rejection")
-        else:
-            report("Candidates headers", "FAIL",
-                   f"expected 19 cols ending in Prior Rejection, got {len(h)}: {h}")
-    except Exception as e:
-        report("Candidates headers", "FAIL", str(e))
-
-    # ---- 3. Insert TEST rows ----
-    test_ts_1 = "TEST-2026-06-24T00:00:01"
-    test_ts_2 = "TEST-2026-06-24T00:00:02"
-    test_ts_3 = "TEST-2026-06-24T00:00:03"
-    test_ts_prior_reject = "TEST-2026-06-24T00:00:00"   # the row that gets pre-rejected
-
-    # First write the "prior rejected" row with Tester Tester + HR Status=Rejected.
-    # This must exist BEFORE the duplicate row gets appended so the
-    # prior-rejection backfill picks it up.
-    rows_to_append = [
-        # Row 0: Tester Tester with HR Status already Rejected (will be the "prior")
-        [
-            test_ts_prior_reject, "Tester Tester", "tester@TEST.com", "TEST",
-            "TEST", "TEST_resume.pdf", "TEST role", "", "", "TEST", "TEST",
-            "TEST", "TEST", "TEST reasoning", "", "", "Rejected", "TEST notes - prior", "",
-        ],
-        # Row 1: TEST normal Email candidate
-        [
-            test_ts_1, "TEST Normal", "test1@TEST.com", "TEST",
-            "Email", "TEST_resume.pdf", "TEST role", "", "", "qualified",
-            "TEST", "TEST", "TEST", "TEST reasoning - normal email",
-            "", "", "", "", "",
-        ],
-        # Row 2: TEST Indeed candidate (Indeed in col E -> Indeed Queue should pick it up)
-        [
-            test_ts_2, "TEST Indeed", "test2@TEST.com", "TEST",
-            "Indeed", "TEST_indeed_resume.pdf", "TEST role", "", "", "qualified",
-            "TEST", "TEST", "TEST", "TEST reasoning - indeed",
-            "", "", "", "", "",
-        ],
-        # Row 3: TEST duplicate of "Tester Tester" -- should get Prior Rejection flag
-        [
-            test_ts_3, "Tester Tester", "test3@TEST.com", "TEST",
-            "Email", "TEST_resume.pdf", "TEST role", "", "", "qualified",
-            "TEST", "TEST", "TEST", "TEST reasoning - second submission",
-            "", "", "", "", "",
-        ],
-    ]
-    try:
-        svc.spreadsheets().values().append(
-            spreadsheetId=cfg.sheet_id,
-            range="Candidates!A:S",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows_to_append},
-        ).execute()
-        report("TEST rows written", "OK", f"appended {len(rows_to_append)} rows to Candidates")
-    except Exception as e:
-        report("TEST rows written", "FAIL", str(e))
-        return 1
-
-    # ---- 4. Also append the Indeed-test row to Indeed Queue (mirrors bot behavior) ----
-    try:
-        hr_lookup = (
-            f'=IFERROR(VLOOKUP("{test_ts_2}",Candidates!A:Q,17,FALSE),"")'
-        )
-        svc.spreadsheets().values().append(
-            spreadsheetId=cfg.sheet_id,
-            range="Indeed Queue!A:G",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [[
-                "TEST Indeed", "TEST role", "Strong", "Move to interview stage",
-                hr_lookup, False, test_ts_2,
-            ]]},
-        ).execute()
-        report("Indeed Queue TEST row", "OK", f"appended with VLOOKUP")
-    except Exception as e:
-        report("Indeed Queue TEST row", "FAIL", str(e))
-
-    # ---- 5. Run prior-rejection backfill so col S populates for the dup row ----
-    try:
-        backfill_prior_rejection(svc, cfg.sheet_id)
-        report("Prior-rejection backfill", "OK", "ran without error")
-    except Exception as e:
-        report("Prior-rejection backfill", "FAIL", str(e))
-
-    _time.sleep(2)  # give Sheets a moment to materialize formulas
-
-    # ---- 6. Read back the test rows + verify ----
-    try:
-        # Find each TEST row by timestamp
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=cfg.sheet_id, range="Candidates!A2:S",
-        ).execute()
-        all_rows = resp.get("values", []) or []
-        ts_to_row = {}
-        for i, r in enumerate(all_rows, start=2):
-            if r and r[0].startswith("TEST-"):
-                ts_to_row[r[0]] = (i, r)
-        if test_ts_3 in ts_to_row:
-            i, r = ts_to_row[test_ts_3]
-            r = (r + [""] * 19)[:19]
-            flag = r[18]
-            if "Previously rejected" in flag:
-                report("Prior Rejection flag (col S)", "OK",
-                       f"row {i} got the flag: {flag!r}")
-            else:
-                report("Prior Rejection flag (col S)", "WARN",
-                       f"row {i} col S = {flag!r} (expected 'Previously rejected')")
-        else:
-            report("Prior Rejection flag (col S)", "FAIL",
-                   "duplicate test row not found by timestamp")
-    except Exception as e:
-        report("Prior Rejection flag (col S)", "FAIL", str(e))
-
-    # ---- 7. Verify Indeed Queue VLOOKUP propagation ----
-    try:
-        # First flip TEST Indeed's HR Status to "Contacted" on Candidates
-        if test_ts_2 in ts_to_row:
-            cand_row_num, _ = ts_to_row[test_ts_2]
-            svc.spreadsheets().values().update(
-                spreadsheetId=cfg.sheet_id,
-                range=f"Candidates!Q{cand_row_num}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [["Contacted"]]},
-            ).execute()
-            _time.sleep(2)
-            # Now read Indeed Queue col E for the TEST Indeed row
-            iq_resp = svc.spreadsheets().values().get(
-                spreadsheetId=cfg.sheet_id, range="Indeed Queue!A2:G",
-            ).execute()
-            iq_rows = iq_resp.get("values", []) or []
-            found = None
-            for r in iq_rows:
-                r = (r + [""] * 7)[:7]
-                if r[6] == test_ts_2:
-                    found = r
-                    break
-            if found and found[4] == "Contacted":
-                report("Indeed Queue VLOOKUP", "OK",
-                       "TEST Indeed thread reflects 'Contacted' status from Candidates")
-            else:
-                report("Indeed Queue VLOOKUP", "WARN",
-                       f"expected 'Contacted', got {found[4] if found else 'row not found'}")
-    except Exception as e:
-        report("Indeed Queue VLOOKUP", "FAIL", str(e))
-
-    # ---- 8. Cross-Match QUERY check (needs a cross_fit_flag = rocket on a test row) ----
-    try:
-        # Set TEST Normal row's col I (Cross-Fit Flag) to rocket emoji
-        if test_ts_1 in ts_to_row:
-            row_num, _ = ts_to_row[test_ts_1]
-            svc.spreadsheets().values().update(
-                spreadsheetId=cfg.sheet_id,
-                range=f"Candidates!I{row_num}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [["\U0001F6A8"]]},
-            ).execute()
-            _time.sleep(3)
-            # Read Cross-Match A2:A and check whether TEST Normal landed
-            cm_resp = svc.spreadsheets().values().get(
-                spreadsheetId=cfg.sheet_id, range="Cross-Match!A2:D",
-            ).execute()
-            cm_rows = cm_resp.get("values", []) or []
-            found = any(r and r[0] == test_ts_1 for r in cm_rows)
-            if found:
-                report("Cross-Match QUERY", "OK", "TEST Normal flagged row appeared in Cross-Match")
-            else:
-                report("Cross-Match QUERY", "WARN",
-                       "TEST Normal didn\'t appear; QUERY may be filtering on HR Status -- which is set to Contacted above. Expected.")
-    except Exception as e:
-        report("Cross-Match QUERY", "FAIL", str(e))
-
-    # ---- 9. Pending tab QUERY check ----
-    try:
-        pn_resp = svc.spreadsheets().values().get(
-            spreadsheetId=cfg.sheet_id, range="Pending!A1:Z1",
-        ).execute()
-        if pn_resp.get("values"):
-            report("Pending tab", "OK", "tab exists with headers")
-        else:
-            report("Pending tab", "WARN", "tab exists but empty headers")
-    except Exception as e:
-        report("Pending tab", "FAIL", str(e))
-
-    # ---- 10. Bot Learning Log check ----
-    try:
-        bll_resp = svc.spreadsheets().values().get(
-            spreadsheetId=cfg.sheet_id, range="Bot Learning Log!A1:K",
-        ).execute()
-        bll_rows = bll_resp.get("values", []) or []
-        n_entries = max(0, len(bll_rows) - 1)
-        report("Bot Learning Log", "OK", f"{n_entries} learning entries on file")
-    except Exception as e:
-        report("Bot Learning Log", "FAIL", str(e))
-
-    # ---- 11. Usage Guide refresh check ----
-    try:
-        ug = svc.spreadsheets().values().get(
-            spreadsheetId=cfg.sheet_id, range="Usage Guide!A1:A3",
-        ).execute().get("values", [])
-        if ug and ug[0] and "Resume Bot Usage Guide" in ug[0][0]:
-            report("Usage Guide tab", "OK", "rewritten with new For HR flow")
-        else:
-            report("Usage Guide tab", "WARN", f"unexpected header: {ug}")
-    except Exception as e:
-        report("Usage Guide tab", "FAIL", str(e))
-
-    # ---- 12. Needs Human (retired) check ----
-    try:
-        if "Needs Human (retired)" in tab_names:
-            report("Needs Human retirement", "OK", "tab renamed to (retired)")
-        elif "Needs Human" in tab_names:
-            report("Needs Human retirement", "WARN", "still named 'Needs Human' (no suffix)")
-        else:
-            report("Needs Human retirement", "WARN", "tab not found")
-    except Exception as e:
-        report("Needs Human retirement", "FAIL", str(e))
-
-    # ---- 13. Write Test Report tab ----
-    try:
-        report_rows = [
-            ["Resume Bot · Sheet Automation Checkup", "", ""],
-            [f"Run: {datetime.now(timezone.utc).isoformat(timespec='seconds')} UTC", "", ""],
-            [f"Test rows inserted: 4 (3 TEST candidates + 1 prior-rejection seed)", "", ""],
-            ["", "", ""],
-            ["Area", "Status", "Detail"],
-        ]
-        report_rows.extend(findings)
-        report_rows.append(["", "", ""])
-        report_rows.append(["NEXT: manual UI test", "", ""])
-        report_rows.append([
-            "Open Candidates tab → find row labeled 'TEST Normal' → set HR Status (col Q) to 'Rejected' via the dropdown → row should auto-hide within 1 second.",
-            "", "",
-        ])
-        report_rows.append([
-            "Then look at Indeed Queue → 'TEST Indeed' row → HR Status (col E) should now also read 'Contacted' (VLOOKUP).",
-            "", "",
-        ])
-        report_rows.append([
-            "Then check Cross-Match tab → 'TEST Normal' should appear at top (cross-fit flag was set + HR Status was empty before you set it).",
-            "", "",
-        ])
-        report_rows.append(["", "", ""])
-        report_rows.append([
-            "When done testing, delete rows by timestamp prefix 'TEST-'.",
-            "", "",
-        ])
-
-        # Make sure the tab exists
-        try:
-            svc.spreadsheets().values().get(
-                spreadsheetId=cfg.sheet_id, range="Test Report!A1",
-            ).execute()
-        except Exception:
-            # Tab doesn't exist; create it
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=cfg.sheet_id,
-                body={"requests": [{"addSheet": {"properties": {"title": "Test Report"}}}]},
-            ).execute()
-
-        svc.spreadsheets().values().clear(
-            spreadsheetId=cfg.sheet_id, range="Test Report!A1:Z200",
-        ).execute()
-        svc.spreadsheets().values().update(
-            spreadsheetId=cfg.sheet_id,
-            range="Test Report!A1",
-            valueInputOption="RAW",
-            body={"values": report_rows},
-        ).execute()
-        report("Test Report tab", "OK", f"wrote {len(report_rows)} rows")
-    except Exception as e:
-        log.warning("Test Report write failed: %s", e)
-
-    log.info("=== CHECKUP SUMMARY ===")
-    for row in findings:
-        log.info("  [%s] %s", row[1], row[0])
-    return 0
-
-
-def run_prior_rejection_only() -> int:
-    """Set col S header and backfill the duplicate-rejection flag. Idempotent."""
-    cfg = config.load()
-    log.info("Prior-rejection backfill. Sheet=%s", cfg.sheet_id)
-    creds = google_auth.make_credentials(
-        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
-    )
-    svc = google_auth.sheets(creds)
-    backfill_prior_rejection(svc, cfg.sheet_id)
-    style_prior_rejection_column(svc, cfg.sheet_id)
-    return 0
-
-
-if __name__ == "__main__":
-    import os as _os
-    _steps = (_os.environ.get("MIGRATE_STEPS", "all") or "all").strip().lower()
-    if _steps in ("emails", "email"):
-        sys.exit(run_email_only())
-    if _steps in ("prior_rejection", "rejection", "dup"):
-        sys.exit(run_prior_rejection_only())
-    if _steps in ("usage_guide", "guide", "docs"):
-        sys.exit(run_usage_guide_only())
-    if _steps in ("retire_needs_human", "retire_nh"):
-        sys.exit(run_retire_needs_human_only())
-    if _steps in ("checkup", "test", "audit_sheet"):
-        sys.exit(run_comprehensive_checkup())
-    if _steps in ("v3_layout", "v3", "layout"):
-        sys.exit(run_v3_layout_only())
-    sys.exit(run())
+    retire_nee
