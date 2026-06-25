@@ -21,6 +21,7 @@ import gzip
 import json
 import logging
 import re
+import time
 from html import unescape
 from urllib.parse import urlparse, parse_qs, urlencode, unquote
 
@@ -51,6 +52,64 @@ _USER_AGENT = (
 
 _FETCH_TIMEOUT_SECONDS = 15
 _MAX_PDF_BYTES = 15 * 1024 * 1024  # 15 MB
+
+# Retry policy for outbound HTTP. Avanan + Indeed both have brief
+# blips (CDN warmup, 502s from edge nodes, occasional connection
+# resets). Retrying with exponential backoff turns a hard miss into a
+# 2-3 second pause for the candidate.
+_HTTP_MAX_ATTEMPTS = 4
+_HTTP_BACKOFF_BASE_SECONDS = 1.0
+
+
+def _get_with_retry(url: str, *, attempts: int = _HTTP_MAX_ATTEMPTS,
+                    **kwargs) -> requests.Response | None:
+    """GET with exponential backoff on 5xx and network errors.
+
+    Returns the final Response if status < 500 (caller still needs to
+    check for 4xx success/failure semantics). Returns None if every
+    attempt raised RequestException or every attempt got 5xx. The
+    backoff doubles each retry: 1s, 2s, 4s -> total ~7s worst-case
+    waiting before the final attempt.
+    """
+    delay = _HTTP_BACKOFF_BASE_SECONDS
+    last_exc: Exception | None = None
+    last_status: int | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, **kwargs)
+            if resp.status_code < 500:
+                # Done -- 2xx, 3xx (rare with allow_redirects), or 4xx.
+                # Retrying 4xx is pointless; caller decides what to do.
+                return resp
+            last_status = resp.status_code
+            log.warning(
+                "indeed_fetcher: HTTP %d on attempt %d/%d url=%r",
+                resp.status_code, attempt, attempts, url[:120],
+            )
+            try:
+                resp.close()
+            except Exception:
+                pass
+        except requests.RequestException as exc:
+            last_exc = exc
+            log.warning(
+                "indeed_fetcher: %s on attempt %d/%d url=%r",
+                type(exc).__name__, attempt, attempts, url[:120],
+            )
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2
+    if last_exc is not None:
+        log.warning(
+            "indeed_fetcher: giving up after %d attempts, last error=%s url=%r",
+            attempts, type(last_exc).__name__, url[:120],
+        )
+    elif last_status is not None:
+        log.warning(
+            "indeed_fetcher: giving up after %d attempts, last status=%d url=%r",
+            attempts, last_status, url[:120],
+        )
+    return None
 
 
 def extract_view_resume_url(email_body: str) -> str | None:
@@ -101,20 +160,22 @@ def _unwrap_avanan(url: str) -> str | None:
     inline = _unwrap_avanan_inline(url)
     candidate_url = inline
     if not candidate_url:
-        try:
-            resp = requests.get(
-                url,
-                headers={"User-Agent": _USER_AGENT},
-                timeout=_FETCH_TIMEOUT_SECONDS,
-                allow_redirects=True,
-                stream=True,
-            )
-            candidate_url = resp.url
-            resp.close()
-        except requests.RequestException as e:
-            log.warning("indeed_fetcher: avanan unwrap failed: %s url=%r",
-                        type(e).__name__, url[:200])
+        resp = _get_with_retry(
+            url,
+            headers={"User-Agent": _USER_AGENT},
+            timeout=_FETCH_TIMEOUT_SECONDS,
+            allow_redirects=True,
+            stream=True,
+        )
+        if resp is None:
+            log.warning("indeed_fetcher: avanan unwrap failed after retries url=%r",
+                        url[:200])
             return None
+        candidate_url = resp.url
+        try:
+            resp.close()
+        except Exception:
+            pass
     host = (urlparse(candidate_url or "").hostname or "").lower()
     if "employers.indeed.com" in host:
         return candidate_url
@@ -205,6 +266,7 @@ def _try_gzip_b64_json(blob: str) -> str | None:
     return None
 
 
+
 def build_download_url(view_resume_url: str) -> str | None:
     real_url = _unwrap_avanan(view_resume_url)
     if not real_url:
@@ -227,19 +289,18 @@ def fetch_resume_pdf(view_resume_url: str) -> bytes | None:
         log.warning("indeed_fetcher: could not build download URL from view URL=%r",
                     (view_resume_url or "")[:200])
         return None
-    try:
-        resp = requests.get(
-            download_url,
-            headers={
-                "User-Agent": _USER_AGENT,
-                "Accept": "application/pdf,*/*",
-            },
-            timeout=_FETCH_TIMEOUT_SECONDS,
-            allow_redirects=True,
-        )
-    except requests.RequestException as e:
-        log.warning("indeed_fetcher: request failed: %s download_url=%r",
-                    type(e).__name__, download_url)
+    resp = _get_with_retry(
+        download_url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Accept": "application/pdf,*/*",
+        },
+        timeout=_FETCH_TIMEOUT_SECONDS,
+        allow_redirects=True,
+    )
+    if resp is None:
+        log.warning("indeed_fetcher: download failed after retries download_url=%r",
+                    download_url)
         return None
     if resp.status_code != 200:
         log.warning("indeed_fetcher: HTTP %d from Indeed download_url=%r body_head=%r",
