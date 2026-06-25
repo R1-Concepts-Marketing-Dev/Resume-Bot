@@ -2080,6 +2080,47 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     except Exception as e:
         log.warning("Could not extend Candidates filter ranges: %s", e)
 
+    # ---- Copy col L's formatting onto col M ----
+    # The base sage-green tint and other per-row formatting on cols A-L
+    # was baked in as cell formatting (not CF). Col M was inserted post-v3
+    # so it never got the same fill. CopyPaste with PASTE_FORMAT clones
+    # col L's per-row formatting onto col M while preserving M's own
+    # values + the conditional-formatting rule for "Previously rejected".
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets(properties(sheetId,title,gridProperties))",
+        ).execute()
+        for s in meta.get("sheets", []):
+            if s.get("properties", {}).get("title") != tab:
+                continue
+            cand_inner = s["properties"]["sheetId"]
+            max_row = s["properties"].get("gridProperties", {}).get("rowCount", 2000)
+            # Copy L2:L<maxRow> formatting onto M2:M<maxRow>
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": [{
+                    "copyPaste": {
+                        "source": {
+                            "sheetId": cand_inner,
+                            "startRowIndex": 1, "endRowIndex": max_row,
+                            "startColumnIndex": 11, "endColumnIndex": 12,
+                        },
+                        "destination": {
+                            "sheetId": cand_inner,
+                            "startRowIndex": 1, "endRowIndex": max_row,
+                            "startColumnIndex": 12, "endColumnIndex": 13,
+                        },
+                        "pasteType": "PASTE_FORMAT",
+                        "pasteOrientation": "NORMAL",
+                    }
+                }]},
+            ).execute()
+            log.info("Copied col L formatting onto col M (rows 2..%d).", max_row)
+            break
+    except Exception as e:
+        log.warning("Could not copy col L formatting to col M: %s", e)
+
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
     """For every Candidates row, set col M (v3 layout; was col S pre-v3)
