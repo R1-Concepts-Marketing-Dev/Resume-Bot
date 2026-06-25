@@ -1960,9 +1960,43 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     # 4) Paint col M data cells (M2:M) sage green to match the rest
     #    of the row. Conditional rule above still wins on flagged rows
     #    because CF beats userEnteredFormat.
-    # No-op for col M data cells: HR has paste-formatted col L's CF rules
-    # onto col M so the row banding extends naturally. Touching the cells
-    # here would strip that formatting on every dispatch.
+    # Sample the exact background color used on col L (row 12 is a
+    # representative data row), then paint col M data cells with that same
+    # color so col M visually participates in the row band. Falls back to
+    # a known sage green if the sample fetch fails.
+    sample_color = {"red": 0.851, "green": 0.918, "blue": 0.827}
+    try:
+        sampled = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            ranges=[f"{tab}!L12"],
+            fields="sheets.data.rowData.values.effectiveFormat.backgroundColor",
+        ).execute()
+        ef = (sampled["sheets"][0]["data"][0]["rowData"][0]["values"][0]
+              ["effectiveFormat"]["backgroundColor"])
+        # effectiveFormat returns colors with default 1.0 when not set;
+        # only adopt if it's not pure white (likely there's a real bg)
+        if not (ef.get("red", 1) > 0.99 and ef.get("green", 1) > 0.99
+                and ef.get("blue", 1) > 0.99):
+            sample_color = {k: ef.get(k, 0) for k in ("red", "green", "blue")}
+        log.info("Sampled col L bg for col M paint: %s", sample_color)
+    except Exception as e:
+        log.warning("Could not sample L12 bg, using fallback sage green: %s", e)
+
+    requests.append({
+        "repeatCell": {
+            "range": {"sheetId": inner_id, "startRowIndex": 1,
+                      "endRowIndex": 2000, "startColumnIndex": 12,
+                      "endColumnIndex": 13},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": sample_color,
+                    "backgroundColorStyle": {"rgbColor": sample_color},
+                }
+            },
+            "fields": ("userEnteredFormat.backgroundColor,"
+                       "userEnteredFormat.backgroundColorStyle"),
+        }
+    })
 
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id, body={"requests": requests},
