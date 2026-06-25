@@ -1957,19 +1957,14 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
         }
     })
 
-    # 4) Visual divider: tint col M data cells (M2:M) with a soft warm gray
-    #    so there's a perceptible color gap between the bot-decision cols
-    #    (left of M) and the HR-area cols (right of M). The conditional
-    #    rule above still wins on flagged rows because CF beats userFormat.
+    # 4) Clear any baked background on col M data cells (M2:M) so the
+    #    sheet's filter-view banding (alternating green) extends into col M
+    #    just like the other columns. The conditional rule above still
+    #    wins on flagged rows because CF beats userFormat.
     requests.append({
-        "repeatCell": {
+        "updateCells": {
             "range": {"sheetId": inner_id, "startRowIndex": 1,
                       "startColumnIndex": 12, "endColumnIndex": 13},
-            "cell": {
-                "userEnteredFormat": {
-                    "backgroundColor": {"red": 0.965, "green": 0.961, "blue": 0.945},
-                }
-            },
             "fields": "userEnteredFormat.backgroundColor",
         }
     })
