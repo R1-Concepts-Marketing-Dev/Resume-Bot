@@ -285,22 +285,22 @@ def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
       E Email | F Phone | G Confidence | H AI Reasoning |
       I Drive | J Gmail | K HR Status | L HR Notes
 
-    Mapping (Cross-Match col -> Candidates col):
+    Mapping (Cross-Match col -> Candidates col, v3 layout 2026-06-25):
       A Timestamp     <- Candidates!A
       B Applied For   <- Candidates!G
       C Better Match  <- Candidates!H (Cross-Fit Match)
       D Candidate N   <- Candidates!B
       E Email         <- Candidates!C
       F Phone         <- Candidates!D
-      G Confidence    <- Candidates!M
-      H AI Reasoning  <- Candidates!N
-      I Drive         <- Candidates!O
-      J Gmail         <- Candidates!P
-      K HR Status     <- Candidates!Q
-      L HR Notes      <- Candidates!R
+      G Confidence    <- Candidates!N (was M pre-v3)
+      H AI Reasoning  <- Candidates!O (was N pre-v3)
+      I Drive         <- Candidates!P (was O pre-v3)
+      J Gmail         <- Candidates!Q (was P pre-v3)
+      K HR Status     <- Candidates!R (was Q pre-v3)
+      L HR Notes      <- Candidates!S (was R pre-v3)
 
     Filter: rows where Cross-Fit Flag (Candidates!I) is the rocket emoji
-    AND HR Status (Candidates!Q) is empty (HR hasn't actioned yet).
+    AND HR Status (Candidates!R) is empty (HR hasn't actioned yet).
     Ordered by Timestamp DESC. Uses header_count=0 so QUERY does NOT
     inject its own header row -- the user's row 1 manual headers are
     the only headers."""
@@ -318,15 +318,16 @@ def fix_cross_match_query(svc, sheet_id, tab="Cross-Match"):
         log.info("No %s tab; skipping cross-match QUERY fix.", tab)
         return
 
-    # Build QUERY that maps Candidates cols A,G,H,B,C,D,M,N,O,P,Q,R
+    # Build QUERY that maps Candidates cols A,G,H,B,C,D,N,O,P,Q,R,S
     # in the order that matches the user's 12-col Cross-Match header row.
-    # header_count=0 -- no extra header row added by QUERY.
+    # v3 layout: confidence/reasoning/drive/gmail/hr_status/hr_notes shifted
+    # right by 1 because Prior Rejection now sits at col M.
     rocket = "\U0001F6A8"  # 🚨
     new_query = (
-        '=IFERROR(QUERY(Candidates!A2:R, '
-        '"SELECT A, G, H, B, C, D, M, N, O, P, Q, R '
+        '=IFERROR(QUERY(Candidates!A2:T, '
+        '"SELECT A, G, H, B, C, D, N, O, P, Q, R, S '
         'WHERE I = \'' + rocket + '\' '
-        'AND (Q IS NULL OR Q = \'\') '
+        'AND (R IS NULL OR R = \'\') '
         'ORDER BY A DESC", 0), "")'
     )
 
@@ -1073,11 +1074,13 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
     # B2: QUERY pulls Applied (Timestamp), Name, Email, Phone, Role
     # (Applied For), Score (Confidence), AI Reasoning, Drive, HR Status,
     # HR Notes from Candidates where Decision=pending_paused.
+    # v3 layout: Confidence=N (was M), AI Reasoning=O (was N), Drive=P
+    # (was O), HR Status=R (was Q), HR Notes=S (was R). Range A2:T.
     query_b = (
-        '=IFERROR(QUERY(Candidates!A2:R, '
-        '"SELECT A, B, C, D, G, M, N, O, Q, R '
+        '=IFERROR(QUERY(Candidates!A2:T, '
+        '"SELECT A, B, C, D, G, N, O, P, R, S '
         'WHERE J = \'pending_paused\' '
-        'AND (Q IS NULL OR Q = \'\') '
+        'AND (R IS NULL OR R = \'\') '
         'ORDER BY A ASC", 0), "")'
     )
     # A2: Days Pending = today - applied date. ARRAYFORMULA spills
@@ -1830,7 +1833,7 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
         }
     })
 
-    # 3) Conditional formatting on S2:S -- light red bg + bold dark red text
+    # 3) Conditional formatting on M2:M -- light red bg + bold dark red text
     #    when cell text contains "Previously rejected".
     requests.append({
         "addConditionalFormatRule": {
@@ -1852,6 +1855,23 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
                 }
             },
             "index": 0,
+        }
+    })
+
+    # 4) Visual divider: tint col M data cells (M2:M) with a soft warm gray
+    #    so there's a perceptible color gap between the bot-decision cols
+    #    (left of M) and the HR-area cols (right of M). The conditional
+    #    rule above still wins on flagged rows because CF beats userFormat.
+    requests.append({
+        "repeatCell": {
+            "range": {"sheetId": inner_id, "startRowIndex": 1,
+                      "startColumnIndex": 12, "endColumnIndex": 13},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.965, "green": 0.961, "blue": 0.945},
+                }
+            },
+            "fields": "userEnteredFormat.backgroundColor",
         }
     })
 
@@ -2018,6 +2038,10 @@ def run_v3_layout_only() -> int:
     """Workflow step `v3_layout`: move Prior Rejection to col M and add
     Bot Feedback at col T on the live sheet. Pairs with the v3 code
     push so the bot's writes line up with the new column positions.
+
+    Also re-applies col styling (Prior Rejection visual gap), rewrites
+    the Pending and Cross-Match QUERY formulas to point at the new col
+    letters, and refreshes Indeed Queue HR-Status VLOOKUPs.
     """
     cfg = config.load()
     log.info("v3 layout migration. Sheet=%s", cfg.sheet_id)
@@ -2027,6 +2051,8 @@ def run_v3_layout_only() -> int:
     svc = google_auth.sheets(creds)
     migrate_to_v3_layout(svc, cfg.sheet_id)
     style_prior_rejection_column(svc, cfg.sheet_id)
+    fix_pending_query(svc, cfg.sheet_id)
+    fix_cross_match_query(svc, cfg.sheet_id)
     return 0
 
 
@@ -2713,22 +2739,6 @@ def run_prior_rejection_only() -> int:
     svc = google_auth.sheets(creds)
     backfill_prior_rejection(svc, cfg.sheet_id)
     style_prior_rejection_column(svc, cfg.sheet_id)
-    return 0
-
-
-def run_email_only() -> int:
-    """Backfill emails only -- skips the destructive Indeed Queue rebuild
-    and other already-completed migration steps. Triggered when the
-    workflow_dispatch input `steps` is 'emails' or 'email'.
-    """
-    cfg = config.load()
-    log.info("Email-only backfill. Sheet=%s", cfg.sheet_id)
-    creds = google_auth.make_credentials(
-        cfg.oauth_client_id, cfg.oauth_client_secret, cfg.oauth_refresh_token
-    )
-    svc = google_auth.sheets(creds)
-    drive_svc = google_auth.drive(creds)
-    backfill_emails(svc, cfg.sheet_id, drive_svc, anthropic_key=cfg.anthropic_api_key)
     return 0
 
 
