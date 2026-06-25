@@ -1991,8 +1991,13 @@ def migrate_to_v3_layout(svc, sheet_id, tab=CANDIDATES_TAB):
                 continue
             new_formula = (
                 str(formula)
+                # Catches pre-migration formulas (A:Q,17) and post-moveDimension
+                # formulas where Sheets auto-shifted A:Q -> A:R but left the
+                # index at 17, which now points at Gmail Link instead of HR Status.
                 .replace("Candidates!A:Q,17,", "Candidates!A:R,18,")
                 .replace("Candidates!$A:$Q,17,", "Candidates!$A:$R,18,")
+                .replace("Candidates!A:R,17,", "Candidates!A:R,18,")
+                .replace("Candidates!$A:$R,17,", "Candidates!$A:$R,18,")
             )
             if new_formula != formula:
                 updates.append({"range": f"{iq_tab}!E{i + 2}",
