@@ -1957,14 +1957,19 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
         }
     })
 
-    # 4) Clear any baked background on col M data cells (M2:M) so the
-    #    sheet's filter-view banding (alternating green) extends into col M
-    #    just like the other columns. The conditional rule above still
-    #    wins on flagged rows because CF beats userFormat.
+    # 4) Paint col M data cells (M2:M) sage green to match the rest
+    #    of the row. Conditional rule above still wins on flagged rows
+    #    because CF beats userEnteredFormat.
     requests.append({
-        "updateCells": {
+        "repeatCell": {
             "range": {"sheetId": inner_id, "startRowIndex": 1,
-                      "startColumnIndex": 12, "endColumnIndex": 13},
+                      "endRowIndex": 2000, "startColumnIndex": 12,
+                      "endColumnIndex": 13},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
+                }
+            },
             "fields": "userEnteredFormat.backgroundColor",
         }
     })
@@ -2080,41 +2085,9 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     except Exception as e:
         log.warning("Could not extend Candidates filter ranges: %s", e)
 
-    # ---- Force col M data cells to sage green via a low-priority CF ----
-    # Other cols (A-L) get their per-row green from a CF rule whose range
-    # ended at col L pre-v3. Extending that CF didn't work consistently,
-    # so we add a NEW low-priority CF rule on M2:M whose condition is
-    # CUSTOM_FORMULA "=TRUE" -- it always fires, painting sage green.
-    # The higher-priority "Previously rejected" rule (index 0) wins on
-    # flagged rows, so red still shows where the duplicate flag is set.
-    try:
-        green_rule_request = {
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": [{
-                        "sheetId": inner_id, "startRowIndex": 1,
-                        "startColumnIndex": 12, "endColumnIndex": 13,
-                    }],
-                    "booleanRule": {
-                        "condition": {
-                            "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": "=TRUE"}],
-                        },
-                        "format": {
-                            "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
-                        },
-                    }
-                },
-                "index": 1,  # below the index-0 "Previously rejected" rule
-            }
-        }
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=sheet_id,
-            body={"requests": [green_rule_request]},
-        ).execute()
-        log.info("Added low-priority sage-green CF rule on M2:M.")
-    except Exception as e:
-        log.warning("Could not add green CF on col M: %s", e)
+    # (No additional CF needed — direct repeatCell paint above covers
+    # all M2:M data cells, and CF "Previously rejected" still wins on
+    # flagged rows since CF beats userEnteredFormat.)
 
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
