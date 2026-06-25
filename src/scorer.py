@@ -131,16 +131,6 @@ Concurrent-role exception: before counting roles for the job-hopping cap, check 
 """
 
 
-# Few-shot block prepended to the user message when HR has approved
-# learning examples on the Bot Learning Log tab. Frames the examples
-# as HR corrections so the model knows to apply the same correction
-# pattern, not just mimic the example's exact wording.
-LEARNING_EXAMPLES_PREAMBLE = """PRIOR HR CORRECTIONS (recent disagreements where HR overrode the bot).
-These are real cases from this company's pipeline where the bot's call did not match HR's final decision. HR's notes tell you why the bot was wrong. When you see a similar resume/position pattern below, apply the lesson HR left -- don't repeat the same mistake.
-
-"""
-
-
 INBOUND_TYPES = ("resume", "application_no_resume", "question", "misc")
 
 # Lowercase string labels used internally + by main.py routing.
@@ -230,7 +220,10 @@ def classify_conversation_closure(*, api_key: str,
         return ClosureResult(decision="unclear", confidence=0.5,
                              reasoning="anthropic SDK unavailable")
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        # max_retries=5: same hardening as the main scorer call. A
+        # transient API 500 here would silently mark conversations as
+        # 'unclear', leaking active candidates into the next sweep.
+        client = anthropic.Anthropic(api_key=api_key, max_retries=5)
         resp = client.messages.create(
             model=_CLOSURE_MODEL,
             max_tokens=200,
@@ -264,7 +257,14 @@ def classify_conversation_closure(*, api_key: str,
 def classify_inbound_email(*, api_key: str, subject: str, body: str,
                            sender_email: str,
                            has_attachment: bool) -> ClassifierResult:
-    """Classify an inbound jobs@ email and return (label, confidence)."""
+    """Classify an inbound jobs@ email and return (label, confidence).
+
+    Confidence is the model's self-reported certainty in [0, 1]. main.py
+    uses it to escalate low-confidence calls to the Needs Human queue
+    instead of trusting them.
+
+    Defaults to ('question', 0.5) on error -- the safest action and
+    a confidence low enough to flag for human review."""
     if not (subject or body or has_attachment):
         return ClassifierResult(label="question", confidence=0.5)
 
@@ -386,6 +386,7 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         )
         text = "".join(b.text for b in resp.content
                        if getattr(b, "type", "") == "text").strip()
+        # Strip code fences if the model wrapped JSON.
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*\n?", "", text)
             text = re.sub(r"\n?```\s*$", "", text).strip()
@@ -393,6 +394,7 @@ def classify_inbound_email(*, api_key: str, subject: str, body: str,
         label_raw = str(data.get("label", "")).strip().upper().rstrip(".,;:")
         label = _LABEL_NORMALIZE.get(label_raw)
         if not label:
+            # Tolerate slight variants.
             for k, v in _LABEL_NORMALIZE.items():
                 if k in label_raw:
                     label = v
@@ -426,39 +428,9 @@ def _build_filter_block(filters: list) -> str:
     return "\n".join(f"- {f.role} - {f.requirement}" for f in filters)
 
 
-def _format_learning_examples(examples: list) -> str:
-    """Render approved Bot Learning Log entries into a few-shot block.
-
-    Returns "" if no examples, otherwise a multi-line string prefixed
-    with LEARNING_EXAMPLES_PREAMBLE and terminated by a separator.
-    Truncates each excerpt + note for prompt size safety."""
-    if not examples:
-        return ""
-    parts = [LEARNING_EXAMPLES_PREAMBLE]
-    for i, ex in enumerate(examples, 1):
-        pos = (ex.get("position") or "").strip() or "(unspecified)"
-        bot = (ex.get("bot_decision") or "").strip() or "(unknown)"
-        hr = (ex.get("hr_outcome") or "").strip() or "(unknown)"
-        notes = (ex.get("hr_notes") or "").strip()[:400]
-        bot_reason = (ex.get("ai_reasoning") or "").strip()[:300]
-        excerpt = (ex.get("resume_excerpt") or "").strip()[:600]
-        parts.append(
-            f"--- Correction {i} ---\n"
-            f"Position applied for: {pos}\n"
-            f"Bot's decision (wrong): {bot}\n"
-            f"Bot's reasoning at the time: {bot_reason}\n"
-            f"HR's final decision: {hr}\n"
-            f"HR's note explaining why the bot was wrong: {notes}\n"
-            f"Resume excerpt:\n{excerpt}\n"
-        )
-    parts.append("---\nApply the lesson above to the new resume below.\n\n")
-    return "\n".join(parts)
-
-
 def score(*, api_key: str, model: str, resume_text: str, filters: list,
           email_subject: str = "", email_body: str = "",
-          used_ocr: bool = False,
-          learning_examples: list | None = None) -> dict[str, Any]:
+          used_ocr: bool = False) -> dict[str, Any]:
     if not resume_text.strip():
         return _fallback("Empty resume text - could not extract content.")
 
@@ -473,22 +445,27 @@ def score(*, api_key: str, model: str, resume_text: str, filters: list,
         resume_text=resume_text[:18000],
     )
 
-    learning_block = _format_learning_examples(learning_examples or [])
-    if learning_block:
-        user_msg = learning_block + user_msg
-
     if used_ocr:
         user_msg += "\n\nNOTE: This resume was OCR'd from a scanned PDF. Expect typos and broken layout."
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # max_retries=5: SDK retries 5xx + 429 + transient network errors with
+    # exponential backoff (~1s, 2s, 4s, 8s, 16s) before raising. Row 94
+    # was a single API 500 that slipped past the default of 2 retries.
+    client = anthropic.Anthropic(api_key=api_key, max_retries=5)
     try:
         resp = client.messages.create(
             model=model, max_tokens=3000, system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
     except Exception as e:
-        log.exception("Claude API call failed")
-        return _fallback(f"Claude API error: {e}")
+        log.exception("Claude API call failed after retries")
+        # Friendly message HR can read; full error in the exception log.
+        # Bot Errors tab gets the structured row separately via main.py.
+        return _fallback(
+            "Scorer temporarily unavailable -- please re-run via the "
+            "'Re-score Errored Rows' button. "
+            f"({type(e).__name__})"
+        )
 
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
 
@@ -554,13 +531,20 @@ _VALID_HOPPING = {"positive", "caution", "neutral"}
 
 
 def _normalize(r: dict[str, Any]) -> dict[str, Any]:
+    """Coerce the model's response into the shape main.py expects.
+
+    Defensive: missing/wrong fields fall back to safe defaults rather
+    than raising, so a bad response still produces a needs_review row
+    instead of crashing the run."""
     out: dict[str, Any] = {}
 
+    # overall_decision
     decision = r.get("overall_decision")
     if decision not in _VALID_DECISIONS:
         decision = "needs_review"
     out["overall_decision"] = decision
 
+    # best_fit_roles - list of {role, fit_level, reasoning}
     raw_roles = r.get("best_fit_roles") or []
     if not isinstance(raw_roles, list):
         raw_roles = []
@@ -573,41 +557,50 @@ def _normalize(r: dict[str, Any]) -> dict[str, Any]:
             continue
         fit = _coerce_level(entry.get("fit_level"))
         if fit == "no_fit":
+            # Per spec: omit no_fit roles from best_fit_roles
             continue
         norm_roles.append({
             "role": role_name,
             "fit_level": fit,
             "reasoning": str(entry.get("reasoning", "") or "").strip(),
         })
+    # Sort by fit level descending (excellent > strong > borderline > weak)
     norm_roles.sort(key=lambda x: _LEVEL_RANK.get(x["fit_level"], 0), reverse=True)
     out["best_fit_roles"] = norm_roles
 
+    # years_relevant_experience
     yre = r.get("years_relevant_experience", 0)
     try:
         out["years_relevant_experience"] = int(float(yre))
     except (TypeError, ValueError):
         out["years_relevant_experience"] = 0
 
+    # job_hopping_flag
     hop = str(r.get("job_hopping_flag", "neutral") or "neutral").strip().lower()
     out["job_hopping_flag"] = hop if hop in _VALID_HOPPING else "neutral"
 
+    # reasoning
     out["reasoning"] = str(r.get("reasoning", "") or "").strip()
 
+    # confidence (0.0 - 1.0)
     try:
         c = float(r.get("confidence", 0) or 0)
     except (TypeError, ValueError):
         c = 0.0
     out["confidence"] = max(0.0, min(1.0, c))
 
+    # candidate identity fields
     out["candidate_name"] = str(r.get("candidate_name", "") or "").strip()
     out["candidate_email"] = str(r.get("candidate_email", "") or "").strip()
     out["candidate_phone"] = str(r.get("candidate_phone", "") or "").strip()
 
+    # applied_for_role
     applied = str(r.get("applied_for_role", "unspecified") or "unspecified").strip()
     if not applied:
         applied = "unspecified"
     out["applied_for_role"] = applied
 
+    # recruiter_agency: "N/A" or extracted agency / recruiter name
     agency = str(r.get("recruiter_agency", "N/A") or "N/A").strip()
     if not agency or agency.lower() in {"n/a", "na", "none", "null", "unknown"}:
         agency = "N/A"
