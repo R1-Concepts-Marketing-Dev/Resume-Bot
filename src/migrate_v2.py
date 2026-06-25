@@ -2025,6 +2025,61 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     except Exception as e:
         log.warning("Could not extend Candidates CF rules to col M: %s", e)
 
+    # ---- Extend filter views + basicFilter to include col M (and beyond) ----
+    # The green per-row tint that distinguishes filtered rows comes from
+    # the filter view's own highlight. If the filter view range was set
+    # up for A:L pre-v3 it does not paint col M now. Extend any such range
+    # to cover A:T so all v3 cols are filtered together.
+    try:
+        fv_meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets(properties(sheetId,title,gridProperties),"
+                   "basicFilter,filterViews)",
+        ).execute()
+        fv_requests = []
+        for s in fv_meta.get("sheets", []):
+            if s.get("properties", {}).get("title") != tab:
+                continue
+            cand_inner = s["properties"]["sheetId"]
+            grid_col_count = s["properties"].get("gridProperties", {}).get("columnCount", 20)
+            # Basic filter (the "Data > Create a filter" style)
+            bf = s.get("basicFilter")
+            if bf and bf.get("range", {}).get("endColumnIndex", 0) < grid_col_count:
+                new_bf = dict(bf)
+                new_bf["range"] = {
+                    "sheetId": cand_inner,
+                    "startRowIndex": bf.get("range", {}).get("startRowIndex", 0),
+                    "startColumnIndex": 0,
+                    "endColumnIndex": grid_col_count,
+                }
+                fv_requests.append({"setBasicFilter": {"filter": new_bf}})
+            # Named filter views
+            for fv in s.get("filterViews", []) or []:
+                fv_range = fv.get("range", {})
+                if fv_range.get("endColumnIndex", 0) < grid_col_count:
+                    new_fv = dict(fv)
+                    new_fv["range"] = {
+                        "sheetId": cand_inner,
+                        "startRowIndex": fv_range.get("startRowIndex", 0),
+                        "startColumnIndex": 0,
+                        "endColumnIndex": grid_col_count,
+                    }
+                    fv_requests.append({
+                        "updateFilterView": {
+                            "filter": new_fv,
+                            "fields": "range",
+                        }
+                    })
+        if fv_requests:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests": fv_requests},
+            ).execute()
+            log.info("Extended %d Candidates filter ranges to cover col M+.",
+                     len(fv_requests))
+    except Exception as e:
+        log.warning("Could not extend Candidates filter ranges: %s", e)
+
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
     """For every Candidates row, set col M (v3 layout; was col S pre-v3)
