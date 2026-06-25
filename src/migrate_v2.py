@@ -1974,6 +1974,57 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     ).execute()
     log.info("style_prior_rejection_column: width + header + conditional format applied.")
 
+    # ---- Extend EXISTING Candidates CF rules to include col M ----
+    # Pre-v3 the CF rules on the Candidates tab targeted A:L (12 cols)
+    # because that's where HR-decision color logic lived. Now col M
+    # (Prior Rejection) sits in between, so we extend any rule whose
+    # endColumnIndex is exactly 12 to endColumnIndex 13 — making col M
+    # adopt the row-banding green like every other col.
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id,
+            fields="sheets(properties(sheetId,title),conditionalFormats)",
+        ).execute()
+        cand_sheet = None
+        for s in meta.get("sheets", []):
+            if s.get("properties", {}).get("title") == tab:
+                cand_sheet = s
+                break
+        if cand_sheet:
+            cf_rules = cand_sheet.get("conditionalFormats", []) or []
+            extend_requests = []
+            for idx, rule in enumerate(cf_rules):
+                changed = False
+                new_rule = dict(rule)
+                ranges = new_rule.get("ranges", []) or []
+                fresh_ranges = []
+                for r in ranges:
+                    new_r = dict(r)
+                    # Only extend the standard 12-col-wide A:L bands
+                    if (new_r.get("startColumnIndex", 0) == 0
+                            and new_r.get("endColumnIndex") == 12):
+                        new_r["endColumnIndex"] = 13
+                        changed = True
+                    fresh_ranges.append(new_r)
+                if changed:
+                    new_rule["ranges"] = fresh_ranges
+                    extend_requests.append({
+                        "updateConditionalFormatRule": {
+                            "sheetId": inner_id,
+                            "index": idx,
+                            "rule": new_rule,
+                        }
+                    })
+            if extend_requests:
+                svc.spreadsheets().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={"requests": extend_requests},
+                ).execute()
+                log.info("Extended %d Candidates CF rules to cover col M.",
+                         len(extend_requests))
+    except Exception as e:
+        log.warning("Could not extend Candidates CF rules to col M: %s", e)
+
 
 def backfill_prior_rejection(svc, sheet_id, tab=CANDIDATES_TAB):
     """For every Candidates row, set col M (v3 layout; was col S pre-v3)
