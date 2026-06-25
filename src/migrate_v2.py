@@ -1961,18 +1961,10 @@ def style_prior_rejection_column(svc, sheet_id, tab=CANDIDATES_TAB):
     #    of the row. Conditional rule above still wins on flagged rows
     #    because CF beats userEnteredFormat.
     requests.append({
-        "repeatCell": {
+        "updateCells": {
             "range": {"sheetId": inner_id, "startRowIndex": 1,
                       "endRowIndex": 2000, "startColumnIndex": 12,
                       "endColumnIndex": 13},
-            "cell": {
-                "userEnteredFormat": {
-                    "backgroundColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
-                    "backgroundColorStyle": {
-                        "rgbColor": {"red": 0.851, "green": 0.918, "blue": 0.827},
-                    },
-                }
-            },
             "fields": ("userEnteredFormat.backgroundColor,"
                        "userEnteredFormat.backgroundColorStyle"),
         }
