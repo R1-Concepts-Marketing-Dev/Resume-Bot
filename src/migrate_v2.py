@@ -1157,12 +1157,29 @@ def fix_pending_query(svc, sheet_id, tab="Pending"):
                 "fields": "userEnteredFormat.backgroundColor",
             }
         }
+        # Also delete bandedRanges on the Pending tab (alternating color
+        # banding can cause the "everything red" look just like CF can).
+        try:
+            bands_meta = svc.spreadsheets().get(
+                spreadsheetId=sheet_id,
+                fields="sheets(properties(sheetId,title),bandedRanges)",
+            ).execute()
+            band_ids = []
+            for s in bands_meta.get("sheets", []):
+                if s.get("properties", {}).get("title") == tab:
+                    band_ids = [b["bandedRangeId"] for b in s.get("bandedRanges", []) or []]
+                    break
+        except Exception:
+            band_ids = []
+        band_delete_requests = [
+            {"deleteBanding": {"bandedRangeId": bid}} for bid in band_ids
+        ]
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sheet_id,
-            body={"requests": delete_requests + [clear_bg_request] + add_requests},
+            body={"requests": delete_requests + band_delete_requests + [clear_bg_request] + add_requests},
         ).execute()
-        log.info("%s: removed %d stale CF rules, cleared baked bg, added Days >=5 red rule.",
-                 tab, n_rules)
+        log.info("%s: removed %d CF rules + %d banding ranges, cleared bg, added Days >=5 red rule.",
+                 tab, n_rules, len(band_ids))
     except Exception as e:
         log.warning("Could not refresh %s CF rules: %s", tab, e)
 
