@@ -530,6 +530,37 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
+    # Auto-reply: instant submission acknowledgement. Fires once per
+    # thread when an inbound has a resume (direct attachment OR Indeed
+    # Quick Apply -- attachments are synthesized earlier in the
+    # pipeline). Bypasses the business-hours gate since this is just
+    # a confirmation, not a workflow reply. Failures are swallowed --
+    # we never want a flaky SMTP to block the scoring pipeline.
+    if (msg.has_resume
+            and "submission_received" in templates
+            and msg.sender_email
+            and not _is_job_board_alias(msg.sender_email)
+            and not internal_forward
+            and not hr_manual
+            and "submission_received" not in sent_in_thread):
+        if cfg.shadow_mode:
+            log.info("  -> shadow: would_have_sent=submission_received (auto-reply)")
+            _log_inbox("submission_received", "shadow: would_have_sent")
+        else:
+            try:
+                _send_template(
+                    gmail, cfg, templates["submission_received"], msg,
+                    vars_extra={"applicant_name": msg.sender_name or "there"},
+                )
+                sent_in_thread.add("submission_received")
+                log.info("  -> sent 'submission_received' (auto-reply) to %s",
+                         msg.sender_email)
+                _log_inbox("submission_received", "auto-reply sent")
+            except Exception as exc:
+                log.warning("  -> auto-reply send failed (continuing to score): %s", exc)
+                _log_inbox("submission_received",
+                           f"send failed: {type(exc).__name__}")
+
     if not msg.has_resume:
         if email_type == "question":
             template_key = "question"
@@ -861,6 +892,20 @@ def _process_resume_attachments(
             processed_label_id=label_id,
             outcome_label_id=outcome_id,
         )
+        # Also stamp Handled/Indeed on Indeed Quick Apply threads so HR
+        # can find them via the Gmail sidebar without filtering by
+        # sender. Best-effort -- a label apply failure shouldn't block
+        # the archive.
+        if is_indeed_candidate:
+            handled_indeed_id = outcome_label_ids.get("handled_indeed")
+            if handled_indeed_id:
+                try:
+                    gmail.users().messages().modify(
+                        userId=cfg.gmail_user, id=msg_id,
+                        body={"addLabelIds": [handled_indeed_id]},
+                    ).execute()
+                except Exception as exc:
+                    log.warning("  -> Handled/Indeed label apply failed: %s", exc)
     else:
         gmail_client.mark_processed(gmail, cfg.gmail_user, msg_id, label_id)
         log.warning("  -> no outcome label found for bucket=%r; email left in inbox",
