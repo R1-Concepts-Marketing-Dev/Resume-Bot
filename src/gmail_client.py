@@ -16,16 +16,17 @@ BOT_TEMPLATE_HEADER = "X-R1-Ref"
 LEGACY_BOT_HEADER = "X-Resume-Bot-Template"
 
 TEMPLATE_KEY_TO_CODE = {
-    "no_resume":    "nr",
-    "question":     "q",
-    "denied":       "d",
-    "paused_match": "pm",
+    "no_resume":            "nr",
+    "question":             "q",
+    "denied":               "d",
+    "paused_match":         "pm",
+    "submission_received":  "sr",
 }
 TEMPLATE_CODE_TO_KEY = {v: k for k, v in TEMPLATE_KEY_TO_CODE.items()}
 
 TERMINAL_TEMPLATE_KEYS = frozenset({"denied", "paused_match"})
 
-ALL_TEMPLATE_KEYS = frozenset({"no_resume", "question", "denied", "paused_match"})
+ALL_TEMPLATE_KEYS = frozenset({"no_resume", "question", "denied", "paused_match", "submission_received"})
 
 _AUTO_REPLY_HEADER_SIGNALS = {
     "auto-submitted":  ("auto-replied", "auto-generated", "auto-notified"),
