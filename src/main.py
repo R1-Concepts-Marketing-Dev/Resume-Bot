@@ -530,37 +530,6 @@ def _handle_one(cfg, gmail, drive, sheets, all_filters, templates,
         )
         return 0
 
-    # Auto-reply: instant submission acknowledgement. Fires once per
-    # thread when an inbound has a resume (direct attachment OR Indeed
-    # Quick Apply -- attachments are synthesized earlier in the
-    # pipeline). Bypasses the business-hours gate since this is just
-    # a confirmation, not a workflow reply. Failures are swallowed --
-    # we never want a flaky SMTP to block the scoring pipeline.
-    if (msg.has_resume
-            and "submission_received" in templates
-            and msg.sender_email
-            and not _is_job_board_alias(msg.sender_email)
-            and not internal_forward
-            and not hr_manual
-            and "submission_received" not in sent_in_thread):
-        if cfg.shadow_mode:
-            log.info("  -> shadow: would_have_sent=submission_received (auto-reply)")
-            _log_inbox("submission_received", "shadow: would_have_sent")
-        else:
-            try:
-                _send_template(
-                    gmail, cfg, templates["submission_received"], msg,
-                    vars_extra={"applicant_name": msg.sender_name or "there"},
-                )
-                sent_in_thread.add("submission_received")
-                log.info("  -> sent 'submission_received' (auto-reply) to %s",
-                         msg.sender_email)
-                _log_inbox("submission_received", "auto-reply sent")
-            except Exception as exc:
-                log.warning("  -> auto-reply send failed (continuing to score): %s", exc)
-                _log_inbox("submission_received",
-                           f"send failed: {type(exc).__name__}")
-
     if not msg.has_resume:
         if email_type == "question":
             template_key = "question"
@@ -876,6 +845,41 @@ def _process_resume_attachments(
         scored += 1
 
     final_bucket = last_bucket or "unreadable"
+
+    # Submission acknowledgement: fires AFTER scoring so we never
+    # double up with a denial or paused-role note. Skipped when the
+    # bot already gave the candidate a substantive workflow reply
+    # (denied, paused_match) or when the candidate falls into a
+    # bucket the bot doesn't ack at all (unreadable / not_a_resume).
+    _ack_skip_buckets = {"not_qualified", "pending_paused", "not_a_resume", "unreadable"}
+    if ("submission_received" in templates
+            and msg.sender_email
+            and not _is_job_board_alias(msg.sender_email)
+            and not is_internal_forward
+            and "submission_received" not in sent_in_thread
+            and final_bucket not in _ack_skip_buckets
+            and can_send is not None):
+        allowed, block_reason = can_send("submission_received")
+        if allowed:
+            if cfg.shadow_mode:
+                log.info("  -> shadow: would_have_sent=submission_received (ack)")
+                log_inbox("submission_received", "shadow: would_have_sent")
+            else:
+                try:
+                    _send_template(
+                        gmail, cfg, templates["submission_received"], msg,
+                        vars_extra={"applicant_name": msg.sender_name or "there"},
+                    )
+                    sent_in_thread.add("submission_received")
+                    log.info("  -> sent submission_received ack to %s",
+                             msg.sender_email)
+                    log_inbox("submission_received", "ack sent")
+                except Exception as exc:
+                    log.warning("  -> submission_received failed: %s", exc)
+                    log_inbox("submission_received",
+                              f"send failed: {type(exc).__name__}")
+        else:
+            log.info("  -> submission_received suppressed: %s", block_reason)
     if cfg.shadow_mode:
         log.info("  -> email outcome=%s, shadow mode (no Gmail label changes)", final_bucket)
         return scored
