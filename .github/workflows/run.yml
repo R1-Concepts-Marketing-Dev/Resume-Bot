@@ -81,7 +81,7 @@ jobs:
           #           label changes, no archiving, no auto-replies, no Drive
           #           uploads. Bot re-marks UNREAD so HR's queue is untouched.
           #   false = live -- full operation.
-          SHADOW_MODE: "true"
+          SHADOW_MODE: "false"
           # BOT_START_DATE: ignore any email received before this date.
-          BOT_START_DATE: "2026-05-29"
+          BOT_START_DATE: "2026-07-01"
         run: python -m src.main
