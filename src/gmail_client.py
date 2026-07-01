@@ -180,16 +180,34 @@ class ThreadHistory:
 
 
 def ensure_label(svc, user: str, name: str) -> str:
+    # Gmail treats label names as case-insensitive for uniqueness (you
+    # cannot have both "Foo" and "foo"), but returns them with their
+    # original casing. Match case-insensitively so we don't try to
+    # create a label that already exists under a slightly different
+    # case. Also catch the 409 race in case another process created
+    # the label between our list + create calls.
+    from googleapiclient.errors import HttpError
+    name_lower = name.lower()
     existing = svc.users().labels().list(userId=user).execute().get("labels", [])
     for lbl in existing:
-        if lbl["name"] == name:
+        if (lbl.get("name") or "").lower() == name_lower:
             return lbl["id"]
-    created = svc.users().labels().create(
-        userId=user,
-        body={"name": name, "labelListVisibility": "labelShow",
-              "messageListVisibility": "show"},
-    ).execute()
-    return created["id"]
+    try:
+        created = svc.users().labels().create(
+            userId=user,
+            body={"name": name, "labelListVisibility": "labelShow",
+                  "messageListVisibility": "show"},
+        ).execute()
+        return created["id"]
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) != 409:
+            raise
+        # 409 = label name conflicts. Re-list; case-insensitive match.
+        existing = svc.users().labels().list(userId=user).execute().get("labels", [])
+        for lbl in existing:
+            if (lbl.get("name") or "").lower() == name_lower:
+                return lbl["id"]
+        raise
 
 
 def migrate_legacy_labels(svc, user: str) -> int:
