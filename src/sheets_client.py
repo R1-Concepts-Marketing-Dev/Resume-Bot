@@ -99,15 +99,16 @@ _INDEED_AI_RECOMMENDATION = {
 SEED_TEMPLATES: list[Template] = [
     Template(
         key="submission_received",
-        subject="Thanks -- we got your resume",
+        subject="We have received your application",
         body=(
-            "Hi {applicant_name},\n\n"
-            "Thanks for sending your resume to {company_name} -- we "
-            "have it. Our hiring team will review it and follow up "
-            "with you shortly.\n\n"
-            "If you have questions in the meantime, just reply to "
-            "this email.\n\n"
-            "-- {company_name} HR"
+            "Hello,\n\n"
+            "Thank you for your interest in R1 Concepts. We have "
+            "received your resume and our hiring team will review "
+            "your qualifications shortly. If your experience matches "
+            "an open position, we will reach out to discuss next "
+            "steps.\n\n"
+            "Thank you,\n"
+            "R1 Concepts"
         ),
         active=True,
     ),
@@ -1098,7 +1099,6 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
             "ai_reasoning": r[14],                     # O (was N pre-v3)
             "gmail_link": r[16],                       # Q (was P pre-v3)
             "hr_status": hr_status,                    # R (was Q pre-v3)
-            "hr_notes": (r[18] or "").strip(),         # S (was R pre-v3)
             "bot_feedback": (r[19] or "").strip(),     # T (NEW v3)
         })
     return out
