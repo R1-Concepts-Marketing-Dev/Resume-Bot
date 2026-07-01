@@ -599,6 +599,10 @@ def _process_resume_attachments(
     last_bucket = None
     reply_queued_for_biz_hours = False
     inbox_type = "resume_internal_forward" if is_internal_forward else "resume"
+    # Hoisted out of the per-attachment loop so post-loop code (Handled/Indeed
+    # label apply at ~line 903) can still reference it when every attachment
+    # skipped past its own assignment (e.g. all failed to parse -> continue).
+    is_indeed_candidate = _is_job_board_alias(msg.sender_email)
 
     for att in msg.attachments:
         text, used_ocr = resume_parser.extract(
@@ -744,7 +748,7 @@ def _process_resume_attachments(
         else:
             cross_fit_match = ""
 
-        is_indeed_candidate = _is_job_board_alias(msg.sender_email)
+        # is_indeed_candidate already computed above the loop.
 
         _sender_lc = (msg.sender_email or "").lower()
         _body_lc = (msg.body_text or "").lower()
