@@ -58,7 +58,7 @@ jobs:
           DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
           TEMPLATES_TAB_NAME: ${{ vars.TEMPLATES_TAB_NAME || 'Templates' }}
           NEEDS_HUMAN_TAB_NAME: ${{ vars.NEEDS_HUMAN_TAB_NAME || 'Needs Human' }}
-          PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'resume-bot/processed' }}
+          PROCESSED_LABEL: ${{ vars.PROCESSED_LABEL || 'Resume Bot Processed' }}
           MAX_MESSAGES_PER_RUN: ${{ vars.MAX_MESSAGES_PER_RUN || '25' }}
           COMPANY_NAME: ${{ vars.COMPANY_NAME || 'R1 Concepts' }}
           # Optional comma-separated list. Senders matching exactly (john@x.com)
