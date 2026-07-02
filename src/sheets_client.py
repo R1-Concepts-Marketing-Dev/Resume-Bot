@@ -753,12 +753,15 @@ def load_recent_inbox_senders(svc, sheet_id, tab, hours_back=24):
 
 
 def load_processed_thread_ids(svc, sheet_id, tab):
-    # Gmail Thread Link lives in column P (was column O before the
-    # 2026-06-18 restructure that added Application Submitted at E).
+    # Gmail Thread Link lives in column Q in the v3 layout (Drive Link is
+    # in P, Gmail Link is in Q). Prior versions had these flipped, which
+    # silently broke shadow-mode dedup and caused every rerun to
+    # re-append rows -- fixed here so the check reads the column that
+    # actually contains "#inbox/<threadId>".
     try:
         resp = svc.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range=f"{tab}!P2:P",
+            range=f"{tab}!Q2:Q",
             valueRenderOption="FORMULA",
         ).execute()
     except Exception:
@@ -841,6 +844,28 @@ def append_candidate(svc, sheet_id, tab, row):
     """
     application_submitted = (row.get("application_submitted") or "Email").strip() or "Email"
     prior_flag = _PRIOR_REJECTION_FLAG if _has_prior_rejection(svc, sheet_id, row.get("candidate_name", ""), tab) else ""
+
+    # Belt-and-suspenders dedup: if a row for this Gmail thread already
+    # exists in Candidates, don't append a second one. Prevents the
+    # shadow-mode-era pileup where the dedup read was pointed at the
+    # wrong column and every re-run added a fresh row.
+    gmail_link = row.get("gmail_link") or ""
+    if gmail_link:
+        m = re.search(r"#inbox/([A-Za-z0-9]+)", gmail_link)
+        thread_id = m.group(1) if m else ""
+        if thread_id:
+            try:
+                existing = load_processed_thread_ids(svc, sheet_id, tab)
+                if thread_id in existing:
+                    log.info(
+                        "append_candidate: thread %s already in sheet; "
+                        "skipping duplicate write for %r",
+                        thread_id, row.get("candidate_name", ""),
+                    )
+                    return 0
+            except Exception as e:
+                log.warning("append_candidate dedup check failed: %s", e)
+
     values = [
         row.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds"),  # A
         _safe(row.get("candidate_name", "")),                                                # B
