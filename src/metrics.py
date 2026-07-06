@@ -63,8 +63,15 @@ MONTH_NAMES = [
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
-# Number of past months to show as individual columns (including
-# the current month). 12 gives a full rolling year.
+# Anchor month: the bot's first live month. Columns start here and
+# march forward in time (oldest to the left, newest to the right).
+# Configurable via env var so a future backfill or reset can shift it
+# without a code change.
+METRICS_ANCHOR_MONTH = os.environ.get("METRICS_ANCHOR_MONTH", "2026-06")
+
+# Total number of month columns to show. Fixed at 12 so the layout
+# doesn't jitter month-to-month; extra months forward stay blank until
+# time catches up. Bump if HR wants more forward planning space.
 MONTHS_WINDOW = 12
 
 
@@ -105,16 +112,20 @@ def month_label(key: str) -> str:
     return f"{MONTH_NAMES[int(month) - 1]} '{year[-2:]}"
 
 
-def past_months(now: datetime, n: int) -> list[str]:
-    """Return n YYYY-MM keys, current month first, going backwards."""
+def months_from_anchor(anchor: str, n: int) -> list[str]:
+    """Return n YYYY-MM keys starting at `anchor` and marching forward.
+
+    Example: months_from_anchor("2026-06", 12) ->
+        ["2026-06", "2026-07", ..., "2027-05"]
+    """
+    y, m = (int(x) for x in anchor.split("-"))
     out = []
-    y, m = now.year, now.month
     for _ in range(n):
         out.append(f"{y:04d}-{m:02d}")
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
     return out
 
 
@@ -558,7 +569,8 @@ def main() -> int:
     log.info("Loaded %d candidate rows", len(rows))
 
     now = datetime.now(timezone.utc)
-    months = past_months(now, MONTHS_WINDOW)
+    months = months_from_anchor(METRICS_ANCHOR_MONTH, MONTHS_WINDOW)
+    log.info("Month columns: %s .. %s", months[0], months[-1])
     metrics = compute_metrics(rows, now, months)
 
     sheet_gid = ensure_metrics_tab(sheets, source_sheet_id, metrics_tab)
