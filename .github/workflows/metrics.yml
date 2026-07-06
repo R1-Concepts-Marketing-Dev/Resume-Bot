@@ -1,8 +1,9 @@
 name: Resume Bot Metrics
 
 # Nightly aggregator that reads Candidates from the main Resume Bot
-# sheet, rolls up six forward months, and writes the result to the
-# Overview tab on the Resume Bot Metrics sheet.
+# sheet, aggregates into Week / Month / YTD buckets, and writes the
+# result to a "Metrics" tab in the SAME sheet -- one place for HR to
+# look, self-contained.
 #
 # Cron is in UTC. GitHub Actions does not handle DST, so we pick one
 # UTC time and accept a 1-hour drift twice a year:
@@ -48,8 +49,8 @@ jobs:
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          METRICS_SHEET_ID: ${{ secrets.METRICS_SHEET_ID }}
-          DASHBOARD_TAB_NAME: ${{ secrets.DASHBOARD_TAB_NAME }}
+          DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
+          METRICS_TAB_NAME: ${{ vars.METRICS_TAB_NAME || 'Metrics' }}
           # Tuning knobs for the KPI band. Defaults in code: 120 sec
           # saved per auto-handled resume, $20/hr triage rate. Override
           # here via repo Variables (no commit needed) if assumptions
