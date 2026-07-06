@@ -1,18 +1,24 @@
-"""Resume Bot Metrics -- nightly aggregator.
+"""Resume Bot Metrics -- nightly aggregator (long-term view).
 
-Reads the Candidates tab from the main Resume Bot sheet, aggregates
-into three time buckets (This Week / This Month / YTD), and writes a
-single "Metrics" tab back into the SAME sheet -- one place for HR to
-look, self-contained.
+Reads the Candidates tab from the main sheet and writes a nicely
+formatted "Metrics" tab back into the SAME sheet with these columns:
 
-Framing: HR ops metrics + bot efficiency, side by side. The five
-headline numbers Lisa asked for (resumes received, interviews
-scheduled, hired, rejected, no shows) live at the top; bot decisions
-and pipeline state sit below.
+    A          B           C..N            O        P
+    Metric     This Week   12 months*      YTD      All-Time
 
-Designed to run as a standalone GitHub Actions job at 5pm PT each
-night. Self-contained -- does NOT import from the rest of the bot
-package so it can be invoked independently.
+* C is the current month, D is last month, ... N is 12 months ago.
+  Rolling window advances automatically as time passes.
+
+Sections:
+  - HR OUTCOMES (Lisa's headline numbers)
+  - BOT DECISIONS (what the bot did with each resume)
+  - BOT EFFICIENCY (time / dollars saved)
+  - CURRENT PIPELINE (point-in-time HR queue state)
+
+The whole tab is bot-managed: labels, values, AND formatting are
+rewritten on every nightly run so manual damage self-heals.
+
+Runs as a standalone GitHub Actions job at 5pm PT each night.
 """
 
 from __future__ import annotations
@@ -31,20 +37,16 @@ log = logging.getLogger(__name__)
 
 # ----------------------------- Configuration --------------------------------
 
-# HR Status values that count toward the outcome buckets Lisa asked for.
 STATUS_INTERVIEW_SCHEDULED = "Interview Scheduled"
 STATUS_HIRED = "Hired"
 STATUS_REJECTED = "Rejected"
 STATUS_NO_SHOW = "No Show"
 
-# HR Status values that count as "active in HR pipeline" (point in
-# time, current state). Excludes Hired (terminal).
 ACTIVE_HR_STATUSES = {
     "In Review", "Contacted", "Interview Scheduled",
     "Offer Made", "On Hold",
 }
 
-# Estimated seconds of HR time saved per auto-handled resume.
 DEFAULT_TIME_SAVED_PER_CASE_SEC = 120
 try:
     TIME_SAVED_PER_CASE_SEC = int(
@@ -55,6 +57,15 @@ except ValueError:
     TIME_SAVED_PER_CASE_SEC = DEFAULT_TIME_SAVED_PER_CASE_SEC
 
 DEFAULT_HOURLY_RATE_USD = 20.0
+
+MONTH_NAMES = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+# Number of past months to show as individual columns (including
+# the current month). 12 gives a full rolling year.
+MONTHS_WINDOW = 12
 
 
 def _required(key: str) -> str:
@@ -85,13 +96,30 @@ def parse_timestamp(s: str) -> Optional[datetime]:
     return dt
 
 
+def month_key(dt: datetime) -> str:
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def month_label(key: str) -> str:
+    year, month = key.split("-")
+    return f"{MONTH_NAMES[int(month) - 1]} '{year[-2:]}"
+
+
+def past_months(now: datetime, n: int) -> list[str]:
+    """Return n YYYY-MM keys, current month first, going backwards."""
+    out = []
+    y, m = now.year, now.month
+    for _ in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return out
+
+
 def in_week(ts: datetime, now: datetime) -> bool:
-    """Timestamp falls in the last 7 days (inclusive)."""
     return ts >= now - timedelta(days=7)
-
-
-def in_month(ts: datetime, now: datetime) -> bool:
-    return ts.year == now.year and ts.month == now.month
 
 
 def in_year(ts: datetime, now: datetime) -> bool:
@@ -100,31 +128,29 @@ def in_year(ts: datetime, now: datetime) -> bool:
 
 # ----------------------------- Aggregation ----------------------------------
 
-def compute_metrics(rows: list[list[str]], now: datetime) -> dict:
-    """Roll up Candidates rows into Week / Month / YTD / All-time buckets.
+def _new_bucket() -> dict:
+    return {
+        "resumes_received": 0,
+        "sent_to_hr": 0,
+        "flagged_for_review": 0,
+        "auto_denied": 0,
+        "pending_paused": 0,
+        "interviews_scheduled": 0,
+        "hired": 0,
+        "rejected": 0,
+        "no_show": 0,
+    }
 
-    Column layout (v3, from Candidates!A2:T):
-      A Timestamp   J Decision   R HR Status
-    """
-    def new_bucket():
-        return {
-            "resumes_received": 0,
-            "sent_to_hr": 0,        # decision == qualified
-            "flagged_for_review": 0, # decision == needs_review
-            "auto_denied": 0,        # decision == not_qualified
-            "pending_paused": 0,
-            "interviews_scheduled": 0,
-            "hired": 0,
-            "rejected": 0,
-            "no_show": 0,
-        }
 
-    week  = new_bucket()
-    month = new_bucket()
-    ytd   = new_bucket()
-    alltime = new_bucket()
+def compute_metrics(rows: list[list[str]], now: datetime,
+                    months: list[str]) -> dict:
+    """Roll up rows into Week / per-month (rolling window) / YTD / All-time
+    buckets, plus point-in-time HR state."""
+    week    = _new_bucket()
+    ytd     = _new_bucket()
+    alltime = _new_bucket()
+    by_month = {m: _new_bucket() for m in months}
 
-    # Point-in-time state (not time-bucketed)
     active_in_pipeline = 0
     awaiting_triage = 0
 
@@ -138,13 +164,15 @@ def compute_metrics(rows: list[list[str]], now: datetime) -> dict:
         if ts is None:
             continue
 
+        mk = month_key(ts)
+
         buckets = [alltime]
         if in_year(ts, now):
             buckets.append(ytd)
-        if in_month(ts, now):
-            buckets.append(month)
         if in_week(ts, now):
             buckets.append(week)
+        if mk in by_month:
+            buckets.append(by_month[mk])
 
         for b in buckets:
             b["resumes_received"] += 1
@@ -166,14 +194,14 @@ def compute_metrics(rows: list[list[str]], now: datetime) -> dict:
             elif hr_status == STATUS_NO_SHOW:
                 b["no_show"] += 1
 
-        # Point-in-time HR state (from current row, not time-bucketed)
         if hr_status in ACTIVE_HR_STATUSES:
             active_in_pipeline += 1
         if not hr_status and decision in {"qualified", "needs_review"}:
             awaiting_triage += 1
 
     return {
-        "week": week, "month": month, "ytd": ytd, "alltime": alltime,
+        "week": week, "ytd": ytd, "alltime": alltime,
+        "by_month": by_month,
         "active_in_pipeline": active_in_pipeline,
         "awaiting_triage": awaiting_triage,
     }
@@ -199,62 +227,108 @@ def read_candidates(sheets, sheet_id: str, tab: str) -> list[list[str]]:
     return resp.get("values", [])
 
 
-def ensure_metrics_tab(sheets, sheet_id: str, tab: str) -> None:
-    """Create the Metrics tab if it doesn't already exist. Idempotent."""
+def ensure_metrics_tab(sheets, sheet_id: str, tab: str) -> int:
+    """Create tab if missing. Return sheetId (numeric gid)."""
     meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
     for sh in meta.get("sheets", []):
-        if sh.get("properties", {}).get("title") == tab:
-            return
+        props = sh.get("properties", {})
+        if props.get("title") == tab:
+            return props["sheetId"]
     log.info("Creating '%s' tab", tab)
-    sheets.spreadsheets().batchUpdate(
+    resp = sheets.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
-        body={"requests": [{"addSheet": {"properties": {"title": tab,
-                                                        "gridProperties": {
-                                                            "rowCount": 40,
-                                                            "columnCount": 6,
-                                                        }}}}]},
+        body={"requests": [{"addSheet": {"properties": {
+            "title": tab,
+            "gridProperties": {"rowCount": 40, "columnCount": 20},
+        }}}]},
     ).execute()
+    return resp["replies"][0]["addSheet"]["properties"]["sheetId"]
 
 
-def write_metrics_tab(sheets, sheet_id: str, tab: str,
-                      metrics: dict, now_utc: datetime) -> None:
-    """Write the Metrics tab layout. Column widths and formatting are
-    left for HR to tweak; the bot only writes values + labels."""
+# ----------------------------- Layout constants -----------------------------
+# Column indices (0-based) matching the header order in write_metrics_tab.
+COL_METRIC     = 0
+COL_WEEK       = 1
+COL_FIRST_MO   = 2                      # C
+COL_LAST_MO    = COL_FIRST_MO + MONTHS_WINDOW - 1  # N (12 months)
+COL_YTD        = COL_LAST_MO + 1        # O
+COL_ALLTIME    = COL_YTD + 1            # P
+TOTAL_COLS     = COL_ALLTIME + 1        # 16
+
+# Section row anchors (1-based row numbers for A-column labels).
+ROW_TITLE   = 1
+ROW_SUBTTL  = 2
+ROW_HEADER  = 4
+
+SEC_OUTCOMES_HDR = 5
+OUT_RESUMES      = 6
+OUT_INTERVIEWS   = 7
+OUT_HIRED        = 8
+OUT_REJECTED     = 9
+OUT_NOSHOW       = 10
+
+SEC_DECISIONS_HDR = 12
+DEC_TO_HR        = 13
+DEC_FLAGGED      = 14
+DEC_DENIED       = 15
+DEC_PAUSED       = 16
+
+SEC_EFFICIENCY_HDR = 18
+EFF_HOURS = 19
+EFF_DOLLARS = 20
+
+SEC_PIPELINE_HDR = 22
+PIPE_ACTIVE = 23
+PIPE_AWAITING = 24
+
+
+# ----------------------------- Write + format -------------------------------
+
+def col_letter(i: int) -> str:
+    """0-based column index -> letter. Works for A..Z; extend if needed."""
+    return chr(ord("A") + i)
+
+
+def write_metrics_tab(sheets, sheet_id: str, sheet_gid: int, tab: str,
+                      metrics: dict, months: list[str], now_utc: datetime) -> None:
     pt = now_utc - timedelta(hours=7)
-    last_run = f"Auto-updates nightly at 5pm PT · Last run: {pt.strftime('%Y-%m-%d %H:%M PT')}"
+    last_run = (f"Auto-updates nightly at 5pm PT   ·   Last run: "
+                f"{pt.strftime('%Y-%m-%d %H:%M PT')}")
 
-    w, m, y = metrics["week"], metrics["month"], metrics["ytd"]
+    w = metrics["week"]
+    y = metrics["ytd"]
+    a = metrics["alltime"]
+    bm = metrics["by_month"]
 
-    def row3(field):
-        return [w[field], m[field], y[field]]
-
-    # Efficiency computed from ALL auto-handled cases in YTD
-    ytd_bucket = metrics["ytd"]
-    ytd_handled = (ytd_bucket["sent_to_hr"] + ytd_bucket["auto_denied"]
-                   + ytd_bucket["pending_paused"])
-    ytd_seconds_saved = ytd_handled * TIME_SAVED_PER_CASE_SEC
-    ytd_hours_saved = ytd_seconds_saved / 3600
     try:
         hourly_rate = float(_optional("HOURLY_RATE_USD",
                                        str(DEFAULT_HOURLY_RATE_USD)))
     except ValueError:
         hourly_rate = DEFAULT_HOURLY_RATE_USD
-    ytd_dollars_saved = ytd_hours_saved * hourly_rate
 
-    m_handled = m["sent_to_hr"] + m["auto_denied"] + m["pending_paused"]
-    m_hours_saved = (m_handled * TIME_SAVED_PER_CASE_SEC) / 3600
-    m_dollars_saved = m_hours_saved * hourly_rate
+    def handled(b): return b["sent_to_hr"] + b["auto_denied"] + b["pending_paused"]
+    def hrs(b): return round((handled(b) * TIME_SAVED_PER_CASE_SEC) / 3600, 1)
+    def dol(b): return f"${hrs(b) * hourly_rate:,.0f}"
 
-    w_handled = w["sent_to_hr"] + w["auto_denied"] + w["pending_paused"]
-    w_hours_saved = (w_handled * TIME_SAVED_PER_CASE_SEC) / 3600
-    w_dollars_saved = w_hours_saved * hourly_rate
+    # Column headers (row 4)
+    headers = ["Metric", "This Week"] + [month_label(m) for m in months] + ["YTD", "All-Time"]
 
-    # A-column labels (fully self-managed by the bot)
+    # For every metric row, build values in the same column order.
+    def row_values(field):
+        return [w[field]] + [bm[m][field] for m in months] + [y[field], a[field]]
+
+    def row_hrs():
+        return [hrs(w)] + [hrs(bm[m]) for m in months] + [hrs(y), hrs(a)]
+
+    def row_dol():
+        return [dol(w)] + [dol(bm[m]) for m in months] + [dol(y), dol(a)]
+
+    # A-column labels are fully bot-managed.
     a_labels = [
         ["Resume Bot Metrics"],                              # A1
         [last_run],                                          # A2
         [""],                                                # A3
-        [""],                                                # A4 (headers written to A4:D4)
+        [""],                                                # A4 (headers written to full row)
         ["HR OUTCOMES"],                                     # A5
         ["Resumes received (unique)"],                       # A6
         ["Scheduled for interviews"],                        # A7
@@ -277,44 +351,191 @@ def write_metrics_tab(sheets, sheet_id: str, tab: str,
         ["Awaiting HR triage"],                              # A24
     ]
 
-    # Column headers on row 4
-    col_headers = [["Metric", "This Week", "This Month", "YTD"]]
+    last_col = col_letter(TOTAL_COLS - 1)
+    data_range = lambda row: f"{tab}!B{row}:{last_col}{row}"
 
-    # Data rows
-    outcome_data = [
-        row3("resumes_received"),
-        row3("interviews_scheduled"),
-        row3("hired"),
-        row3("rejected"),
-        row3("no_show"),
-    ]
-    decision_data = [
-        row3("sent_to_hr"),
-        row3("flagged_for_review"),
-        row3("auto_denied"),
-        row3("pending_paused"),
-    ]
-    efficiency_data = [
-        [round(w_hours_saved, 1), round(m_hours_saved, 1), round(ytd_hours_saved, 1)],
-        [f"${w_dollars_saved:.0f}", f"${m_dollars_saved:.0f}", f"${ytd_dollars_saved:.0f}"],
-    ]
-    pipeline_data = [
-        [metrics["active_in_pipeline"], "", ""],
-        [metrics["awaiting_triage"], "", ""],
-    ]
+    outcomes = {
+        OUT_RESUMES:    row_values("resumes_received"),
+        OUT_INTERVIEWS: row_values("interviews_scheduled"),
+        OUT_HIRED:      row_values("hired"),
+        OUT_REJECTED:   row_values("rejected"),
+        OUT_NOSHOW:     row_values("no_show"),
+    }
+    decisions = {
+        DEC_TO_HR:    row_values("sent_to_hr"),
+        DEC_FLAGGED:  row_values("flagged_for_review"),
+        DEC_DENIED:   row_values("auto_denied"),
+        DEC_PAUSED:   row_values("pending_paused"),
+    }
+    efficiency = {
+        EFF_HOURS:   row_hrs(),
+        EFF_DOLLARS: row_dol(),
+    }
+    # Pipeline is a single point-in-time number -- put it in col B only.
+    pipe_blank = [""] * (TOTAL_COLS - 2)  # after B, blank to end
+    pipeline = {
+        PIPE_ACTIVE:   [metrics["active_in_pipeline"]] + pipe_blank,
+        PIPE_AWAITING: [metrics["awaiting_triage"]]    + pipe_blank,
+    }
 
     data = [
         {"range": f"{tab}!A1:A24", "values": a_labels},
-        {"range": f"{tab}!A4:D4",  "values": col_headers},
-        {"range": f"{tab}!B6:D10", "values": outcome_data},
-        {"range": f"{tab}!B13:D16","values": decision_data},
-        {"range": f"{tab}!B19:D20","values": efficiency_data},
-        {"range": f"{tab}!B23:D24","values": pipeline_data},
+        {"range": f"{tab}!A4:{last_col}4", "values": [headers]},
     ]
+    for row, vals in {**outcomes, **decisions, **efficiency, **pipeline}.items():
+        data.append({"range": data_range(row), "values": [vals]})
 
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
         body={"valueInputOption": "USER_ENTERED", "data": data},
+    ).execute()
+
+    # ---- Formatting pass ----
+    apply_formatting(sheets, sheet_id, sheet_gid)
+
+
+def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
+    """Bold headers, colored section rows, freeze panes, column widths."""
+    NAVY = {"red": 0.06, "green": 0.14, "blue": 0.22}
+    TEAL = {"red": 0.11, "green": 0.45, "blue": 0.58}
+    LIGHT_TEAL = {"red": 0.90, "green": 0.94, "blue": 0.96}
+    LIGHT_GRAY = {"red": 0.95, "green": 0.95, "blue": 0.96}
+    WHITE = {"red": 1, "green": 1, "blue": 1}
+
+    def cell_range(start_row, start_col, end_row, end_col):
+        # end_row / end_col are EXCLUSIVE in the Sheets API.
+        return {
+            "sheetId": sheet_gid,
+            "startRowIndex": start_row - 1,
+            "endRowIndex": end_row,
+            "startColumnIndex": start_col,
+            "endColumnIndex": end_col,
+        }
+
+    requests = []
+
+    # Title row (row 1): bold, size 16, navy
+    requests.append({"repeatCell": {
+        "range": cell_range(ROW_TITLE, 0, ROW_TITLE, TOTAL_COLS),
+        "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "fontSize": 16,
+                           "foregroundColor": NAVY},
+            "verticalAlignment": "MIDDLE",
+        }},
+        "fields": "userEnteredFormat.textFormat,userEnteredFormat.verticalAlignment",
+    }})
+
+    # Subtitle row (row 2): italic muted
+    requests.append({"repeatCell": {
+        "range": cell_range(ROW_SUBTTL, 0, ROW_SUBTTL, TOTAL_COLS),
+        "cell": {"userEnteredFormat": {
+            "textFormat": {"italic": True, "fontSize": 10,
+                           "foregroundColor": {"red": 0.4, "green": 0.42, "blue": 0.48}},
+        }},
+        "fields": "userEnteredFormat.textFormat",
+    }})
+
+    # Column headers (row 4): bold, teal on light gray, bottom border
+    requests.append({"repeatCell": {
+        "range": cell_range(ROW_HEADER, 0, ROW_HEADER, TOTAL_COLS),
+        "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "fontSize": 10, "foregroundColor": TEAL},
+            "backgroundColor": LIGHT_GRAY,
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+            "borders": {"bottom": {"style": "SOLID_MEDIUM",
+                                    "color": {"red": 0.7, "green": 0.75, "blue": 0.8}}},
+        }},
+        "fields": ("userEnteredFormat.textFormat,userEnteredFormat.backgroundColor,"
+                   "userEnteredFormat.horizontalAlignment,"
+                   "userEnteredFormat.verticalAlignment,"
+                   "userEnteredFormat.borders"),
+    }})
+
+    # Metric column (A) after row 4: bold navy
+    requests.append({"repeatCell": {
+        "range": cell_range(ROW_HEADER + 1, 0, 25, 1),  # A5:A24
+        "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "foregroundColor": NAVY, "fontSize": 10},
+        }},
+        "fields": "userEnteredFormat.textFormat",
+    }})
+
+    # Section header rows: teal text, light teal background, larger
+    for section_row in (SEC_OUTCOMES_HDR, SEC_DECISIONS_HDR,
+                        SEC_EFFICIENCY_HDR, SEC_PIPELINE_HDR):
+        requests.append({"repeatCell": {
+            "range": cell_range(section_row, 0, section_row, TOTAL_COLS),
+            "cell": {"userEnteredFormat": {
+                "textFormat": {"bold": True, "fontSize": 11,
+                               "foregroundColor": TEAL},
+                "backgroundColor": LIGHT_TEAL,
+            }},
+            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColor",
+        }})
+
+    # Data cells (row 6-24 excluding section headers), cols B..P:
+    #   right-align, thousands separator, muted gray text
+    number_ranges = [
+        (OUT_RESUMES, OUT_NOSHOW),
+        (DEC_TO_HR, DEC_PAUSED),
+        (EFF_HOURS, EFF_DOLLARS),
+        (PIPE_ACTIVE, PIPE_AWAITING),
+    ]
+    for r0, r1 in number_ranges:
+        requests.append({"repeatCell": {
+            "range": cell_range(r0, 1, r1 + 1, TOTAL_COLS),  # end_row+1 (exclusive)
+            "cell": {"userEnteredFormat": {
+                "horizontalAlignment": "RIGHT",
+                "numberFormat": {"type": "NUMBER", "pattern": "#,##0"},
+                "textFormat": {"fontSize": 10},
+            }},
+            "fields": ("userEnteredFormat.horizontalAlignment,"
+                       "userEnteredFormat.numberFormat,"
+                       "userEnteredFormat.textFormat"),
+        }})
+
+    # Currency row (EFF_DOLLARS): override to $ format
+    requests.append({"repeatCell": {
+        "range": cell_range(EFF_DOLLARS, 1, EFF_DOLLARS + 1, TOTAL_COLS),
+        "cell": {"userEnteredFormat": {
+            "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"},
+        }},
+        "fields": "userEnteredFormat.numberFormat",
+    }})
+
+    # Freeze row 4 and column A
+    requests.append({"updateSheetProperties": {
+        "properties": {"sheetId": sheet_gid,
+                       "gridProperties": {"frozenRowCount": 4,
+                                          "frozenColumnCount": 1}},
+        "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+    }})
+
+    # Column widths
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_gid, "dimension": "COLUMNS",
+                  "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 230},
+        "fields": "pixelSize",
+    }})
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_gid, "dimension": "COLUMNS",
+                  "startIndex": 1, "endIndex": TOTAL_COLS},
+        "properties": {"pixelSize": 88},
+        "fields": "pixelSize",
+    }})
+
+    # Row heights: pad title + sections
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_gid, "dimension": "ROWS",
+                  "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 34},
+        "fields": "pixelSize",
+    }})
+
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
     ).execute()
 
 
@@ -337,19 +558,19 @@ def main() -> int:
     log.info("Loaded %d candidate rows", len(rows))
 
     now = datetime.now(timezone.utc)
-    metrics = compute_metrics(rows, now)
+    months = past_months(now, MONTHS_WINDOW)
+    metrics = compute_metrics(rows, now, months)
 
-    ensure_metrics_tab(sheets, source_sheet_id, metrics_tab)
+    sheet_gid = ensure_metrics_tab(sheets, source_sheet_id, metrics_tab)
 
-    log.info("Writing %s tab on %s", metrics_tab, source_sheet_id)
-    write_metrics_tab(sheets, source_sheet_id, metrics_tab, metrics, now)
+    log.info("Writing %s tab on %s (gid %s)", metrics_tab, source_sheet_id, sheet_gid)
+    write_metrics_tab(sheets, source_sheet_id, sheet_gid, metrics_tab,
+                       metrics, months, now)
 
-    log.info(
-        "Done. Received (week/month/YTD): %d / %d / %d",
-        metrics["week"]["resumes_received"],
-        metrics["month"]["resumes_received"],
-        metrics["ytd"]["resumes_received"],
-    )
+    log.info("Done. Week/YTD/All-Time received: %d / %d / %d",
+             metrics["week"]["resumes_received"],
+             metrics["ytd"]["resumes_received"],
+             metrics["alltime"]["resumes_received"])
     return 0
 
 
