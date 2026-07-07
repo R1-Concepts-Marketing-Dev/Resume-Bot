@@ -829,6 +829,64 @@ def _has_prior_rejection(svc, sheet_id, candidate_name,
     return False
 
 
+# Cache of {(sheet_id, tab_name): numeric_gid}. Populated lazily on first
+# lookup so we don't hit the spreadsheets().get() endpoint on every write.
+# In-process only; refreshes each bot run.
+_TAB_GID_CACHE: dict[tuple[str, str], int] = {}
+
+
+def _get_tab_gid(svc, sheet_id: str, tab: str) -> int | None:
+    """Return the numeric sheetId (gid) for a tab, or None if lookup fails."""
+    key = (sheet_id, tab)
+    if key in _TAB_GID_CACHE:
+        return _TAB_GID_CACHE[key]
+    try:
+        meta = svc.spreadsheets().get(
+            spreadsheetId=sheet_id, fields="sheets.properties",
+        ).execute()
+    except Exception as e:
+        log.warning("_get_tab_gid: could not fetch metadata: %s", e)
+        return None
+    for sh in meta.get("sheets", []):
+        props = sh.get("properties", {})
+        if props.get("title") == tab:
+            gid = props.get("sheetId")
+            if gid is not None:
+                _TAB_GID_CACHE[key] = gid
+            return gid
+    return None
+
+
+def hide_row(svc, sheet_id: str, tab: str, row_num: int) -> None:
+    """Hide a single row (1-based) on the given tab. Best-effort -- a
+    failure here shouldn't block the bot's main workflow."""
+    if not row_num or row_num < 2:
+        return
+    gid = _get_tab_gid(svc, sheet_id, tab)
+    if gid is None:
+        log.warning("hide_row: no gid for %s; skipping hide of row %d",
+                    tab, row_num)
+        return
+    try:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": gid,
+                        "dimension": "ROWS",
+                        "startIndex": row_num - 1,   # 0-based inclusive
+                        "endIndex": row_num,          # exclusive
+                    },
+                    "properties": {"hiddenByUser": True},
+                    "fields": "hiddenByUser",
+                }
+            }]},
+        ).execute()
+    except Exception as e:
+        log.warning("hide_row: failed to hide %s row %d: %s", tab, row_num, e)
+
+
 def append_candidate(svc, sheet_id, tab, row):
     """Append a candidate row to the Candidates dashboard (columns A:T).
 
@@ -897,7 +955,19 @@ def append_candidate(svc, sheet_id, tab, row):
     ).execute()
     # Parse the updated range like "Candidates!A1139:T1139" to get the row #.
     m = re.search(r"!\w+(\d+):", (resp.get("updates", {}) or {}).get("updatedRange", "") or "")
-    return int(m.group(1)) if m else 0
+    row_num = int(m.group(1)) if m else 0
+
+    # Auto-hide pending_paused rows so they don't clutter the Candidates
+    # view. They still exist in the underlying data, so the Pending tab's
+    # QUERY (WHERE Decision = 'pending_paused') keeps surfacing them and
+    # Metrics keeps counting them. If HR wants to see hidden rows they
+    # can right-click a row range and choose "Unhide rows".
+    if row_num and row.get("decision") == "pending_paused":
+        hide_row(svc, sheet_id, tab, row_num)
+        log.info("append_candidate: hid pending_paused row %d (%r)",
+                 row_num, row.get("candidate_name", ""))
+
+    return row_num
 
 
 def set_hr_status(svc, sheet_id, tab: str, row_num: int, status: str) -> None:
