@@ -10,9 +10,26 @@ timestamp, which we store in col K of Bot Learning Log). Idempotent.
 
 Runs weekly via .github/workflows/audit.yml (Fri 4pm PT).
 
+Signal quality (which HR statuses count as bot errors):
+
+  Over-permissive (bot=qualified/needs_review/pending_paused, HR closed)
+    * Rejected      -- HR reviewed and said no fit                    (YES, teach)
+    * Not a fit     -- softer version of Rejected                     (YES, teach)
+    * Not Selected  -- HR compared candidates and picked another      (YES, teach)
+    * Not Interested-- candidate declined HR's outreach               (NO,  candidate-side)
+    * Withdrawn / Unavailable / Closed                                (NO,  role-side)
+
+  Over-strict (bot=not_qualified, HR engaged)
+    * Any of: In Review / Contacted / Interview Scheduled / Offer Made
+      / On Hold / Hired / No Show                                     (YES, teach)
+    A no-show still counts -- reaching interview stage means HR
+    thought the candidate was worth interviewing, i.e. the bot's
+    "not qualified" was wrong. The no-show is a candidate behavior
+    downstream, not a comment on the bot's classification.
+
 Downstream: each bot run reads up to 8 approved entries from Bot
-Learning Log via sheets_client.load_learning_examples() and passes them
-to scorer.score() as few-shot context.
+Learning Log via sheets_client.load_learning_examples() and passes
+them to scorer.score() as few-shot context.
 """
 
 from __future__ import annotations
@@ -33,17 +50,22 @@ log = logging.getLogger("audit")
 CANDIDATES_TAB_DEFAULT = "Candidates"
 LEARNING_TAB_DEFAULT = "Bot Learning Log"
 
-# HR statuses that mean HR moved the candidate FORWARD past the auto-archive
-# gate. If the bot said not_qualified but HR ended up here, that's a
-# valuable correction -- the bot was too strict.
+# HR statuses that mean HR engaged the candidate past the auto-archive
+# gate. If bot said not_qualified but HR ended up here, bot was too
+# strict. Includes No Show -- reaching an interview slot means HR
+# thought the person was interview-worthy, regardless of the no-show.
 HR_ENGAGED = {
     "In Review", "Contacted", "Interview Scheduled",
-    "Offer Made", "On Hold", "Hired",
+    "Offer Made", "On Hold", "Hired", "No Show",
 }
-# HR statuses that mean HR closed the candidate NEGATIVELY. If the bot
-# said qualified/needs_review/pending_paused but HR ended up here,
-# that's the other flavor of correction -- the bot was too permissive.
-HR_REJECTED = {"Rejected", "Not Interested", "Not Selected", "Not a fit"}
+
+# HR statuses that mean HR closed the candidate BECAUSE of the candidate
+# (fit / experience / skill mismatch). If bot said qualified/needs_review/
+# pending_paused but HR ended up here, bot was too permissive.
+# Deliberately EXCLUDES:
+#   - Not Interested (candidate declined -- bot was right, candidate lost)
+#   - Withdrawn / Unavailable / Closed (role- or candidate-side, not fit)
+HR_REJECTED_BOT_ERROR = {"Rejected", "Not a fit", "Not Selected"}
 
 POSITIVE_BOT_DECISIONS = {"qualified", "needs_review", "pending_paused"}
 NEGATIVE_BOT_DECISIONS = {"not_qualified"}
@@ -73,8 +95,7 @@ def build_creds():
 def already_logged_timestamps(sheets, sheet_id, learning_tab):
     """Return the set of original_timestamps already in Bot Learning Log.
 
-    Dedup key = the original Candidates row's Timestamp (col A), which
-    we mirror into col K of the learning log.
+    Dedup key = original Candidates timestamp mirrored into col K.
     """
     try:
         resp = sheets.spreadsheets().values().get(
@@ -92,12 +113,17 @@ def already_logged_timestamps(sheets, sheet_id, learning_tab):
 
 
 def classify_disagreement(decision, hr_status):
-    """Return 'over_permissive', 'over_strict', or None."""
+    """Return 'over_permissive', 'over_strict', or None.
+
+    Only real bot-error classes are returned. Not Interested, Withdrawn,
+    etc. return None so they don't become false-positive training
+    examples.
+    """
     dec = (decision or "").strip().lower()
     hr = (hr_status or "").strip()
     if not hr or not dec:
         return None
-    if dec in POSITIVE_BOT_DECISIONS and hr in HR_REJECTED:
+    if dec in POSITIVE_BOT_DECISIONS and hr in HR_REJECTED_BOT_ERROR:
         return "over_permissive"
     if dec in NEGATIVE_BOT_DECISIONS and hr in HR_ENGAGED:
         return "over_strict"
