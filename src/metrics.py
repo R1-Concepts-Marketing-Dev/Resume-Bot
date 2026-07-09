@@ -177,9 +177,17 @@ def compute_metrics(rows: list[list[str]], now: datetime,
 
         mk = month_key(ts)
 
-        buckets = [alltime]
-        if in_year(ts, now):
-            buckets.append(ytd)
+        # Global cutoff: only rows on/after the anchor month count toward
+        # YTD and All-Time. This keeps June 2026 (shadow-mode test data)
+        # and any older rows out of the totals, so YTD/All-Time reflect
+        # only the live-bot era.
+        after_anchor = mk >= METRICS_ANCHOR_MONTH
+
+        buckets = []
+        if after_anchor:
+            buckets.append(alltime)
+            if in_year(ts, now):
+                buckets.append(ytd)
         if in_week(ts, now):
             buckets.append(week)
         if mk in by_month:
@@ -561,7 +569,6 @@ def main() -> int:
     metrics_tab = _optional("METRICS_TAB_NAME", "Metrics")
 
     log.info("Building Google API credentials")
-    creds = build_credentials()
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     log.info("Reading Candidates from %s", source_sheet_id)
@@ -577,7 +584,7 @@ def main() -> int:
 
     log.info("Writing %s tab on %s (gid %s)", metrics_tab, source_sheet_id, sheet_gid)
     write_metrics_tab(sheets, source_sheet_id, sheet_gid, metrics_tab,
-                       metrics, months, now)
+                     metrics, months, now)
 
     log.info("Done. Week/YTD/All-Time received: %d / %d / %d",
              metrics["week"]["resumes_received"],
