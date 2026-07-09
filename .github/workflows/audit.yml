@@ -1,9 +1,16 @@
-name: Resume bot - weekly audit
+name: Resume Bot audit
+
+# Weekly harvest of HR-vs-bot disagreements into Bot Learning Log.
+# Runs Fri 4pm PT (23:00 UTC during PDT) so it catches the full week
+# of HR activity. Each new entry becomes few-shot context for every
+# bot scoring call the following week.
+#
+# Idempotent: reruns skip candidates already in the log.
 
 on:
   schedule:
-    - cron: "0 14 * * 1"
-  workflow_dispatch: {}
+    - cron: "0 23 * * 5"   # Friday 4pm PT (PDT)
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,7 +22,7 @@ concurrency:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -24,25 +31,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install OCR system deps (Tesseract + Poppler)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends tesseract-ocr poppler-utils
-
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run weekly audit
+      - name: Run audit
         env:
-          GOOGLE_OAUTH_CLIENT_ID:     ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
-          GMAIL_USER:                 ${{ secrets.GMAIL_USER }}
-          ANTHROPIC_API_KEY:          ${{ secrets.ANTHROPIC_API_KEY }}
-          DRIVE_FOLDER_QUALIFIED:     ${{ secrets.DRIVE_FOLDER_QUALIFIED }}
-          DRIVE_FOLDER_NOT_QUALIFIED: ${{ secrets.DRIVE_FOLDER_NOT_QUALIFIED }}
-          DRIVE_FOLDER_REVIEW:        ${{ secrets.DRIVE_FOLDER_REVIEW }}
-          DRIVE_FOLDER_PENDING:       ${{ secrets.DRIVE_FOLDER_PENDING }}
-          DRIVE_FOLDER_INCOMING:      ${{ secrets.DRIVE_FOLDER_INCOMING }}
-          SHEET_ID:                   ${{ secrets.SHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          DASHBOARD_TAB_NAME: ${{ vars.DASHBOARD_TAB_NAME || 'Candidates' }}
+          LEARNING_LOG_TAB_NAME: ${{ vars.LEARNING_LOG_TAB_NAME || 'Bot Learning Log' }}
         run: python -m src.audit
