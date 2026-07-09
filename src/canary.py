@@ -40,35 +40,28 @@ METRICS_TAB = "Metrics"
 BOT_ERRORS_TAB = "Bot Errors"
 ALERTS_TAB = "Bot Alerts"
 
-# Expected v3 header row on Candidates. If HR reorders / renames a col,
-# most of the bot's magic-number lookups break silently -- catch it here.
+# Expected v3 header row on Candidates. Each entry is a case-insensitive
+# substring that must appear in the actual header cell. Loose enough
+# that HR cosmetically renaming "Application" -> "Application Submitted"
+# doesn't alarm, but a real reorder (HR Status moves from R to P) does.
 EXPECTED_HEADERS = [
-    "Timestamp", "Candidate Name", "Email", "Phone",
-    "Application", "Original File", "Applied For",
-    "Cross-Fit Match", "Cross-Fit Flag", "Decision",
-    "Years Relevant Exp", "Job Hopping", "Prior Rejection",
-    "Confidence", "AI Reasoning", "Drive File",
-    "Gmail Thread", "HR Status", "HR Notes", "Bot Feedback",
+    "timestamp", "candidate name", "email", "phone",
+    "application", "original file", "applied for",
+    "cross-fit match", "cross-fit", "decision",
+    "years", "job hopping", "prior rejection",
+    "confidence", "reasoning", "drive",
+    "gmail", "hr status", "hr notes", "bot feedback",
 ]
 
-# HR Status values metrics.py knows how to bucket. If HR adds a new
-# status via the dropdown, we want to know so we can update the code.
+# HR Status values metrics.py knows how to bucket. Alert on any new one.
 KNOWN_HR_STATUSES = {
     "", "In Review", "Contacted", "Interview Scheduled", "Offer Made",
     "On Hold", "Hired", "Rejected", "Not Interested", "Not Selected",
     "Not a fit", "Closed", "Withdrawn", "Unavailable", "No Show", "Saved",
 }
 
-# Alert if the last hour saw more than this many new Candidates rows.
-# Legitimate spikes exist (bulk backfill, promo email) but 200+/hour is
-# the shape the dupe-creep bug had. Tune if HR normally sees more.
 ROW_GROWTH_THRESHOLD = 200
-
-# Alert if the last 24h saw more than this many Bot Errors entries.
 BOT_ERRORS_THRESHOLD = 5
-
-# Alert if the Metrics tab hasn't been refreshed in this many hours.
-# Nightly job runs at 5pm PT (00:00 UTC).
 METRICS_STALE_HOURS = 25
 
 
@@ -105,27 +98,24 @@ def build_creds():
 
 def ensure_alerts_tab(sheets, sheet_id):
     meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
-    exists = False
     for sh in meta.get("sheets", []):
         if sh.get("properties", {}).get("title") == ALERTS_TAB:
-            exists = True
-            break
-    if not exists:
-        log.info("Creating '%s' tab", ALERTS_TAB)
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=sheet_id,
-            body={"requests": [{"addSheet": {"properties": {
-                "title": ALERTS_TAB,
-                "gridProperties": {"rowCount": 500, "columnCount": 6},
-            }}}]},
-        ).execute()
-        sheets.spreadsheets().values().update(
-            spreadsheetId=sheet_id,
-            range=f"{ALERTS_TAB}!A1:F1",
-            valueInputOption="USER_ENTERED",
-            body={"values": [["Timestamp (PT)", "Check", "Status",
-                              "Detail", "state", "notes"]]},
-        ).execute()
+            return
+    log.info("Creating '%s' tab", ALERTS_TAB)
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"addSheet": {"properties": {
+            "title": ALERTS_TAB,
+            "gridProperties": {"rowCount": 500, "columnCount": 6},
+        }}}]},
+    ).execute()
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{ALERTS_TAB}!A1:F1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [["Timestamp (PT)", "Check", "Status",
+                          "Detail", "state", "notes"]]},
+    ).execute()
 
 
 # ----- Individual checks. Each returns (name, ok_bool, detail_str). -----
@@ -152,8 +142,7 @@ def check_dupes(sheets, sheet_id, state):
     top = sorted(dupes.items(), key=lambda x: -x[1])[:3]
     extras = sum(n - 1 for n in dupes.values())
     return ("dupe_detector", False,
-            f"{extras} extra rows across {len(dupes)} duplicated "
-            f"threads; worst: "
+            f"{extras} extra rows across {len(dupes)} duplicated threads; worst: "
             + ", ".join(f"{t}(x{n})" for t, n in top))
 
 
@@ -164,10 +153,10 @@ def check_headers(sheets, sheet_id):
     ).execute()
     row = (resp.get("values", [[]])[0] + [""] * 20)[:20]
     diffs = []
-    for i, exp in enumerate(EXPECTED_HEADERS):
+    for i, exp_substr in enumerate(EXPECTED_HEADERS):
         got = str(row[i] if i < len(row) else "").strip()
-        if got != exp:
-            diffs.append(f"col{chr(65 + i)}: expected {exp!r}, got {got!r}")
+        if exp_substr not in got.lower():
+            diffs.append(f"col{chr(65 + i)}: expected substring {exp_substr!r}, got {got!r}")
     if not diffs:
         return ("header_drift", True, "20 headers match expected layout")
     return ("header_drift", False, "; ".join(diffs[:5]))
@@ -208,17 +197,13 @@ def check_metrics_freshness(sheets, sheet_id, now_utc):
     try:
         last_pt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
     except Exception:
-        return ("metrics_freshness", False,
-                f"unparseable timestamp: {m.group(1)}")
-    # Metrics writes PT as naive; convert to UTC by adding 7h (PDT).
+        return ("metrics_freshness", False, f"unparseable timestamp: {m.group(1)}")
     last_utc = last_pt.replace(tzinfo=timezone.utc) + timedelta(hours=7)
     age_hrs = (now_utc - last_utc).total_seconds() / 3600
     if age_hrs > METRICS_STALE_HOURS:
         return ("metrics_freshness", False,
-                f"Metrics tab last updated {age_hrs:.1f} hours ago "
-                f"(threshold {METRICS_STALE_HOURS}h)")
-    return ("metrics_freshness", True,
-            f"Metrics tab updated {age_hrs:.1f}h ago")
+                f"Metrics tab last updated {age_hrs:.1f} hours ago (threshold {METRICS_STALE_HOURS}h)")
+    return ("metrics_freshness", True, f"Metrics tab updated {age_hrs:.1f}h ago")
 
 
 def check_bot_errors(sheets, sheet_id, now_utc):
@@ -227,8 +212,7 @@ def check_bot_errors(sheets, sheet_id, now_utc):
             spreadsheetId=sheet_id, range=f"{BOT_ERRORS_TAB}!A2:A",
         ).execute()
     except Exception as e:
-        return ("bot_errors", True,
-                f"Bot Errors tab unreadable ({e})")
+        return ("bot_errors_surge", True, f"Bot Errors tab unreadable ({e})")
     recent = 0
     cutoff = now_utc - timedelta(hours=24)
     for row in resp.get("values", []):
@@ -249,41 +233,33 @@ def check_bot_errors(sheets, sheet_id, now_utc):
             continue
     if recent > BOT_ERRORS_THRESHOLD:
         return ("bot_errors_surge", False,
-                f"{recent} errors in last 24h (threshold "
-                f"{BOT_ERRORS_THRESHOLD})")
-    return ("bot_errors_surge", True,
-            f"{recent} errors in last 24h")
+                f"{recent} errors in last 24h (threshold {BOT_ERRORS_THRESHOLD})")
+    return ("bot_errors_surge", True, f"{recent} errors in last 24h")
 
 
 def check_row_growth(sheets, sheet_id, state):
     resp = sheets.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{CANDIDATES_TAB}!A:A",
     ).execute()
-    current = max(0, len(resp.get("values", [])) - 1)  # minus header
+    current = max(0, len(resp.get("values", [])) - 1)
     state["current_row_count"] = current
     prev = state.get("last_row_count")
     if prev is None:
-        return ("row_growth", True,
-                f"baseline {current} rows (first canary run)")
+        return ("row_growth", True, f"baseline {current} rows (first canary run)")
     delta = current - prev
     if delta > ROW_GROWTH_THRESHOLD:
         return ("row_growth", False,
-                f"Candidates grew by {delta} rows since last check "
-                f"(threshold {ROW_GROWTH_THRESHOLD}) -- possible "
-                f"duplicate creep or backlog spike")
+                f"Candidates grew by {delta} rows since last check (threshold {ROW_GROWTH_THRESHOLD}) -- possible duplicate creep or backlog spike")
     if delta < -5:
         return ("row_growth", False,
-                f"Candidates SHRANK by {-delta} rows -- unexpected "
-                f"deletion?")
-    return ("row_growth", True,
-            f"grew by {delta} rows ({current} total)")
+                f"Candidates SHRANK by {-delta} rows -- unexpected deletion?")
+    return ("row_growth", True, f"grew by {delta} rows ({current} total)")
 
 
 def check_bot_run_health():
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
-        return ("bot_run_health", True,
-                "GITHUB_TOKEN not set; skipping (run in Actions to enable)")
+        return ("bot_run_health", True, "GITHUB_TOKEN not set; skipping")
     url = ("https://api.github.com/repos/R1-Concepts-Marketing-Dev/"
            "Resume-Bot/actions/workflows/run.yml/runs?per_page=5")
     req = urllib.request.Request(url, headers={
@@ -302,13 +278,11 @@ def check_bot_run_health():
     fails = sum(1 for r in runs if r.get("conclusion") == "failure")
     if fails >= 3:
         return ("bot_run_health", False,
-                f"{fails}/5 recent run.yml runs failed "
-                f"(latest={concl_latest})")
+                f"{fails}/5 recent run.yml runs failed (latest={concl_latest})")
     if concl_latest == "failure":
         return ("bot_run_health", False,
                 f"latest run.yml failed ({fails}/5 recent failures)")
-    return ("bot_run_health", True,
-            f"latest={concl_latest}, {fails}/5 recent failures")
+    return ("bot_run_health", True, f"latest={concl_latest}, {fails}/5 recent failures")
 
 
 def check_oauth_token(gmail, gmail_user):
@@ -317,8 +291,7 @@ def check_oauth_token(gmail, gmail_user):
         return ("oauth_token", True, "Gmail token healthy")
     except Exception as e:
         return ("oauth_token", False,
-                f"Gmail labels.list failed -- OAuth token may need "
-                f"refresh: {e}")
+                f"Gmail labels.list failed -- OAuth token may need refresh: {e}")
 
 
 # ----- Alert logging + email -----
@@ -348,7 +321,7 @@ def send_alert_email(gmail, gmail_user, to, subject, body):
     ).execute()
 
 
-# ----- Persistent state (previous row count in Bot Alerts!E1) -----
+# ----- Persistent state -----
 
 def load_state(sheets, sheet_id):
     state = {"last_row_count": None}
@@ -435,8 +408,7 @@ def main():
             lines.append(f"      {detail}")
         lines += [
             "",
-            "Sheet: https://docs.google.com/spreadsheets/d/"
-            + sheet_id + "/edit",
+            "Sheet: https://docs.google.com/spreadsheets/d/" + sheet_id + "/edit",
             "Full log tab: 'Bot Alerts'",
             "",
             "Passing checks:",
@@ -447,8 +419,7 @@ def main():
         try:
             send_alert_email(gmail, gmail_user, to_email, subject,
                              "\n".join(lines))
-            log.info("Sent alert email to %s (%d failures)",
-                     to_email, len(failed))
+            log.info("Sent alert email to %s (%d failures)", to_email, len(failed))
         except Exception as e:
             log.error("Failed to send alert email: %s", e)
     else:
@@ -460,6 +431,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as exc:
+    except Exception:
         log.exception("Canary crashed")
         sys.exit(2)
