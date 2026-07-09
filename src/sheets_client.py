@@ -1098,6 +1098,19 @@ def append_learning_entry(svc, sheet_id, tab, row):
         log.warning("Failed to append to %s tab: %s", tab, e)
 
 
+# HR outcomes that are real bot-error signal (not candidate-side loss).
+# Only rows with an outcome in this set get loaded as few-shot context,
+# even if HR left Approve as Training = TRUE. Second line of defense
+# against the audit script (or a manual entry) putting noise in.
+_TEACHING_HR_OUTCOMES = {
+    # Bot said qualified/needs_review/pending_paused, HR said no fit:
+    "Rejected", "Not a fit", "Not Selected",
+    # Bot said not_qualified, HR engaged:
+    "In Review", "Contacted", "Interview Scheduled",
+    "Offer Made", "On Hold", "Hired", "No Show",
+}
+
+
 def load_learning_examples(svc, sheet_id, tab, max_examples=8):
     """Read approved learning entries from the Bot Learning Log.
 
@@ -1106,6 +1119,11 @@ def load_learning_examples(svc, sheet_id, tab, max_examples=8):
     ai_reasoning. Quietly returns [] if the tab doesn't exist or
     has nothing approved -- the bot then runs without few-shot
     context (its current behavior pre-audit-shipment).
+
+    Filters out rows whose HR outcome isn't real bot-error signal (e.g.
+    Not Interested / Withdrawn / Unavailable / Closed) even when
+    Approve as Training = TRUE. Those outcomes mean the candidate
+    declined or the role closed, not that the bot misclassified.
     """
     try:
         resp = svc.spreadsheets().values().get(
@@ -1117,24 +1135,35 @@ def load_learning_examples(svc, sheet_id, tab, max_examples=8):
         return []
     rows = resp.get("values", []) or []
     out = []
+    skipped_unapproved = 0
+    skipped_non_teaching = 0
     # Walk newest-first (rows arrive in insertion order; reverse).
     for r in reversed(rows):
         r = (r + [""] * 11)[:11]
         approve_raw = str(r[1]).strip().lower()
         if approve_raw not in {"true", "yes", "y", "1", "x"}:
+            skipped_unapproved += 1
+            continue
+        hr_outcome = str(r[5]).strip()
+        if hr_outcome not in _TEACHING_HR_OUTCOMES:
+            skipped_non_teaching += 1
             continue
         out.append({
             "position": r[3],
             "bot_decision": r[4],
-            "hr_outcome": r[5],
+            "hr_outcome": hr_outcome,
             "hr_notes": r[6],
             "ai_reasoning": r[7],
             "resume_excerpt": r[8],
         })
         if len(out) >= max_examples:
             break
+    if skipped_non_teaching:
+        log.info(
+            "load_learning_examples: skipped %d non-teaching outcomes "
+            "(Not Interested/Withdrawn/etc)", skipped_non_teaching,
+        )
     return out
-
 
 def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
                                   terminal_statuses=None):
@@ -1149,10 +1178,6 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
     gmail_link, hr_status, hr_notes.
     """
     if terminal_statuses is None:
-        # "Saved" parks a candidate for later reference (moves to the
-        # Saved Candidates tab) -- treated as terminal for audit
-        # purposes since HR has acted. "No Show" + "Not Interested" +
-        # "Unavailable" all close out the conversation.
         terminal_statuses = {"Hired", "Rejected", "Not Selected",
                              "Not a fit", "Not Interested", "Unavailable",
                              "Closed", "Withdrawn", "Declined",
@@ -1169,7 +1194,6 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
     out = []
     for r in rows:
-        # v3 layout: 20 cols A..T
         r = (r + [""] * 20)[:20]
         ts_str = r[0]
         try:
@@ -1180,20 +1204,20 @@ def load_recent_hidden_candidates(svc, sheet_id, tab, days_back=7,
             ts = ts.replace(tzinfo=timezone.utc)
         if ts < cutoff:
             continue
-        hr_status = (r[17] or "").strip()  # R = HR Status
+        hr_status = (r[17] or "").strip()
         if hr_status not in terminal_statuses:
             continue
         out.append({
             "timestamp": ts_str,
-            "candidate_name": r[1],                    # B
-            "application_submitted": r[4],             # E
-            "filename": r[5],                          # F
-            "applied_for": r[6],                       # G
-            "decision": r[9],                          # J
-            "confidence": r[13],                       # N (was M pre-v3)
-            "ai_reasoning": r[14],                     # O (was N pre-v3)
-            "gmail_link": r[16],                       # Q (was P pre-v3)
-            "hr_status": hr_status,                    # R (was Q pre-v3)
-            "bot_feedback": (r[19] or "").strip(),     # T (NEW v3)
+            "candidate_name": r[1],
+            "application_submitted": r[4],
+            "filename": r[5],
+            "applied_for": r[6],
+            "decision": r[9],
+            "confidence": r[13],
+            "ai_reasoning": r[14],
+            "gmail_link": r[16],
+            "hr_status": hr_status,
+            "bot_feedback": (r[19] or "").strip(),
         })
     return out
