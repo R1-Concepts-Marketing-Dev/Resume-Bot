@@ -67,7 +67,7 @@ MONTH_NAMES = [
 # march forward in time (oldest to the left, newest to the right).
 # Configurable via env var so a future backfill or reset can shift it
 # without a code change.
-METRICS_ANCHOR_MONTH = os.environ.get("METRICS_ANCHOR_MONTH", "2026-06")
+METRICS_ANCHOR_MONTH = os.environ.get("METRICS_ANCHOR_MONTH", "2026-07")
 
 # Total number of month columns to show. Fixed at 12 so the layout
 # doesn't jitter month-to-month; extra months forward stay blank until
