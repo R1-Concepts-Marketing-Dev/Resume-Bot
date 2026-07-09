@@ -1,0 +1,53 @@
+name: Resume Bot canary
+
+# Hourly health check during business hours. Runs the deterministic
+# checks in src/canary.py, writes results to the 'Bot Alerts' tab, and
+# emails benw@r1concepts.com on any failure. Silent when everything is
+# green -- we don't want cron-email spam every hour.
+#
+# GitHub Actions cron is UTC. PDT is UTC-7 (most of the year).
+# Schedule: 8am - 5pm PT Mon-Fri = UTC 15-23 M-F plus UTC 00:00 for the
+# 5pm PT slot (which lands on the next UTC day, so day-of-week 2-6).
+# Accepts 1h drift twice a year around DST rather than DST-aware cron.
+
+on:
+  schedule:
+    - cron: "0 15-23 * * 1-5"   # 8am - 4pm PT (PDT), Mon-Fri
+    - cron: "0 0 * * 2-6"        # 5pm PT (previous day) close-of-business
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run canary
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          ALERT_EMAIL_TO: ${{ vars.ALERT_EMAIL_TO || 'benw@r1concepts.com' }}
+          # Auto-provided by GitHub. Used to query workflow run history
+          # for the bot_run_health check. Read-only on this repo.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m src.canary
