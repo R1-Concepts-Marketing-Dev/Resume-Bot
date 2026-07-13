@@ -569,6 +569,7 @@ def main() -> int:
     metrics_tab = _optional("METRICS_TAB_NAME", "Metrics")
 
     log.info("Building Google API credentials")
+    creds = build_credentials()
     sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     log.info("Reading Candidates from %s", source_sheet_id)
