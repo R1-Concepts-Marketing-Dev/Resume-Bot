@@ -1,19 +1,22 @@
 name: Resume Bot canary
 
-# Hourly health check during business hours. Runs the deterministic
-# checks in src/canary.py, writes results to the 'Bot Alerts' tab, and
-# emails benw@r1concepts.com on any failure. Silent when everything is
-# green -- we don't want cron-email spam every hour.
+# Every-15-minute health check during business hours. Runs the
+# deterministic checks in src/canary.py, writes results to the 'Bot
+# Alerts' tab, and emails benw@r1concepts.com on any failure. Silent
+# when everything is green -- no cron-email spam.
 #
 # GitHub Actions cron is UTC. PDT is UTC-7 (most of the year).
-# Schedule: 8am - 5pm PT Mon-Fri = UTC 15-23 M-F plus UTC 00:00 for the
+# Schedule: 8am - 5pm PT Mon-Fri = UTC 15-23 M-F plus UTC 00:XX for the
 # 5pm PT slot (which lands on the next UTC day, so day-of-week 2-6).
 # Accepts 1h drift twice a year around DST rather than DST-aware cron.
+#
+# Cadence: 4 checks/hour × ~9 hours × 5 days = ~180 runs/week. Each run
+# is ~25 seconds, so ~75 min/week of Actions time = well under quota.
 
 on:
   schedule:
-    - cron: "0 15-23 * * 1-5"   # 8am - 4pm PT (PDT), Mon-Fri
-    - cron: "0 0 * * 2-6"        # 5pm PT (previous day) close-of-business
+    - cron: "*/15 15-23 * * 1-5"   # every 15 min, 8am-4:45pm PT, Mon-Fri
+    - cron: "*/15 0 * * 2-6"        # every 15 min, 5-5:45pm PT close of biz
   workflow_dispatch:
 
 permissions:
