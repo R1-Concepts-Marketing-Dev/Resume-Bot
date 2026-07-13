@@ -397,31 +397,10 @@ def main():
 
     failed = [r for r in results if not r[1]]
     if failed:
-        subject = f"[Resume Bot] Canary: {len(failed)} alert(s)"
-        lines = [
-            f"Canary run at {ts_pt}",
-            f"{len(failed)} of {len(results)} checks failed:",
-            "",
-        ]
-        for name, _ok, detail in failed:
-            lines.append(f"  * {name}")
-            lines.append(f"      {detail}")
-        lines += [
-            "",
-            "Sheet: https://docs.google.com/spreadsheets/d/" + sheet_id + "/edit",
-            "Full log tab: 'Bot Alerts'",
-            "",
-            "Passing checks:",
-        ]
-        for name, ok, detail in results:
-            if ok:
-                lines.append(f"  - {name}: {detail}")
-        try:
-            send_alert_email(gmail, gmail_user, to_email, subject,
-                             "\n".join(lines))
-            log.info("Sent alert email to %s (%d failures)", to_email, len(failed))
-        except Exception as e:
-            log.error("Failed to send alert email: %s", e)
+        log.info("Canary: %d of %d checks failed. Logged to Bot Alerts tab. "
+                 "Claude monitor scheduled task picks these up 3x/day and "
+                 "drafts summaries. No direct email sent.",
+                 len(failed), len(results))
     else:
         log.info("All %d checks passed", len(results))
 
