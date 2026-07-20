@@ -10,7 +10,17 @@ from datetime import datetime, timedelta, timezone
 
 import yaml
 
-from . import config, drive_client, gmail_client, google_auth, indeed_fetcher, resume_parser, scorer, sheets_client
+from . import (
+    config,
+    consistency_guard,
+    drive_client,
+    gmail_client,
+    google_auth,
+    indeed_fetcher,
+    resume_parser,
+    scorer,
+    sheets_client,
+)
 
 
 logging.basicConfig(
@@ -719,6 +729,59 @@ def _process_resume_attachments(
                      recruiter_agency_value)
             template_key = None
 
+        # -----------------------------------------------------------------
+        # AUTO-DENIAL SAFETY LAYER (added 2026-07-20)
+        # -----------------------------------------------------------------
+        # Two independent gates that MUST both pass for a "denied"
+        # template to fire. Both can only downgrade -- neither can
+        # upgrade a decision, so failure modes are always safe.
+        # -----------------------------------------------------------------
+        _guard_note = ""
+        if bucket == "not_qualified" and template_key == "denied":
+            # Gate 1: consistency guard. Independent Haiku pass verifies
+            # the reasoning actually justifies not_qualified. Catches
+            # cases like Anthony Luna row 383 where the primary scorer's
+            # decision field drifted from its own reasoning body.
+            if cfg.consistency_guard_enabled:
+                safe_to_deny, verdict = consistency_guard.verify_not_qualified(
+                    api_key=cfg.anthropic_api_key,
+                    applied_for=applied_for,
+                    confidence=float(result.get("confidence") or 0.0),
+                    reasoning=result.get("reasoning") or "",
+                )
+                if not safe_to_deny:
+                    log.warning(
+                        "  -> CONSISTENCY GUARD blocked denial (%s). "
+                        "Downgrading not_qualified -> needs_review.",
+                        verdict,
+                    )
+                    _guard_note = f"[GUARD FLIP {verdict}] "
+                    bucket = "needs_review"
+                    template_key = None
+                    outcome_folder_id = cfg.folder_review
+                    # Prepend audit trail so HR sees why this landed
+                    # in review instead of getting auto-denied.
+                    result["reasoning"] = (
+                        "[Consistency guard blocked auto-denial: "
+                        f"{verdict}. Original scorer said not_qualified "
+                        "but the reasoning body did not clearly justify "
+                        "it. Please review manually.]\n\n"
+                        + (result.get("reasoning") or "")
+                    )
+                else:
+                    log.info("  -> consistency guard: %s", verdict)
+
+            # Gate 2: hard killswitch. When DISABLE_AUTO_DENIAL=True,
+            # never fire the denied template regardless of guard verdict.
+            # Row still logged as not_qualified but HR handles the reply.
+            if cfg.disable_auto_denial and template_key == "denied":
+                log.warning(
+                    "  -> DISABLE_AUTO_DENIAL is set; suppressing 'denied' "
+                    "template. Row stays not_qualified but HR Status stays "
+                    "blank for manual review."
+                )
+                template_key = None
+
         tag_roles = active_matches or paused_matches or qualifying
         tag = _sanitize_filename_tag([r["role"] for r in tag_roles])
         tagged_name = f"{tag}{att.filename}" if tag else att.filename
@@ -829,12 +892,26 @@ def _process_resume_attachments(
                 # auto-hides AND so re-applicants from the same name get
                 # caught by the Prior Rejection flag.
                 if template_key == "denied" and bucket == "not_qualified":
-                    sheets_client.set_hr_status(
+                    ok = sheets_client.set_hr_status(
                         sheets, cfg.sheet_id, cfg.dashboard_tab,
                         candidates_row_num, "Rejected",
+                        errors_svc=sheets,
+                        errors_tab=cfg.errors_tab,
+                        context=(
+                            f"candidate={result['candidate_name']!r} "
+                            f"email={msg.sender_email!r} "
+                            f"applied_for={applied_for!r}"
+                        ),
                     )
-                    log.info("  -> auto-stamped HR Status=Rejected (row %d)",
-                             candidates_row_num)
+                    if ok:
+                        log.info("  -> auto-stamped HR Status=Rejected (row %d)",
+                                 candidates_row_num)
+                    else:
+                        log.error(
+                            "  -> FAILED to stamp HR Status=Rejected row=%d "
+                            "after retries; Bot Errors row written",
+                            candidates_row_num,
+                        )
         else:
             if is_internal_forward:
                 log.info("  -> %s | conf=%.2f | internal forward (no auto-reply)",
