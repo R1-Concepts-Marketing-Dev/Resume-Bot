@@ -104,6 +104,27 @@ class Config:
     business_hours_start_pt: int
     business_hours_end_pt: int
 
+    # ----- Auto-denial safety layer -----
+    # Added 2026-07-20 after Anthony Luna row 383 false-negative
+    # (bot said not_qualified while its own reasoning called him an
+    # "excellent match for Cherry Picker"). Two independent controls:
+    #
+    # disable_auto_denial: hard killswitch. When True, the "denied"
+    #   template NEVER fires and no HR Status stamp happens. Rows land
+    #   as not_qualified but stay open for HR review. Default True on
+    #   first deploy of this safety layer -- Ben flips to False in the
+    #   GitHub Actions vars once he's confident the consistency guard
+    #   is behaving correctly.
+    #
+    # consistency_guard_enabled: when True, every not_qualified verdict
+    #   must pass a second Haiku verification that the reasoning body
+    #   actually justifies the decision. Fail-closed: any LLM error or
+    #   "unsafe" verdict downgrades the row to needs_review and blocks
+    #   the denial send. Extra API cost is minimal (Haiku, ~10 tokens)
+    #   and Ben explicitly asked for overkill accuracy.
+    disable_auto_denial: bool
+    consistency_guard_enabled: bool
+
 
 def load() -> Config:
     internal_domains_raw = _optional("INTERNAL_DOMAINS", "r1concepts.com")
@@ -153,4 +174,11 @@ def load() -> Config:
         ),
         business_hours_start_pt=_optional_int("BUSINESS_HOURS_START_PT", 8),
         business_hours_end_pt=_optional_int("BUSINESS_HOURS_END_PT", 17),
+        # Killswitch defaults True on first deploy. Flip via GitHub
+        # Actions vars (DISABLE_AUTO_DENIAL=false) once the consistency
+        # guard has been observed working for a full business day.
+        disable_auto_denial=_optional_bool("DISABLE_AUTO_DENIAL", True),
+        consistency_guard_enabled=_optional_bool(
+            "CONSISTENCY_GUARD_ENABLED", True,
+        ),
     )
