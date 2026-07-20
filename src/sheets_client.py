@@ -970,23 +970,75 @@ def append_candidate(svc, sheet_id, tab, row):
     return row_num
 
 
-def set_hr_status(svc, sheet_id, tab: str, row_num: int, status: str) -> None:
+def set_hr_status(
+    svc, sheet_id, tab: str, row_num: int, status: str,
+    *, errors_svc=None, errors_tab: str = "", context: str = "",
+) -> bool:
     """Update HR Status (col R, post v3 layout) on the given Candidates
     row. Used by the bot to auto-stamp 'Rejected' on rows where it sent
     the denied template end-to-end, so (a) the row auto-hides on the
     next onEdit cycle and (b) the Prior Rejection flag catches any
-    future submissions from the same name. No-op if row_num is 0."""
+    future submissions from the same name.
+
+    Hardened 2026-07-20 after Ben spotted rows sitting red-and-unhidden
+    on the Candidates tab: retry the write up to 3 times with backoff,
+    and if all retries fail, log a row into the Bot Errors tab so we
+    can catch the miss on the next canary sweep. Silent write failures
+    were the root cause of the visible-red backlog.
+
+    Returns True on success, False if all retries failed. No-op (True)
+    if row_num is 0."""
     if not row_num or row_num <= 0:
-        return
-    try:
-        svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id,
-            range=f"{tab}!R{row_num}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[status]]},
-        ).execute()
-    except Exception as e:
-        log.warning("Failed to set HR Status row=%d to %r: %s", row_num, status, e)
+        return True
+
+    import time
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            svc.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"{tab}!R{row_num}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[status]]},
+            ).execute()
+            if attempt > 1:
+                log.info("set_hr_status: row=%d succeeded on attempt %d",
+                         row_num, attempt)
+            return True
+        except Exception as e:
+            last_exc = e
+            log.warning(
+                "set_hr_status attempt %d/3 failed row=%d status=%r: %s",
+                attempt, row_num, status, e,
+            )
+            # Exponential backoff: 0.5s, 1.5s.
+            if attempt < 3:
+                time.sleep(0.5 * (3 ** (attempt - 1)))
+
+    # All three retries failed. Log to Bot Errors so the miss is
+    # visible to the canary + weekly digest and nothing gets silently
+    # dropped.
+    log.error(
+        "set_hr_status: EXHAUSTED retries row=%d status=%r last_err=%s",
+        row_num, status, last_exc,
+    )
+    if errors_svc is not None and errors_tab:
+        try:
+            append_error(errors_svc, sheet_id, errors_tab, {
+                "msg_id": "",
+                "sender_email": "",
+                "filename": "",
+                "error_type": "hr_status_stamp_failed",
+                "detail": (
+                    f"row={row_num} status={status!r} "
+                    f"context={context!r} last_err={last_exc!r}"
+                )[:500],
+                "bot_action": "row left unhidden; needs manual HR Status set",
+                "gmail_link": "",
+            })
+        except Exception as inner:
+            log.warning("Also failed to write Bot Errors row: %s", inner)
+    return False
 
 
 def append_indeed_queue(svc, sheet_id, tab, row):
