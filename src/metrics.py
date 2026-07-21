@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -63,15 +64,7 @@ MONTH_NAMES = [
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
-# Anchor month: the bot's first live month. Columns start here and
-# march forward in time (oldest to the left, newest to the right).
-# Configurable via env var so a future backfill or reset can shift it
-# without a code change.
 METRICS_ANCHOR_MONTH = os.environ.get("METRICS_ANCHOR_MONTH", "2026-07")
-
-# Total number of month columns to show. Fixed at 12 so the layout
-# doesn't jitter month-to-month; extra months forward stay blank until
-# time catches up. Bump if HR wants more forward planning space.
 MONTHS_WINDOW = 12
 
 
@@ -113,11 +106,6 @@ def month_label(key: str) -> str:
 
 
 def months_from_anchor(anchor: str, n: int) -> list[str]:
-    """Return n YYYY-MM keys starting at `anchor` and marching forward.
-
-    Example: months_from_anchor("2026-06", 12) ->
-        ["2026-06", "2026-07", ..., "2027-05"]
-    """
     y, m = (int(x) for x in anchor.split("-"))
     out = []
     for _ in range(n):
@@ -155,8 +143,6 @@ def _new_bucket() -> dict:
 
 def compute_metrics(rows: list[list[str]], now: datetime,
                     months: list[str]) -> dict:
-    """Roll up rows into Week / per-month (rolling window) / YTD / All-time
-    buckets, plus point-in-time HR state."""
     week    = _new_bucket()
     ytd     = _new_bucket()
     alltime = _new_bucket()
@@ -176,11 +162,6 @@ def compute_metrics(rows: list[list[str]], now: datetime,
             continue
 
         mk = month_key(ts)
-
-        # Global cutoff: only rows on/after the anchor month count toward
-        # YTD and All-Time. This keeps June 2026 (shadow-mode test data)
-        # and any older rows out of the totals, so YTD/All-Time reflect
-        # only the live-bot era.
         after_anchor = mk >= METRICS_ANCHOR_MONTH
 
         buckets = []
@@ -239,11 +220,31 @@ def build_credentials() -> Credentials:
 
 
 def read_candidates(sheets, sheet_id: str, tab: str) -> list[list[str]]:
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=sheet_id,
-        range=f"{tab}!A2:T",
-    ).execute()
-    return resp.get("values", [])
+    # Hardened 2026-07-20 after a socket-level TimeoutError killed the
+    # whole metrics run. Sheets API occasionally hangs the SSL read on
+    # large ranges; retry up to 3 times with backoff before giving up.
+    # Keeps the scheduled metrics job from failing on transient Google
+    # network flakes.
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            resp = sheets.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=f"{tab}!A2:T",
+            ).execute()
+            if attempt > 1:
+                log.info("read_candidates: succeeded on attempt %d", attempt)
+            return resp.get("values", [])
+        except Exception as e:
+            last_exc = e
+            log.warning(
+                "read_candidates attempt %d/3 failed: %s: %s",
+                attempt, type(e).__name__, e,
+            )
+            if attempt < 3:
+                time.sleep(2.0 * attempt)  # 2s, 4s
+    log.error("read_candidates: EXHAUSTED retries. Last error: %s", last_exc)
+    raise last_exc
 
 
 def ensure_metrics_tab(sheets, sheet_id: str, tab: str) -> int:
@@ -265,16 +266,14 @@ def ensure_metrics_tab(sheets, sheet_id: str, tab: str) -> int:
 
 
 # ----------------------------- Layout constants -----------------------------
-# Column indices (0-based) matching the header order in write_metrics_tab.
 COL_METRIC     = 0
 COL_WEEK       = 1
-COL_FIRST_MO   = 2                      # C
-COL_LAST_MO    = COL_FIRST_MO + MONTHS_WINDOW - 1  # N (12 months)
-COL_YTD        = COL_LAST_MO + 1        # O
-COL_ALLTIME    = COL_YTD + 1            # P
-TOTAL_COLS     = COL_ALLTIME + 1        # 16
+COL_FIRST_MO   = 2
+COL_LAST_MO    = COL_FIRST_MO + MONTHS_WINDOW - 1
+COL_YTD        = COL_LAST_MO + 1
+COL_ALLTIME    = COL_YTD + 1
+TOTAL_COLS     = COL_ALLTIME + 1
 
-# Section row anchors (1-based row numbers for A-column labels).
 ROW_TITLE   = 1
 ROW_SUBTTL  = 2
 ROW_HEADER  = 4
@@ -304,7 +303,6 @@ PIPE_AWAITING = 24
 # ----------------------------- Write + format -------------------------------
 
 def col_letter(i: int) -> str:
-    """0-based column index -> letter. Works for A..Z; extend if needed."""
     return chr(ord("A") + i)
 
 
@@ -329,10 +327,8 @@ def write_metrics_tab(sheets, sheet_id: str, sheet_gid: int, tab: str,
     def hrs(b): return round((handled(b) * TIME_SAVED_PER_CASE_SEC) / 3600, 1)
     def dol(b): return f"${hrs(b) * hourly_rate:,.0f}"
 
-    # Column headers (row 4)
     headers = ["Metric", "This Week"] + [month_label(m) for m in months] + ["YTD", "All-Time"]
 
-    # For every metric row, build values in the same column order.
     def row_values(field):
         return [w[field]] + [bm[m][field] for m in months] + [y[field], a[field]]
 
@@ -342,32 +338,31 @@ def write_metrics_tab(sheets, sheet_id: str, sheet_gid: int, tab: str,
     def row_dol():
         return [dol(w)] + [dol(bm[m]) for m in months] + [dol(y), dol(a)]
 
-    # A-column labels are fully bot-managed.
     a_labels = [
-        ["Resume Bot Metrics"],                              # A1
-        [last_run],                                          # A2
-        [""],                                                # A3
-        [""],                                                # A4 (headers written to full row)
-        ["HR OUTCOMES"],                                     # A5
-        ["Resumes received (unique)"],                       # A6
-        ["Scheduled for interviews"],                        # A7
-        ["Hired"],                                           # A8
-        ["Rejected"],                                        # A9
-        ["No shows"],                                        # A10
-        [""],                                                # A11
-        ["BOT DECISIONS"],                                   # A12
-        ["Sent to HR (qualified)"],                          # A13
-        ["Flagged for review"],                              # A14
-        ["Auto-denied"],                                     # A15
-        ["Pending / paused role"],                           # A16
-        [""],                                                # A17
-        ["BOT EFFICIENCY"],                                  # A18
-        ["HR time saved (hrs)"],                             # A19
-        ["$ saved (@ $%d/hr)" % int(hourly_rate)],           # A20
-        [""],                                                # A21
-        ["CURRENT PIPELINE (point-in-time)"],                # A22
-        ["Active in HR pipeline"],                           # A23
-        ["Awaiting HR triage"],                              # A24
+        ["Resume Bot Metrics"],
+        [last_run],
+        [""],
+        [""],
+        ["HR OUTCOMES"],
+        ["Resumes received (unique)"],
+        ["Scheduled for interviews"],
+        ["Hired"],
+        ["Rejected"],
+        ["No shows"],
+        [""],
+        ["BOT DECISIONS"],
+        ["Sent to HR (qualified)"],
+        ["Flagged for review"],
+        ["Auto-denied"],
+        ["Pending / paused role"],
+        [""],
+        ["BOT EFFICIENCY"],
+        ["HR time saved (hrs)"],
+        ["$ saved (@ $%d/hr)" % int(hourly_rate)],
+        [""],
+        ["CURRENT PIPELINE (point-in-time)"],
+        ["Active in HR pipeline"],
+        ["Awaiting HR triage"],
     ]
 
     last_col = col_letter(TOTAL_COLS - 1)
@@ -390,8 +385,7 @@ def write_metrics_tab(sheets, sheet_id: str, sheet_gid: int, tab: str,
         EFF_HOURS:   row_hrs(),
         EFF_DOLLARS: row_dol(),
     }
-    # Pipeline is a single point-in-time number -- put it in col B only.
-    pipe_blank = [""] * (TOTAL_COLS - 2)  # after B, blank to end
+    pipe_blank = [""] * (TOTAL_COLS - 2)
     pipeline = {
         PIPE_ACTIVE:   [metrics["active_in_pipeline"]] + pipe_blank,
         PIPE_AWAITING: [metrics["awaiting_triage"]]    + pipe_blank,
@@ -409,20 +403,16 @@ def write_metrics_tab(sheets, sheet_id: str, sheet_gid: int, tab: str,
         body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
 
-    # ---- Formatting pass ----
     apply_formatting(sheets, sheet_id, sheet_gid)
 
 
 def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
-    """Bold headers, colored section rows, freeze panes, column widths."""
     NAVY = {"red": 0.06, "green": 0.14, "blue": 0.22}
     TEAL = {"red": 0.11, "green": 0.45, "blue": 0.58}
     LIGHT_TEAL = {"red": 0.90, "green": 0.94, "blue": 0.96}
     LIGHT_GRAY = {"red": 0.95, "green": 0.95, "blue": 0.96}
-    WHITE = {"red": 1, "green": 1, "blue": 1}
 
     def cell_range(start_row, start_col, end_row, end_col):
-        # end_row / end_col are EXCLUSIVE in the Sheets API.
         return {
             "sheetId": sheet_gid,
             "startRowIndex": start_row - 1,
@@ -433,7 +423,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
 
     requests = []
 
-    # Title row (row 1): bold, size 16, navy
     requests.append({"repeatCell": {
         "range": cell_range(ROW_TITLE, 0, ROW_TITLE, TOTAL_COLS),
         "cell": {"userEnteredFormat": {
@@ -444,7 +433,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
         "fields": "userEnteredFormat.textFormat,userEnteredFormat.verticalAlignment",
     }})
 
-    # Subtitle row (row 2): italic muted
     requests.append({"repeatCell": {
         "range": cell_range(ROW_SUBTTL, 0, ROW_SUBTTL, TOTAL_COLS),
         "cell": {"userEnteredFormat": {
@@ -454,7 +442,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
         "fields": "userEnteredFormat.textFormat",
     }})
 
-    # Column headers (row 4): bold, teal on light gray, bottom border
     requests.append({"repeatCell": {
         "range": cell_range(ROW_HEADER, 0, ROW_HEADER, TOTAL_COLS),
         "cell": {"userEnteredFormat": {
@@ -471,16 +458,14 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
                    "userEnteredFormat.borders"),
     }})
 
-    # Metric column (A) after row 4: bold navy
     requests.append({"repeatCell": {
-        "range": cell_range(ROW_HEADER + 1, 0, 25, 1),  # A5:A24
+        "range": cell_range(ROW_HEADER + 1, 0, 25, 1),
         "cell": {"userEnteredFormat": {
             "textFormat": {"bold": True, "foregroundColor": NAVY, "fontSize": 10},
         }},
         "fields": "userEnteredFormat.textFormat",
     }})
 
-    # Section header rows: teal text, light teal background, larger
     for section_row in (SEC_OUTCOMES_HDR, SEC_DECISIONS_HDR,
                         SEC_EFFICIENCY_HDR, SEC_PIPELINE_HDR):
         requests.append({"repeatCell": {
@@ -493,8 +478,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
             "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColor",
         }})
 
-    # Data cells (row 6-24 excluding section headers), cols B..P:
-    #   right-align, thousands separator, muted gray text
     number_ranges = [
         (OUT_RESUMES, OUT_NOSHOW),
         (DEC_TO_HR, DEC_PAUSED),
@@ -503,7 +486,7 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
     ]
     for r0, r1 in number_ranges:
         requests.append({"repeatCell": {
-            "range": cell_range(r0, 1, r1 + 1, TOTAL_COLS),  # end_row+1 (exclusive)
+            "range": cell_range(r0, 1, r1 + 1, TOTAL_COLS),
             "cell": {"userEnteredFormat": {
                 "horizontalAlignment": "RIGHT",
                 "numberFormat": {"type": "NUMBER", "pattern": "#,##0"},
@@ -514,7 +497,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
                        "userEnteredFormat.textFormat"),
         }})
 
-    # Currency row (EFF_DOLLARS): override to $ format
     requests.append({"repeatCell": {
         "range": cell_range(EFF_DOLLARS, 1, EFF_DOLLARS + 1, TOTAL_COLS),
         "cell": {"userEnteredFormat": {
@@ -523,7 +505,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
         "fields": "userEnteredFormat.numberFormat",
     }})
 
-    # Freeze row 4 and column A
     requests.append({"updateSheetProperties": {
         "properties": {"sheetId": sheet_gid,
                        "gridProperties": {"frozenRowCount": 4,
@@ -531,7 +512,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
         "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
     }})
 
-    # Column widths
     requests.append({"updateDimensionProperties": {
         "range": {"sheetId": sheet_gid, "dimension": "COLUMNS",
                   "startIndex": 0, "endIndex": 1},
@@ -545,7 +525,6 @@ def apply_formatting(sheets, sheet_id: str, sheet_gid: int) -> None:
         "fields": "pixelSize",
     }})
 
-    # Row heights: pad title + sections
     requests.append({"updateDimensionProperties": {
         "range": {"sheetId": sheet_gid, "dimension": "ROWS",
                   "startIndex": 0, "endIndex": 1},
