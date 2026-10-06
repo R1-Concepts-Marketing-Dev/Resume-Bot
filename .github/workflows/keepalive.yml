@@ -1,0 +1,89 @@
+name: Keepalive
+
+# -----------------------------------------------------------------------------
+# Prevents GitHub's 60-day scheduled-workflow auto-disable.
+#
+# WHY THIS EXISTS
+#   GitHub automatically disables every scheduled workflow in a repo after
+#   60 days without a push/commit. Bot cron runs do NOT count as repository
+#   activity -- only human (or human-looking) commits do. On 2026-09-20 this
+#   silently killed the Resume bot, canary, audit, and metrics workflows at
+#   once; nothing on either side of the system noticed for 17 days because
+#   every watchdog depended on signals the dying workflows had stopped
+#   producing. The outage ended only when Ben eyeballed the Metrics tab and
+#   spotted it was stale.
+#
+# WHAT THIS DOES
+#   Once per month, on the 1st at 10:00 UTC, this workflow writes the
+#   current UTC timestamp into .keepalive and pushes a commit. That commit
+#   is the "repo activity" that resets the 60-day auto-disable timer for
+#   every scheduled workflow in the repo. The commit touches no code or
+#   configuration, so it cannot regress anything.
+#
+#   30-day cadence (instead of the latest-possible 59 days) gives us ~30
+#   days of safety margin if one keepalive run itself fails for some
+#   reason -- the NEXT one still lands before auto-disable.
+#
+# WHY NOT A FOREIGN SOLUTION
+#   An external uptime pinger could keep the repo "awake" for GitHub's
+#   purposes too, but it would be a second system to maintain and
+#   authenticate against. A self-contained monthly commit lives in the
+#   repo, requires no new credentials, and survives any owner change.
+# -----------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 10:00 UTC on the 1st of every month. Mid-morning in London / early
+    # morning in PT; well outside any batch windows the other workflows
+    # use so there is no scheduling contention.
+    - cron: "0 10 1 * *"
+  # Manual trigger: use "Run workflow" from the Actions UI if you want to
+  # confirm it works without waiting for the 1st of next month.
+  workflow_dispatch:
+
+permissions:
+  # Needs write to commit the timestamp bump back to the default branch.
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full fetch not needed; shallow clone keeps this fast.
+          fetch-depth: 1
+          # Default GITHUB_TOKEN is fine because we only push to the
+          # default branch of the same repo; permissions.contents=write
+          # above grants the needed scope.
+          persist-credentials: true
+
+      - name: Write timestamp and commit if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "$STAMP" > .keepalive
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # If the file genuinely changed (always true after writing a
+          # fresh UTC timestamp), commit and push. The "|| exit 0" guard
+          # is belt-and-suspenders in case a re-run happens inside the
+          # same second and the file didn't change.
+          git add .keepalive
+          if git diff --cached --quiet; then
+            echo "No changes to commit (unexpected but non-fatal); exiting clean."
+            exit 0
+          fi
+
+          git commit -m "chore: keepalive bump ${STAMP}"
+          git push
